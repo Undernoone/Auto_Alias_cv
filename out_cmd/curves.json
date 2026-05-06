@@ -1,0 +1,256 @@
+{
+  "schema": "autoalias.curves.v1",
+  "unit": "px",
+  "curves": [
+    {
+      "label": "beltline_s_curve",
+      "degree": 7,
+      "span": 1,
+      "single_span": true,
+      "cv": [
+        [
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          45.809288024902344,
+          -9.677926063537598,
+          0.0
+        ],
+        [
+          97.12103271484375,
+          -42.19472122192383,
+          0.0
+        ],
+        [
+          144.55995178222656,
+          -29.301002502441406,
+          0.0
+        ],
+        [
+          186.3765869140625,
+          27.628292083740234,
+          0.0
+        ],
+        [
+          233.3412322998047,
+          45.52061462402344,
+          0.0
+        ],
+        [
+          283.4449157714844,
+          7.131237030029297,
+          0.0
+        ],
+        [
+          330.0,
+          0.0,
+          0.0
+        ]
+      ],
+      "weights": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "knots": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "u_min": 0.0,
+      "u_max": 1.0,
+      "confidence": 1.0,
+      "source": "points_json+torch_refine",
+      "metadata": {
+        "candidate_points": 12,
+        "torch_refine_loss": 199.96002197265625,
+        "torch_refine_steps": 10,
+        "inflection_u": [
+          0.07547738693467337,
+          0.5024120603015075,
+          0.9100502512562814
+        ],
+        "is_s_curve": true,
+        "max_abs_curvature": 0.008068259170814258,
+        "effective_radius_px": 123.94247368965948,
+        "is_l_curve": false
+      }
+    },
+    {
+      "label": "soft_l_blend_bumper",
+      "degree": 7,
+      "span": 1,
+      "single_span": true,
+      "cv": [
+        [
+          0.0,
+          120.0,
+          0.0
+        ],
+        [
+          35.10661697387695,
+          118.12784576416016,
+          0.0
+        ],
+        [
+          65.16825103759766,
+          120.1283187866211,
+          0.0
+        ],
+        [
+          106.85114288330078,
+          129.64669799804688,
+          0.0
+        ],
+        [
+          149.4041290283203,
+          114.27125549316406,
+          0.0
+        ],
+        [
+          162.91888427734375,
+          70.90385437011719,
+          0.0
+        ],
+        [
+          154.80242919921875,
+          32.17061233520508,
+          0.0
+        ],
+        [
+          156.0,
+          0.0,
+          0.0
+        ]
+      ],
+      "weights": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "knots": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "u_min": 0.0,
+      "u_max": 1.0,
+      "confidence": 1.0,
+      "source": "points_json+torch_refine",
+      "metadata": {
+        "candidate_points": 8,
+        "torch_refine_loss": 132.97457885742188,
+        "torch_refine_steps": 10,
+        "inflection_u": [
+          0.15989949748743715,
+          0.9317587939698492
+        ],
+        "is_s_curve": true,
+        "max_abs_curvature": 0.014992186388019066,
+        "effective_radius_px": 66.70141193009349,
+        "is_l_curve": false
+      }
+    }
+  ],
+  "quality": [
+    {
+      "label": "beltline_s_curve",
+      "passed": true,
+      "metrics": {
+        "degree": 7,
+        "span": 1,
+        "single_span": true,
+        "cv_count": 8,
+        "knot_count": 16,
+        "cv_spacing_ratio": 1.508677309159308,
+        "cv_min_spacing": 46.82043487879797,
+        "cv_max_spacing": 70.63692770661353,
+        "control_polygon_turnback": false,
+        "max_abs_curvature": 0.009805128710819757,
+        "curvature_smoothness": 6.001998008191052e-08,
+        "curvature_jerk": 8.605285676955519e-11,
+        "curvature_peak_count": 2,
+        "curvature_oscillation": 0.05038428774169413,
+        "inflection_count": 3,
+        "inflection_u": [
+          0.07765690376569037,
+          0.5020502092050209,
+          0.910041841004184
+        ],
+        "chamfer_mean": 4.41133737536671,
+        "hausdorff": 16.07124799850543,
+        "rms_projection_error": 9.014312568420573,
+        "endpoint_error": 0.0
+      },
+      "warnings": []
+    },
+    {
+      "label": "soft_l_blend_bumper",
+      "passed": true,
+      "metrics": {
+        "degree": 7,
+        "span": 1,
+        "single_span": true,
+        "cv_count": 8,
+        "knot_count": 16,
+        "cv_spacing_ratio": 1.5077091016338637,
+        "cv_min_spacing": 30.12812199415435,
+        "cv_max_spacing": 45.4244437457219,
+        "control_polygon_turnback": false,
+        "max_abs_curvature": 0.014992021744770843,
+        "curvature_smoothness": 3.7649961357090886e-08,
+        "curvature_jerk": 3.527044386711527e-11,
+        "curvature_peak_count": 2,
+        "curvature_oscillation": 0.02629640218526955,
+        "inflection_count": 2,
+        "inflection_u": [
+          0.1596652719665272,
+          0.9325941422594142
+        ],
+        "chamfer_mean": 4.79227926511844,
+        "hausdorff": 19.888268964533566,
+        "rms_projection_error": 10.207472274467767,
+        "endpoint_error": 0.0
+      },
+      "warnings": []
+    }
+  ]
+}

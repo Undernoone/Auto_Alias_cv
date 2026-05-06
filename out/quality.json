@@ -1,0 +1,68 @@
+{
+  "schema": "autoalias.curves.v1",
+  "unit": "px",
+  "curves": [],
+  "quality": [
+    {
+      "label": "beltline_s_curve",
+      "passed": true,
+      "metrics": {
+        "degree": 7,
+        "span": 1,
+        "single_span": true,
+        "cv_count": 8,
+        "knot_count": 16,
+        "cv_spacing_ratio": 1.437946527173507,
+        "cv_min_spacing": 48.34660122689057,
+        "cv_max_spacing": 69.51982733484971,
+        "control_polygon_turnback": false,
+        "max_abs_curvature": 0.007930313223271621,
+        "curvature_smoothness": 4.677339078061647e-08,
+        "curvature_jerk": 5.1510922403074185e-11,
+        "curvature_peak_count": 2,
+        "curvature_oscillation": 0.04700675146383267,
+        "inflection_count": 3,
+        "inflection_u": [
+          0.06945606694560669,
+          0.49999999999999994,
+          0.9182426778242676
+        ],
+        "chamfer_mean": 4.529614862810529,
+        "hausdorff": 15.995128570070124,
+        "rms_projection_error": 9.043849421830922,
+        "endpoint_error": 0.0
+      },
+      "warnings": []
+    },
+    {
+      "label": "soft_l_blend_bumper",
+      "passed": true,
+      "metrics": {
+        "degree": 7,
+        "span": 1,
+        "single_span": true,
+        "cv_count": 8,
+        "knot_count": 16,
+        "cv_spacing_ratio": 1.4384916007708703,
+        "cv_min_spacing": 31.517961289839132,
+        "cv_max_spacing": 45.33832258885502,
+        "control_polygon_turnback": false,
+        "max_abs_curvature": 0.014423453239081866,
+        "curvature_smoothness": 2.655992718202857e-08,
+        "curvature_jerk": 1.9018540218929663e-11,
+        "curvature_peak_count": 1,
+        "curvature_oscillation": 0.02315947970114742,
+        "inflection_count": 2,
+        "inflection_u": [
+          0.13711297071129708,
+          0.9489958158995815
+        ],
+        "chamfer_mean": 5.166330742547505,
+        "hausdorff": 19.88231732822499,
+        "rms_projection_error": 10.301304201796803,
+        "endpoint_error": 0.0
+      },
+      "warnings": []
+    }
+  ]
+}

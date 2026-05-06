@@ -1,0 +1,12 @@
+name: autoalias
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - scipy
+  - opencv
+  - pydantic
+  - rich
+  - pytest
+  - pip

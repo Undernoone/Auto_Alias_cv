@@ -1,0 +1,68 @@
+{
+  "schema": "autoalias.curves.v1",
+  "unit": "px",
+  "curves": [],
+  "quality": [
+    {
+      "label": "beltline_s_curve",
+      "passed": true,
+      "metrics": {
+        "degree": 7,
+        "span": 1,
+        "single_span": true,
+        "cv_count": 8,
+        "knot_count": 16,
+        "cv_spacing_ratio": 1.508677309159308,
+        "cv_min_spacing": 46.82043487879797,
+        "cv_max_spacing": 70.63692770661353,
+        "control_polygon_turnback": false,
+        "max_abs_curvature": 0.009805128710819757,
+        "curvature_smoothness": 6.001998008191052e-08,
+        "curvature_jerk": 8.605285676955519e-11,
+        "curvature_peak_count": 2,
+        "curvature_oscillation": 0.05038428774169413,
+        "inflection_count": 3,
+        "inflection_u": [
+          0.07765690376569037,
+          0.5020502092050209,
+          0.910041841004184
+        ],
+        "chamfer_mean": 4.41133737536671,
+        "hausdorff": 16.07124799850543,
+        "rms_projection_error": 9.014312568420573,
+        "endpoint_error": 0.0
+      },
+      "warnings": []
+    },
+    {
+      "label": "soft_l_blend_bumper",
+      "passed": true,
+      "metrics": {
+        "degree": 7,
+        "span": 1,
+        "single_span": true,
+        "cv_count": 8,
+        "knot_count": 16,
+        "cv_spacing_ratio": 1.5077091016338637,
+        "cv_min_spacing": 30.12812199415435,
+        "cv_max_spacing": 45.4244437457219,
+        "control_polygon_turnback": false,
+        "max_abs_curvature": 0.014992021744770843,
+        "curvature_smoothness": 3.7649961357090886e-08,
+        "curvature_jerk": 3.527044386711527e-11,
+        "curvature_peak_count": 2,
+        "curvature_oscillation": 0.02629640218526955,
+        "inflection_count": 2,
+        "inflection_u": [
+          0.1596652719665272,
+          0.9325941422594142
+        ],
+        "chamfer_mean": 4.79227926511844,
+        "hausdorff": 19.888268964533566,
+        "rms_projection_error": 10.207472274467767,
+        "endpoint_error": 0.0
+      },
+      "warnings": []
+    }
+  ]
+}

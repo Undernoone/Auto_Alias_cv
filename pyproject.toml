@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autoalias-curves"
+version = "0.1.0"
+description = "Automotive image to Alias-ready single-span NURBS curve reconstruction."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "AutoAlias" }]
+dependencies = [
+  "numpy>=1.24",
+  "opencv-python>=4.8",
+  "scipy>=1.10",
+  "pydantic>=2.0",
+  "rich>=13.0"
+]
+
+[project.optional-dependencies]
+deep = [
+  "torch>=2.2",
+  "torchvision>=0.17",
+  "transformers>=4.40"
+]
+cad = [
+  "pythonocc-core>=7.7.0"
+]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.5"
+]
+
+[project.scripts]
+autoalias = "autoalias.cli:main"
+autoalias-train = "autoalias.learning.train_supervised:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
