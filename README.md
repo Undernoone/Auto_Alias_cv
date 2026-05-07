@@ -105,6 +105,25 @@ F:\430AutoAlias\corrections\<image-name>.topology_corrections.json
 
 These files are the first training dataset for the curve-topology model.
 
+Export Alias curves directly from manually reviewed segmentation:
+
+```powershell
+.\scripts\autoalias.cmd fit-reviewed F:\430AutoAlias\corrections\*.topology_corrections.json --out F:\430AutoAlias\out_reviewed --degree auto
+```
+
+This command reads only the saved manual `design_curves`, fits each one as a compact
+degree 3/5/7 single-span NURBS curve, and writes:
+
+- `reviewed_curves.igs`: Alias import file;
+- `reviewed_curves.json`: compact CV/degree/weight/knot data;
+- `reviewed_clean_preview.svg`: clean curve preview;
+- `reviewed_preview.svg`: debug preview with skeleton target, CV polygon and curvature comb.
+
+When a saved manual design curve contains several boundary points, AutoAlias treats
+them as split boundaries, not as one long fitting guide. For example, points
+`1, 2, 3, 4` export as three independent single-span curves: `1->2`, `2->3`,
+and `3->4`. If the curve is closed, the final `N->1` segment is exported too.
+
 Convert reviewed curves into supervised decoder data:
 
 ```powershell

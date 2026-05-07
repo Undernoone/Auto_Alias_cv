@@ -20,10 +20,18 @@ def main(argv: list[str] | None = None) -> int:
         return _fit_points(args)
     if args.command == "review-image":
         return _review_image(args)
+    if args.command == "skeleton-review":
+        return _skeleton_review(args)
+    if args.command == "fit-reviewed":
+        return _fit_reviewed(args)
     if args.command == "build-training-set":
         return _build_training_set(args)
     if args.command == "train-decoder":
         return _train_decoder(args)
+    if args.command == "decode-checkpoint":
+        return _decode_checkpoint(args)
+    if args.command == "infer-image-checkpoint":
+        return _infer_image_checkpoint(args)
     if args.command == "validate-json":
         return _validate_json(args)
     parser.print_help()
@@ -52,6 +60,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_review.add_argument("--port", type=int, default=8765)
     p_review.add_argument("--no-browser", action="store_true")
 
+    p_skeleton_review = sub.add_parser(
+        "skeleton-review",
+        help="serve a LAN web tool for image upload, skeleton routing, manual splitting and IGES export",
+    )
+    p_skeleton_review.add_argument("--out", type=Path, default=Path("lan_reviews"))
+    p_skeleton_review.add_argument("--host", default="0.0.0.0")
+    p_skeleton_review.add_argument("--port", type=int, default=8765)
+    p_skeleton_review.add_argument("--no-browser", action="store_true")
+
+    p_fit_reviewed = sub.add_parser(
+        "fit-reviewed",
+        help="fit Alias-ready curves from manually saved review design curves",
+    )
+    p_fit_reviewed.add_argument("annotations", nargs="+", type=Path)
+    p_fit_reviewed.add_argument("--out", type=Path, default=Path("out_reviewed"))
+    p_fit_reviewed.add_argument("--degree", default="auto", help="auto, 3, 4, 5, 6 or 7")
+    p_fit_reviewed.add_argument("--min-points", type=int, default=8)
+
     p_build = sub.add_parser(
         "build-training-set",
         help="convert reviewed manual curves into neural decoder supervision JSON",
@@ -70,6 +96,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--hidden-dim", type=int, default=256)
     p_train.add_argument("--layers", type=int, default=4)
     p_train.add_argument("--heads", type=int, default=8)
+
+    p_decode = sub.add_parser(
+        "decode-checkpoint",
+        help="load a trained decoder checkpoint and export Alias-ready curves",
+    )
+    p_decode.add_argument("checkpoint", type=Path)
+    p_decode.add_argument("json", type=Path)
+    p_decode.add_argument("--out", type=Path, default=Path("out_checkpoint"))
+    p_decode.add_argument("--degree-source", choices=("input", "predicted"), default="input")
+    p_decode.add_argument("--n-points", type=int, default=128)
+    p_decode.add_argument("--max-curves", type=int, default=200)
+
+    p_img_decode = sub.add_parser(
+        "infer-image-checkpoint",
+        help="extract image candidates, decode with checkpoint, and export IGES",
+    )
+    p_img_decode.add_argument("image", type=Path)
+    p_img_decode.add_argument("--checkpoint", required=True, type=Path)
+    p_img_decode.add_argument("--out", type=Path, default=Path("out_image_checkpoint"))
+    p_img_decode.add_argument("--degree-source", choices=("input", "predicted"), default="predicted")
+    p_img_decode.add_argument("--n-points", type=int, default=128)
+    p_img_decode.add_argument("--max-curves", type=int, default=80)
 
     p_val = sub.add_parser("validate-json", help="validate an AutoAlias curves.json file")
     p_val.add_argument("curves_json", type=Path)
@@ -150,6 +198,48 @@ def _review_image(args: argparse.Namespace) -> int:
     return 0
 
 
+def _skeleton_review(args: argparse.Namespace) -> int:
+    from autoalias.review.workflow_server import run_skeleton_review_server
+
+    run_skeleton_review_server(
+        args.out,
+        host=args.host,
+        port=args.port,
+        open_browser=not args.no_browser,
+    )
+    return 0
+
+
+def _fit_reviewed(args: argparse.Namespace) -> int:
+    from autoalias.review.fit_reviewed import fit_reviewed_annotations
+
+    degree = _parse_degree(args.degree)
+    result = fit_reviewed_annotations(
+        args.annotations,
+        args.out,
+        degree=degree,
+        min_points=args.min_points,
+    )
+    passed = sum(1 for report in result.reports if report.passed)
+    print(f"AutoAlias fitted {len(result.curves)} manually reviewed curve(s) to {result.out}")
+    print(f"Quality: {passed}/{len(result.reports)} passed")
+    print(f"Alias file: {result.out / 'reviewed_curves.igs'}")
+    print(f"Compact curve JSON: {result.out / 'reviewed_curves.json'}")
+    print(f"Preview SVG: {result.out / 'reviewed_clean_preview.svg'}")
+    if result.skipped_count:
+        print(f"Skipped {result.skipped_count} incomplete reviewed curve(s)")
+    for report in result.reports[:40]:
+        status = "PASS" if report.passed else "WARN"
+        degree_value = report.metrics.get("degree", "?")
+        span = report.metrics.get("span", "?")
+        print(f"{status} {report.label}: degree={degree_value} span={span}")
+        for warning in report.warnings[:3]:
+            print(f"  - {warning}")
+    if len(result.reports) > 40:
+        print(f"... {len(result.reports) - 40} more curve report(s) omitted")
+    return 0 if result.curves else 1
+
+
 def _build_training_set(args: argparse.Namespace) -> int:
     from autoalias.learning.annotation_dataset import build_supervision_from_annotations
 
@@ -170,6 +260,25 @@ def _train_decoder(args: argparse.Namespace) -> int:
     from autoalias.learning.train_supervised import train
 
     return train(args)
+
+
+def _decode_checkpoint(args: argparse.Namespace) -> int:
+    from autoalias.learning.predict_checkpoint import decode
+
+    return decode(args)
+
+
+def _infer_image_checkpoint(args: argparse.Namespace) -> int:
+    from autoalias.learning.predict_checkpoint import decode_image
+
+    return decode_image(
+        args.checkpoint,
+        args.image,
+        args.out,
+        degree_source=args.degree_source,
+        n_points=args.n_points,
+        max_curves=args.max_curves,
+    )
 
 
 def _validate_json(args: argparse.Namespace) -> int:

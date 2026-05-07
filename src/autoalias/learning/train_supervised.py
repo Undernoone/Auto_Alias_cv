@@ -58,11 +58,22 @@ def train(args: argparse.Namespace) -> int:
         print(f"epoch {epoch:03d} loss={total / max(count, 1):.6f}")
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"model": model.state_dict(), "args": vars(args)}, args.out)
+    torch.save({"model": model.state_dict(), "args": _serializable_args(args)}, args.out)
     print(f"saved {args.out}")
     return 0
 
 
+def _serializable_args(args: argparse.Namespace) -> dict:
+    clean = {}
+    for key, value in vars(args).items():
+        if isinstance(value, Path):
+            clean[key] = str(value)
+        elif isinstance(value, list):
+            clean[key] = [str(item) if isinstance(item, Path) else item for item in value]
+        else:
+            clean[key] = value
+    return clean
+
+
 if __name__ == "__main__":
     raise SystemExit(main())
-
