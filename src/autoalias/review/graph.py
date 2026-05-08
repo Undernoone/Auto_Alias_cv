@@ -92,15 +92,83 @@ class SkeletonRouter:
             "snap_distance_end": round(float(end_dist), 3),
         }
 
+    def route_candidates(
+        self,
+        start: tuple[float, float],
+        end: tuple[float, float],
+        *,
+        count: int = 3,
+        max_preview_points: int = 900,
+    ) -> list[dict[str, Any]]:
+        if len(self.coords) == 0:
+            return [
+                {
+                    "ok": False,
+                    "reason": "no skeleton pixels",
+                    "points": [list(start), list(end)],
+                }
+            ]
+        start_idx, start_dist = self.nearest_index(start)
+        end_idx, end_dist = self.nearest_index(end)
+        candidates: list[dict[str, Any]] = []
+        penalty: dict[int, float] = {}
+        attempts = max(count * 2, count)
+        for attempt in range(attempts):
+            path = self._shortest_path(start_idx, end_idx, node_penalty=penalty)
+            if not path:
+                break
+            if _is_distinct_path(path, [item["path_indices"] for item in candidates]):
+                routed = self.coords[path]
+                routed = _smooth_route_points(routed)
+                routed = _downsample_points(routed, max_preview_points)
+                candidates.append(
+                    {
+                        "ok": True,
+                        "candidate_index": len(candidates),
+                        "points": _round_points(routed),
+                        "point_count": int(len(routed)),
+                        "length": round(float(_curve_length(routed)), 3),
+                        "snapped_start": _round_points(self.coords[[start_idx]])[0],
+                        "snapped_end": _round_points(self.coords[[end_idx]])[0],
+                        "snap_distance_start": round(float(start_dist), 3),
+                        "snap_distance_end": round(float(end_dist), 3),
+                        "path_indices": path,
+                    }
+                )
+                if len(candidates) >= count:
+                    break
+            penalty_value = 20.0 + 20.0 * attempt
+            for node in path[1:-1]:
+                penalty[node] = penalty.get(node, 0.0) + penalty_value
+        if not candidates:
+            return [
+                {
+                    "ok": False,
+                    "reason": "no connected skeleton path",
+                    "points": [list(start), list(end)],
+                    "snap_distance_start": round(float(start_dist), 3),
+                    "snap_distance_end": round(float(end_dist), 3),
+                }
+            ]
+        for item in candidates:
+            item.pop("path_indices", None)
+        return candidates
+
     def nearest_index(self, point: tuple[float, float]) -> tuple[int, float]:
         p = np.asarray(point, dtype=float)
         d2 = np.sum((self.coords - p) ** 2, axis=1)
         idx = int(np.argmin(d2))
         return idx, float(d2[idx] ** 0.5)
 
-    def _shortest_path(self, start_idx: int, end_idx: int) -> list[int]:
+    def _shortest_path(
+        self,
+        start_idx: int,
+        end_idx: int,
+        node_penalty: dict[int, float] | None = None,
+    ) -> list[int]:
         if start_idx == end_idx:
             return [start_idx]
+        node_penalty = node_penalty or {}
         count = len(self.coords)
         distances = [float("inf")] * count
         previous = [-1] * count
@@ -113,7 +181,7 @@ class SkeletonRouter:
             if dist > distances[current]:
                 continue
             for other, weight in self.adjacency[current]:
-                new_dist = dist + weight
+                new_dist = dist + weight + node_penalty.get(other, 0.0)
                 if new_dist < distances[other]:
                     distances[other] = new_dist
                     previous[other] = current
@@ -356,6 +424,20 @@ def _smooth_route_points(points: np.ndarray, passes: int = 2) -> np.ndarray:
         smoothed[1:-1] = 0.25 * out[:-2] + 0.5 * out[1:-1] + 0.25 * out[2:]
         out = smoothed
     return out
+
+
+def _is_distinct_path(path: list[int], existing: list[list[int]], max_overlap: float = 0.82) -> bool:
+    if not existing:
+        return True
+    current = set(path)
+    if not current:
+        return False
+    for other in existing:
+        shared = len(current.intersection(other))
+        denom = max(min(len(current), len(other)), 1)
+        if shared / denom > max_overlap:
+            return False
+    return True
 
 
 def _edge_coverage_metrics(

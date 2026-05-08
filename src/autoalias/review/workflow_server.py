@@ -10,6 +10,13 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+import numpy as np
+
+from autoalias.geometry.bezier import evaluate_bezier
+from autoalias.geometry.fitting import FittingOptions, SingleSpanFitter
+from autoalias.geometry.polyline import remove_duplicate_points
+from autoalias.models import CurveCandidate
+from autoalias.quality import ClassAValidator
 from autoalias.review.fit_reviewed import fit_reviewed_annotations
 from autoalias.review.server import ReviewSession
 
@@ -100,6 +107,12 @@ def _make_handler(
                     return
                 self._handle_route(session)
                 return
+            if parsed.path == "/api/fit-preview":
+                session = self._require_session(parsed)
+                if session is None:
+                    return
+                self._handle_fit_preview(session)
+                return
             if parsed.path == "/api/snap":
                 session = self._require_session(parsed)
                 if session is None:
@@ -155,7 +168,29 @@ def _make_handler(
                 if not isinstance(points, list):
                     raise ValueError("points must be a list")
                 closed = bool(payload.get("closed", False))
-                self._send_json(session.route_points(points, closed=closed))
+                branch_choices = payload.get("branch_choices", [])
+                if not isinstance(branch_choices, list):
+                    branch_choices = []
+                self._send_json(
+                    _route_points_with_choices(
+                        session,
+                        points,
+                        closed=closed,
+                        branch_choices=branch_choices,
+                        candidate_count=int(payload.get("candidate_count", 3)),
+                    )
+                )
+            except Exception as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+
+        def _handle_fit_preview(self, session: ReviewSession) -> None:
+            try:
+                payload = self._read_json()
+                degree = payload.get("degree", "auto")
+                route_segments = payload.get("route_segments", [])
+                if not isinstance(route_segments, list):
+                    raise ValueError("route_segments must be a list")
+                self._send_json(_fit_preview_segments(route_segments, degree=degree))
             except Exception as exc:
                 self._send_json({"ok": False, "error": str(exc)}, status=400)
 
@@ -165,7 +200,18 @@ def _make_handler(
                 point = _coerce_xy(payload.get("point", payload))
                 if point is None:
                     raise ValueError("point must contain x and y")
+                max_distance = float(payload.get("max_distance", 24.0))
                 index, distance = session.router.nearest_index(point)
+                if distance > max_distance:
+                    self._send_json(
+                        {
+                            "ok": False,
+                            "reason": "nearest skeleton point is outside snap radius",
+                            "distance": round(float(distance), 3),
+                            "max_distance": round(float(max_distance), 3),
+                        }
+                    )
+                    return
                 snapped = session.router.coords[index]
                 self._send_json(
                     {
@@ -285,6 +331,194 @@ def _make_handler(
             self.wfile.write(data)
 
     return SkeletonReviewHandler
+
+
+def _route_points_with_choices(
+    session: ReviewSession,
+    points: list[Any],
+    *,
+    closed: bool = False,
+    branch_choices: list[Any] | None = None,
+    candidate_count: int = 3,
+) -> dict[str, Any]:
+    clean = [_coerce_xy(item) for item in points]
+    clean = [item for item in clean if item is not None]
+    if len(clean) < 2:
+        return {"ok": False, "reason": "need at least two points", "segments": [], "points": []}
+    branch_choices = branch_choices or []
+    segments: list[dict[str, Any]] = []
+    combined: list[list[float]] = []
+    all_ok = True
+    pairs = list(zip(clean, clean[1:]))
+    is_closed = bool(closed and len(clean) >= 3)
+    if is_closed:
+        pairs.append((clean[-1], clean[0]))
+    for index, (start, end) in enumerate(pairs):
+        candidates = session.router.route_candidates(
+            start,
+            end,
+            count=max(1, min(int(candidate_count), 5)),
+        )
+        choice = _safe_choice(branch_choices, index, len(candidates))
+        chosen = candidates[choice] if candidates else {"ok": False, "points": [list(start), list(end)]}
+        segment_points = chosen.get("points") or [list(start), list(end)]
+        if combined and segment_points:
+            combined.extend(segment_points[1:])
+        else:
+            combined.extend(segment_points)
+        all_ok = bool(chosen.get("ok")) and all_ok
+        segments.append(
+            {
+                **chosen,
+                "segment_index": index,
+                "selected_candidate": choice,
+                "alternatives": candidates,
+            }
+        )
+    return {
+        "ok": all_ok,
+        "closed": is_closed,
+        "segments": segments,
+        "points": combined,
+        "point_count": len(combined),
+    }
+
+
+def _fit_preview_segments(route_segments: list[dict[str, Any]], degree: int | str = "auto") -> dict[str, Any]:
+    parsed_degree = _parse_preview_degree(degree)
+    validator = ClassAValidator()
+    previews: list[dict[str, Any]] = []
+    for index, segment in enumerate(route_segments):
+        raw_points = segment.get("points") or []
+        points = _as_points3(raw_points)
+        try:
+            points = remove_duplicate_points(points, eps=0.5)
+            points = _ensure_preview_points(points)
+            if len(points) < 4:
+                raise ValueError("not enough points")
+            label = f"preview_segment_{index + 1:03d}"
+            candidate = CurveCandidate(label=label, points=points, source="fit_preview")
+            curve = _fit_preview_lowest_degree(candidate, points, parsed_degree, validator)
+            report = validator.validate(curve, points)
+            samples = evaluate_bezier(curve.cvs, np.linspace(0.0, 1.0, 120), curve.weights)
+            previews.append(
+                {
+                    "ok": True,
+                    "segment_index": index,
+                    "degree": curve.degree,
+                    "span": curve.span_count,
+                    "samples": _round_xy(samples),
+                    "cvs": _round_xy(curve.cvs),
+                    "passed": report.passed,
+                    "color": _quality_color(report.warnings),
+                    "warnings": report.warnings,
+                    "metrics": report.metrics,
+                }
+            )
+        except Exception as exc:
+            previews.append(
+                {
+                    "ok": False,
+                    "segment_index": index,
+                    "color": "#d93025",
+                    "warnings": [str(exc)],
+                }
+            )
+    passed = sum(1 for item in previews if item.get("passed"))
+    return {
+        "ok": True,
+        "segments": previews,
+        "segment_count": len(previews),
+        "passed_count": passed,
+    }
+
+
+def _fit_preview_lowest_degree(
+    candidate: CurveCandidate,
+    target_points: np.ndarray,
+    degree: int | str,
+    validator: ClassAValidator,
+):
+    if isinstance(degree, int):
+        return SingleSpanFitter(FittingOptions(degree=degree)).fit_candidate(candidate)
+    best_curve = None
+    best_score = float("inf")
+    for candidate_degree in (3, 4, 5, 6, 7):
+        curve = SingleSpanFitter(FittingOptions(degree=candidate_degree)).fit_candidate(candidate)
+        report = validator.validate(curve, target_points)
+        chamfer = float(report.metrics.get("chamfer_mean", 999.0))
+        warnings = len(report.warnings)
+        score = warnings * 1000.0 + chamfer + candidate_degree * 0.01
+        if report.passed:
+            return curve
+        if score < best_score:
+            best_score = score
+            best_curve = curve
+    if best_curve is None:
+        raise ValueError("failed to fit any degree")
+    return best_curve
+
+
+def _safe_choice(branch_choices: list[Any], index: int, candidate_count: int) -> int:
+    if candidate_count <= 0:
+        return 0
+    try:
+        value = int(branch_choices[index])
+    except Exception:
+        value = 0
+    return max(0, min(value, candidate_count - 1))
+
+
+def _parse_preview_degree(value: Any) -> int | str:
+    if str(value) == "auto":
+        return "auto"
+    degree = int(value)
+    if degree not in (3, 4, 5, 6, 7):
+        return "auto"
+    return degree
+
+
+def _quality_color(warnings: list[str]) -> str:
+    if not warnings:
+        return "#14a05a"
+    joined = " ".join(warnings).lower()
+    if "turnback" in joined or "curvature" in joined or "oscillation" in joined:
+        return "#d93025"
+    return "#f4a000"
+
+
+def _as_points3(points: Any) -> np.ndarray:
+    arr = np.asarray(points, dtype=float)
+    if arr.ndim != 2 or arr.shape[1] not in (2, 3):
+        return np.zeros((0, 3), dtype=float)
+    if arr.shape[1] == 2:
+        arr = np.column_stack([arr, np.zeros(len(arr), dtype=float)])
+    return arr
+
+
+def _ensure_preview_points(points: np.ndarray) -> np.ndarray:
+    if len(points) >= 4:
+        return points
+    if len(points) < 2:
+        return points
+    return _line_points(points[0], points[-1])
+
+
+def _line_points(a: np.ndarray, b: np.ndarray, count: int = 8) -> np.ndarray:
+    u = np.linspace(0.0, 1.0, count)
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    pts = a * (1.0 - u[:, None]) + b * u[:, None]
+    if pts.shape[1] == 2:
+        pts = np.column_stack([pts, np.zeros(len(pts), dtype=float)])
+    return pts
+
+
+def _round_xy(points: np.ndarray) -> list[list[float]]:
+    arr = np.asarray(points, dtype=float)
+    if arr.ndim != 2 or arr.shape[1] < 2:
+        return []
+    return [[round(float(x), 3), round(float(y), 3)] for x, y in arr[:, :2]]
 
 
 def _sid(parsed) -> str:
@@ -462,6 +696,17 @@ a { color:#075fd7; }
         </div>
       </div>
       <div class="box" id="routeBox">在图上点击两个或多个点，蓝线会沿骨架自动生成。</div>
+      <div class="grid2" style="margin-top:8px">
+        <select id="snapRadius">
+          <option value="10">吸附半径 10px</option>
+          <option value="24" selected>吸附半径 24px</option>
+          <option value="48">吸附半径 48px</option>
+          <option value="9999">全局最近骨架</option>
+        </select>
+        <button class="primary" id="btnAliasPreview">隐藏拟合预览</button>
+      </div>
+      <div class="box" id="branchBox" style="margin-top:8px">暂无分支候选</div>
+      <div class="box" id="qualityBox" style="margin-top:8px">暂无拟合质量</div>
 
       <h2>显示</h2>
       <div class="grid2">
@@ -504,10 +749,14 @@ let selectedCutIndex = null;
 let routePreview = null;
 let routeRequestId = 0;
 let routeStatus = "";
+let fitPreview = null;
+let fitPreviewRequestId = 0;
+let branchChoices = [];
 let closedCurve = false;
 let activeCurve = null;
 let showSkeleton = true;
 let showFullSkeleton = true;
+let showAliasPreview = true;
 let transform = { scale: 1, x: 0, y: 0 };
 let dragging = false;
 let lastMouse = null;
@@ -587,8 +836,10 @@ function render() {
   ctx.drawImage(img, 0, 0);
   if (showFullSkeleton) drawFullSkeleton();
   if (showSkeleton) drawSkeleton();
+  drawBranchAlternatives();
   for (const curve of designCurves) drawPolyline(curve.routed_points || [], "#0b6dff", 2.4, 0.95);
   if (routePreview && routePreview.points) drawPolyline(routePreview.points, "#006dff", 3.2, 1);
+  if (showAliasPreview) drawFitPreview();
   drawCutPoints();
   ctx.restore();
 }
@@ -639,6 +890,32 @@ function drawPolyline(points, color, width, alpha) {
   ctx.restore();
 }
 
+function drawBranchAlternatives() {
+  if (!routePreview || !routePreview.segments) return;
+  const colors = ["rgba(245,128,32,.42)", "rgba(170,80,220,.40)", "rgba(0,150,190,.38)"];
+  ctx.save();
+  ctx.setLineDash([8 / transform.scale, 7 / transform.scale]);
+  for (const segment of routePreview.segments) {
+    const selected = segment.selected_candidate || 0;
+    const alternatives = segment.alternatives || [];
+    for (let i = 0; i < alternatives.length; i++) {
+      if (i === selected) continue;
+      const alt = alternatives[i];
+      drawPolyline(alt.points || [], colors[i % colors.length], 1.6, 1);
+    }
+  }
+  ctx.setLineDash([]);
+  ctx.restore();
+}
+
+function drawFitPreview() {
+  if (!fitPreview || !fitPreview.segments) return;
+  for (const seg of fitPreview.segments) {
+    if (!seg.ok || !seg.samples) continue;
+    drawPolyline(seg.samples, seg.color || "#14a05a", 4.0, 0.95);
+  }
+}
+
 function drawCutPoints() {
   ctx.save();
   for (let i = 0; i < cutPoints.length; i++) {
@@ -687,11 +964,34 @@ async function addCutPoint(wx, wy) {
 
 function round3(v) { return Math.round(v * 1000) / 1000; }
 
+function expectedSegmentCount() {
+  if (cutPoints.length < 2) return 0;
+  return Math.max(0, cutPoints.length - 1) + (closedCurve && cutPoints.length >= 3 ? 1 : 0);
+}
+
+function normalizeBranchChoices() {
+  const count = expectedSegmentCount();
+  while (branchChoices.length < count) branchChoices.push(0);
+  if (branchChoices.length > count) branchChoices = branchChoices.slice(0, count);
+}
+
+function cleanRouteSegment(segment) {
+  return {
+    ok: !!segment.ok,
+    points: segment.points || [],
+    segment_index: segment.segment_index || 0,
+    selected_candidate: segment.selected_candidate || 0,
+    length: segment.length || 0
+  };
+}
+
 async function snapPoint(wx, wy) {
+  const radiusEl = document.getElementById("snapRadius");
+  const maxDistance = radiusEl ? parseFloat(radiusEl.value || "24") : 24;
   const res = await fetch(api("/api/snap"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ point: { x: wx, y: wy } })
+    body: JSON.stringify({ point: { x: wx, y: wy }, max_distance: maxDistance })
   });
   const result = await res.json();
   if (!result.ok) throw new Error(result.error || "snap failed");
@@ -722,18 +1022,25 @@ async function refreshRoutePreview() {
   const requestId = ++routeRequestId;
   if (cutPoints.length < 2) {
     routePreview = null;
+    fitPreview = null;
     routeStatus = "";
     updatePanel();
     render();
     return;
   }
+  normalizeBranchChoices();
   routeStatus = "正在沿骨架生成蓝线...";
   updatePanel();
   try {
     const res = await fetch(api("/api/route"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ points: cutPoints, closed: closedCurve })
+      body: JSON.stringify({
+        points: cutPoints,
+        closed: closedCurve,
+        branch_choices: branchChoices,
+        candidate_count: 2
+      })
     });
     const result = await res.json();
     if (requestId !== routeRequestId) return;
@@ -741,13 +1048,39 @@ async function refreshRoutePreview() {
     routeStatus = result.ok
       ? `蓝线已生成：${result.point_count || 0} 个骨架点`
       : "骨架未连通，请在中间多加一个引导点";
+    await refreshFitPreview();
   } catch (_err) {
     if (requestId !== routeRequestId) return;
     routePreview = null;
+    fitPreview = null;
     routeStatus = "路径生成失败";
   }
   updatePanel();
   render();
+}
+
+async function refreshFitPreview() {
+  const requestId = ++fitPreviewRequestId;
+  if (!routePreview || !routePreview.segments || routePreview.segments.length < 1) {
+    fitPreview = null;
+    return;
+  }
+  try {
+    const res = await fetch(api("/api/fit-preview"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        route_segments: routePreview.segments.map(cleanRouteSegment),
+        degree: document.getElementById("degree").value
+      })
+    });
+    const result = await res.json();
+    if (requestId !== fitPreviewRequestId) return;
+    fitPreview = result.ok ? result : null;
+  } catch (_err) {
+    if (requestId !== fitPreviewRequestId) return;
+    fitPreview = null;
+  }
 }
 
 async function saveCurrent(startNext=false) {
@@ -762,7 +1095,8 @@ async function saveCurrent(startNext=false) {
     cut_points: cutPoints.map((p, i) => ({ ...p, order: i })),
     closed: closedCurve,
     routed_points: routePreview && routePreview.points ? routePreview.points : [],
-    route_segments: routePreview && routePreview.segments ? routePreview.segments : [],
+    route_segments: routePreview && routePreview.segments ? routePreview.segments.map(cleanRouteSegment) : [],
+    branch_choices: branchChoices.slice(),
     route_ok: routePreview ? !!routePreview.ok : false,
     created_at: new Date().toISOString()
   };
@@ -816,7 +1150,9 @@ function clearCurrent() {
   cutPoints = [];
   selectedCutIndex = null;
   routePreview = null;
+  fitPreview = null;
   routeStatus = "";
+  branchChoices = [];
   closedCurve = false;
   activeCurve = null;
   updatePanel();
@@ -828,6 +1164,7 @@ function undoPoint() {
   cutPoints.pop();
   selectedCutIndex = cutPoints.length ? cutPoints.length - 1 : null;
   if (cutPoints.length < 3) closedCurve = false;
+  normalizeBranchChoices();
   refreshRoutePreview();
 }
 
@@ -836,12 +1173,14 @@ function deleteSelected() {
   cutPoints.splice(selectedCutIndex, 1);
   selectedCutIndex = cutPoints.length ? Math.min(selectedCutIndex, cutPoints.length - 1) : null;
   if (cutPoints.length < 3) closedCurve = false;
+  normalizeBranchChoices();
   refreshRoutePreview();
 }
 
 function toggleClosed() {
   if (cutPoints.length < 3) return;
   closedCurve = !closedCurve;
+  normalizeBranchChoices();
   refreshRoutePreview();
 }
 
@@ -870,12 +1209,15 @@ function renderCurveList() {
       activeCurve = curve.id;
       cutPoints = (curve.manual_points || curve.cut_points || []).map(p => ({ ...p }));
       closedCurve = !!curve.closed;
+      branchChoices = (curve.branch_choices || []).slice();
+      normalizeBranchChoices();
       routePreview = { ok: !!curve.route_ok, points: curve.routed_points || [], segments: curve.route_segments || [] };
       routeStatus = routePreview.points.length ? `已加载蓝线：${routePreview.points.length} 个骨架点` : "";
       document.getElementById("semantic").value = curve.semantic || "detail_line";
       selectedCutIndex = null;
       updatePanel();
       render();
+      refreshRoutePreview();
     };
     list.appendChild(item);
   }
@@ -897,18 +1239,68 @@ function updatePanel() {
   document.getElementById("curveCount").textContent = designCurves.length;
   document.getElementById("pointCount").textContent = cutPoints.length;
   document.getElementById("routeBox").textContent = routeStatus || "在图上点击两个或多个点，蓝线会沿骨架自动生成。";
+  renderBranchControls();
+  renderQualityPreview();
   document.getElementById("btnClose").classList.toggle("primary", closedCurve);
   document.getElementById("btnClose").textContent = closedCurve ? "闭合中" : "闭合曲线";
   document.getElementById("btnSkeleton").classList.toggle("primary", showSkeleton);
   document.getElementById("btnSkeleton").textContent = showSkeleton ? "隐藏切段骨架" : "显示切段骨架";
   document.getElementById("btnFullSkeleton").classList.toggle("primary", showFullSkeleton);
   document.getElementById("btnFullSkeleton").textContent = showFullSkeleton ? "隐藏完整骨架" : "显示完整骨架";
+  document.getElementById("btnAliasPreview").classList.toggle("primary", showAliasPreview);
+  document.getElementById("btnAliasPreview").textContent = showAliasPreview ? "隐藏拟合预览" : "显示拟合预览";
   document.getElementById("btnSave").disabled = cutPoints.length < 2;
   document.getElementById("btnSaveNext").disabled = cutPoints.length < 2;
   document.getElementById("btnUndo").disabled = cutPoints.length < 1;
   document.getElementById("btnDelete").disabled = selectedCutIndex == null;
   document.getElementById("btnClose").disabled = cutPoints.length < 3;
   renderCurveList();
+}
+
+function renderBranchControls() {
+  const box = document.getElementById("branchBox");
+  if (!routePreview || !routePreview.segments || routePreview.segments.length === 0) {
+    box.innerHTML = "暂无分支候选";
+    return;
+  }
+  const rows = [];
+  for (const segment of routePreview.segments) {
+    const alternatives = segment.alternatives || [];
+    if (alternatives.length <= 1) continue;
+    const idx = segment.segment_index || 0;
+    const selected = segment.selected_candidate || 0;
+    const buttons = alternatives.map((alt, altIndex) => {
+      const cls = altIndex === selected ? "primary" : "";
+      const text = `方案 ${altIndex + 1} / ${Math.round(alt.length || 0)}px`;
+      return `<button class="${cls}" data-seg="${idx}" data-alt="${altIndex}">${text}</button>`;
+    }).join("");
+    rows.push(`<div style="margin-bottom:8px"><strong>第 ${idx + 1} 段分支</strong><div class="grid2" style="margin-top:5px">${buttons}</div></div>`);
+  }
+  box.innerHTML = rows.length ? rows.join("") : "当前路径没有明显分支候选";
+  for (const btn of box.querySelectorAll("button[data-seg]")) {
+    btn.onclick = () => {
+      const seg = parseInt(btn.getAttribute("data-seg") || "0", 10);
+      const alt = parseInt(btn.getAttribute("data-alt") || "0", 10);
+      branchChoices[seg] = alt;
+      refreshRoutePreview();
+    };
+  }
+}
+
+function renderQualityPreview() {
+  const box = document.getElementById("qualityBox");
+  if (!fitPreview || !fitPreview.segments || fitPreview.segments.length === 0) {
+    box.innerHTML = "暂无拟合质量";
+    return;
+  }
+  const rows = fitPreview.segments.map((seg, i) => {
+    const color = seg.color || "#888";
+    const status = seg.passed ? "通过" : "警告";
+    const degree = seg.degree ? `d${seg.degree}` : "未拟合";
+    const warn = seg.warnings && seg.warnings.length ? seg.warnings.slice(0, 2).join("；") : "曲率/CV 检查正常";
+    return `<div style="border-left:6px solid ${color};padding:4px 0 5px 8px;margin:4px 0"><strong>第 ${i + 1} 段 ${status} ${degree}</strong><br><small>${warn}</small></div>`;
+  });
+  box.innerHTML = rows.join("");
 }
 
 function makeId() { return "curve_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 7); }
@@ -1004,6 +1396,8 @@ document.getElementById("btnClose").onclick = toggleClosed;
 document.getElementById("btnClear").onclick = clearCurrent;
 document.getElementById("btnSkeleton").onclick = () => { showSkeleton = !showSkeleton; updatePanel(); render(); };
 document.getElementById("btnFullSkeleton").onclick = () => { showFullSkeleton = !showFullSkeleton; updatePanel(); render(); };
+document.getElementById("btnAliasPreview").onclick = () => { showAliasPreview = !showAliasPreview; updatePanel(); render(); };
+document.getElementById("degree").onchange = () => { refreshFitPreview().then(() => { updatePanel(); render(); }); };
 document.getElementById("btnReset").onclick = resetView;
 document.getElementById("btnExport").onclick = exportIges;
 resize();
