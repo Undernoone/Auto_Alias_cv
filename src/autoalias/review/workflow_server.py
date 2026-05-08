@@ -295,6 +295,7 @@ def _client_state(session: ReviewSession) -> dict[str, Any]:
     payload = session.state()
     graph = dict(payload.get("graph", {}))
     graph.pop("coverage_fragments", None)
+    graph["full_skeleton_points"] = _downsample_xy(session.router.coords, 12000)
     payload["graph"] = graph
     return payload
 
@@ -357,6 +358,21 @@ def _unique_path(path: Path) -> Path:
 
 def _make_session_id(path: Path) -> str:
     return f"{path.stem}_{int(time.time() * 1000):x}"
+
+
+def _downsample_xy(points: Any, max_count: int) -> list[list[float]]:
+    try:
+        import numpy as np
+
+        arr = np.asarray(points, dtype=float)
+        if arr.ndim != 2 or arr.shape[1] < 2 or len(arr) == 0:
+            return []
+        if len(arr) > max_count:
+            idx = np.linspace(0, len(arr) - 1, max_count).round().astype(int)
+            arr = arr[idx]
+        return [[round(float(x), 3), round(float(y), 3)] for x, y in arr[:, :2]]
+    except Exception:
+        return []
 
 
 def _coerce_xy(item: Any) -> tuple[float, float] | None:
@@ -449,7 +465,8 @@ a { color:#075fd7; }
 
       <h2>显示</h2>
       <div class="grid2">
-        <button class="primary" id="btnSkeleton">显示骨架</button>
+        <button class="primary" id="btnFullSkeleton">隐藏完整骨架</button>
+        <button class="primary" id="btnSkeleton">隐藏切段骨架</button>
         <button id="btnReset">重置视图</button>
       </div>
 
@@ -490,6 +507,7 @@ let routeStatus = "";
 let closedCurve = false;
 let activeCurve = null;
 let showSkeleton = true;
+let showFullSkeleton = true;
 let transform = { scale: 1, x: 0, y: 0 };
 let dragging = false;
 let lastMouse = null;
@@ -567,6 +585,7 @@ function render() {
   ctx.translate(transform.x, transform.y);
   ctx.scale(transform.scale, transform.scale);
   ctx.drawImage(img, 0, 0);
+  if (showFullSkeleton) drawFullSkeleton();
   if (showSkeleton) drawSkeleton();
   for (const curve of designCurves) drawPolyline(curve.routed_points || [], "#0b6dff", 2.4, 0.95);
   if (routePreview && routePreview.points) drawPolyline(routePreview.points, "#006dff", 3.2, 1);
@@ -574,12 +593,26 @@ function render() {
   ctx.restore();
 }
 
+function drawFullSkeleton() {
+  const pts = graph.full_skeleton_points || [];
+  if (!pts.length) return;
+  ctx.save();
+  ctx.fillStyle = "rgba(220,0,0,.70)";
+  const r = Math.max(1.2 / transform.scale, 0.62);
+  for (const p of pts) {
+    ctx.beginPath();
+    ctx.arc(p[0], p[1], r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
 function drawSkeleton() {
   ctx.save();
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
-  ctx.strokeStyle = "rgba(20,20,20,.22)";
-  ctx.lineWidth = Math.max(1.2 / transform.scale, 0.65);
+  ctx.strokeStyle = "rgba(0,140,115,.45)";
+  ctx.lineWidth = Math.max(1.7 / transform.scale, 0.85);
   for (const edge of graph.edges) {
     const pts = edge.points || [];
     if (pts.length < 2) continue;
@@ -867,7 +900,9 @@ function updatePanel() {
   document.getElementById("btnClose").classList.toggle("primary", closedCurve);
   document.getElementById("btnClose").textContent = closedCurve ? "闭合中" : "闭合曲线";
   document.getElementById("btnSkeleton").classList.toggle("primary", showSkeleton);
-  document.getElementById("btnSkeleton").textContent = showSkeleton ? "显示骨架" : "隐藏骨架";
+  document.getElementById("btnSkeleton").textContent = showSkeleton ? "隐藏切段骨架" : "显示切段骨架";
+  document.getElementById("btnFullSkeleton").classList.toggle("primary", showFullSkeleton);
+  document.getElementById("btnFullSkeleton").textContent = showFullSkeleton ? "隐藏完整骨架" : "显示完整骨架";
   document.getElementById("btnSave").disabled = cutPoints.length < 2;
   document.getElementById("btnSaveNext").disabled = cutPoints.length < 2;
   document.getElementById("btnUndo").disabled = cutPoints.length < 1;
@@ -968,6 +1003,7 @@ document.getElementById("btnDelete").onclick = deleteSelected;
 document.getElementById("btnClose").onclick = toggleClosed;
 document.getElementById("btnClear").onclick = clearCurrent;
 document.getElementById("btnSkeleton").onclick = () => { showSkeleton = !showSkeleton; updatePanel(); render(); };
+document.getElementById("btnFullSkeleton").onclick = () => { showFullSkeleton = !showFullSkeleton; updatePanel(); render(); };
 document.getElementById("btnReset").onclick = resetView;
 document.getElementById("btnExport").onclick = exportIges;
 resize();
