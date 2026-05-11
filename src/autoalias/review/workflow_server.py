@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import mimetypes
 import socket
+import threading
 import time
+import uuid
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -35,8 +37,10 @@ def run_skeleton_review_server(
 
     sessions: dict[str, ReviewSession] = {}
     exports: dict[str, dict[str, Path]] = {}
+    ai_jobs: dict[str, dict[str, Any]] = {}
+    ai_job_lock = threading.Lock()
     actual_port = _find_available_port(host, port)
-    handler = _make_handler(out, sessions, exports)
+    handler = _make_handler(out, sessions, exports, ai_jobs, ai_job_lock)
     httpd = ThreadingHTTPServer((host, actual_port), handler)
 
     local_url = f"http://127.0.0.1:{actual_port}/"
@@ -62,6 +66,8 @@ def _make_handler(
     output_dir: Path,
     sessions: dict[str, ReviewSession],
     exports: dict[str, dict[str, Path]],
+    ai_jobs: dict[str, dict[str, Any]],
+    ai_job_lock: threading.Lock,
 ):
     class SkeletonReviewHandler(BaseHTTPRequestHandler):
         server_version = "AutoAliasSkeletonReview/0.1"
@@ -79,6 +85,12 @@ def _make_handler(
                 payload["sid"] = _sid(parsed)
                 payload["exports"] = _export_payload(exports.get(_sid(parsed), {}), _sid(parsed))
                 self._send_json(payload)
+                return
+            if parsed.path == "/api/ai-suggest-status":
+                session = self._require_session(parsed)
+                if session is None:
+                    return
+                self._handle_ai_status(parsed)
                 return
             if parsed.path == "/image":
                 session = self._require_session(parsed)
@@ -118,6 +130,18 @@ def _make_handler(
                 if session is None:
                     return
                 self._handle_snap(session)
+                return
+            if parsed.path == "/api/ai-suggest-start":
+                session = self._require_session(parsed)
+                if session is None:
+                    return
+                self._handle_ai_start(session)
+                return
+            if parsed.path == "/api/ai-suggest":
+                session = self._require_session(parsed)
+                if session is None:
+                    return
+                self._handle_ai_suggest(session)
                 return
             if parsed.path == "/api/corrections":
                 session = self._require_session(parsed)
@@ -190,7 +214,13 @@ def _make_handler(
                 route_segments = payload.get("route_segments", [])
                 if not isinstance(route_segments, list):
                     raise ValueError("route_segments must be a list")
-                self._send_json(_fit_preview_segments(route_segments, degree=degree))
+                self._send_json(
+                    _fit_preview_segments(
+                        route_segments,
+                        degree=degree,
+                        closed=bool(payload.get("closed", False)),
+                    )
+                )
             except Exception as exc:
                 self._send_json({"ok": False, "error": str(exc)}, status=400)
 
@@ -221,6 +251,88 @@ def _make_handler(
                         "distance": round(float(distance), 3),
                     }
                 )
+            except Exception as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+
+        def _handle_ai_start(self, session: ReviewSession) -> None:
+            try:
+                payload = self._read_json(required=False)
+                job_id = uuid.uuid4().hex
+                sid = _sid(urlparse(self.path))
+                now = time.time()
+                with ai_job_lock:
+                    ai_jobs[job_id] = {
+                        "ok": True,
+                        "job_id": job_id,
+                        "sid": sid,
+                        "status": "queued",
+                        "progress": 1,
+                        "message": "AI 任务已创建，等待后台线程启动",
+                        "created_at": now,
+                        "updated_at": now,
+                    }
+
+                def update(**patch: Any) -> None:
+                    with ai_job_lock:
+                        job = ai_jobs.get(job_id)
+                        if job is not None:
+                            job.update(patch)
+                            job["updated_at"] = time.time()
+
+                def progress(percent: int, message: str) -> None:
+                    update(
+                        status="running",
+                        progress=max(1, min(int(percent), 99)),
+                        message=message,
+                    )
+
+                def worker() -> None:
+                    try:
+                        progress(3, "后台任务已启动")
+                        result = _ai_suggest_curves(
+                            session,
+                            payload,
+                            output_dir,
+                            progress=progress,
+                        )
+                        update(
+                            status="done",
+                            progress=100,
+                            message=f"AI 已生成 {result.get('curve_count', 0)} 条候选曲线",
+                            result=result,
+                        )
+                    except Exception as exc:
+                        update(
+                            status="failed",
+                            progress=100,
+                            message="AI 建议失败",
+                            error=str(exc),
+                        )
+                    finally:
+                        _prune_ai_jobs(ai_jobs, ai_job_lock)
+
+                threading.Thread(target=worker, name=f"autoalias-ai-{job_id[:8]}", daemon=True).start()
+                self._send_json({"ok": True, "job_id": job_id})
+            except Exception as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+
+        def _handle_ai_status(self, parsed) -> None:
+            job_id = parse_qs(parsed.query).get("job", [""])[0]
+            if not job_id:
+                self._send_json({"ok": False, "error": "missing job id"}, status=400)
+                return
+            with ai_job_lock:
+                job = dict(ai_jobs.get(job_id, {}))
+            if not job:
+                self._send_json({"ok": False, "error": "AI job not found"}, status=404)
+                return
+            self._send_json(job)
+
+        def _handle_ai_suggest(self, session: ReviewSession) -> None:
+            try:
+                payload = self._read_json(required=False)
+                result = _ai_suggest_curves(session, payload, output_dir)
+                self._send_json(result)
             except Exception as exc:
                 self._send_json({"ok": False, "error": str(exc)}, status=400)
 
@@ -384,10 +496,120 @@ def _route_points_with_choices(
     }
 
 
-def _fit_preview_segments(route_segments: list[dict[str, Any]], degree: int | str = "auto") -> dict[str, Any]:
+def _ai_suggest_curves(
+    session: ReviewSession,
+    payload: dict[str, Any],
+    output_dir: Path,
+    progress: Any = None,
+) -> dict[str, Any]:
+    from autoalias.review.ai_suggest import DEFAULT_MODEL, VlmSuggestOptions, suggest_design_curves
+
+    options = VlmSuggestOptions(
+        model=str(payload.get("model") or DEFAULT_MODEL),
+        device=str(payload.get("device") or "auto"),
+        local_files_only=bool(payload.get("local_files_only", False)),
+        max_curves=max(1, min(int(payload.get("max_curves", 12)), 24)),
+        max_points_per_curve=max(2, min(int(payload.get("max_points_per_curve", 12)), 24)),
+        max_new_tokens=max(256, min(int(payload.get("max_new_tokens", 1800)), 4096)),
+        snap_max_distance=float(payload.get("snap_max_distance", 96.0)),
+    )
+    result = suggest_design_curves(
+        session.image_path,
+        router=session.router,
+        output_dir=output_dir,
+        options=options,
+        progress=progress,
+    )
+    design_curves: list[dict[str, Any]] = []
+    for index, item in enumerate(result.get("curves", [])):
+        manual_points = item.get("manual_points", [])
+        closed = bool(item.get("closed", False))
+        route = _route_points_with_choices(
+            session,
+            manual_points,
+            closed=closed,
+            branch_choices=[],
+            candidate_count=2,
+        )
+        design_curves.append(
+            {
+                "id": f"ai_curve_{int(time.time() * 1000):x}_{index:03d}",
+                "type": "manual_design_curve",
+                "semantic": item.get("semantic", "detail_line"),
+                "edge_ids": [],
+                "manual_points": manual_points,
+                "cut_points": manual_points,
+                "closed": closed,
+                "routed_points": route.get("points", []),
+                "route_segments": [
+                    _clean_server_route_segment(segment)
+                    for segment in route.get("segments", [])
+                ],
+                "branch_choices": [0 for _ in route.get("segments", [])],
+                "route_ok": bool(route.get("ok")),
+                "source": "qwen_vl_suggestion",
+                "confidence": item.get("confidence", 0.5),
+                "reason": item.get("reason", ""),
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            }
+        )
+    return {
+        "ok": True,
+        "model": result.get("model"),
+        "curve_count": len(design_curves),
+        "curves": design_curves,
+        "context_image": result.get("context_image"),
+    }
+
+
+def _prune_ai_jobs(
+    ai_jobs: dict[str, dict[str, Any]],
+    ai_job_lock: threading.Lock,
+    *,
+    max_age_seconds: float = 6 * 60 * 60,
+    max_jobs: int = 30,
+) -> None:
+    now = time.time()
+    with ai_job_lock:
+        old = [
+            job_id
+            for job_id, job in ai_jobs.items()
+            if now - float(job.get("updated_at", now)) > max_age_seconds
+        ]
+        for job_id in old:
+            ai_jobs.pop(job_id, None)
+        if len(ai_jobs) > max_jobs:
+            ordered = sorted(
+                ai_jobs.items(),
+                key=lambda item: float(item[1].get("updated_at", 0.0)),
+            )
+            for job_id, _job in ordered[: max(0, len(ai_jobs) - max_jobs)]:
+                ai_jobs.pop(job_id, None)
+
+
+def _clean_server_route_segment(segment: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "ok": bool(segment.get("ok")),
+        "points": segment.get("points", []),
+        "segment_index": int(segment.get("segment_index", 0)),
+        "selected_candidate": int(segment.get("selected_candidate", 0)),
+        "length": float(segment.get("length", 0.0) or 0.0),
+    }
+
+
+def _fit_preview_segments(
+    route_segments: list[dict[str, Any]],
+    degree: int | str = "auto",
+    *,
+    closed: bool = False,
+) -> dict[str, Any]:
     parsed_degree = _parse_preview_degree(degree)
     validator = ClassAValidator()
     previews: list[dict[str, Any]] = []
+    if len(route_segments) > 1:
+        chain_preview = _fit_preview_g2_chain(route_segments, parsed_degree, closed=closed, validator=validator)
+        if chain_preview is not None:
+            return chain_preview
     for index, segment in enumerate(route_segments):
         raw_points = segment.get("points") or []
         points = _as_points3(raw_points)
@@ -431,6 +653,79 @@ def _fit_preview_segments(route_segments: list[dict[str, Any]], degree: int | st
         "segment_count": len(previews),
         "passed_count": passed,
     }
+
+
+def _fit_preview_g2_chain(
+    route_segments: list[dict[str, Any]],
+    degree: int | str,
+    *,
+    closed: bool,
+    validator: ClassAValidator,
+) -> dict[str, Any] | None:
+    try:
+        from autoalias.review.fit_reviewed import (
+            G2_SPLIT_MAX_SHIFT_PX,
+            _apply_g2_endpoint_fairing,
+            _auto_adjust_g2_split_points,
+        )
+
+        parsed_segments: list[dict[str, Any]] = []
+        for segment in route_segments:
+            points = remove_duplicate_points(_as_points3(segment.get("points") or []), eps=0.5)
+            points = _ensure_preview_points(points)
+            if len(points) < 4:
+                return None
+            parsed_segments.append({"points": points})
+        parsed_segments, split_diagnostics = _auto_adjust_g2_split_points(
+            parsed_segments,
+            closed=bool(closed),
+            max_shift_px=G2_SPLIT_MAX_SHIFT_PX,
+        )
+        fitted_curves = []
+        candidates = []
+        previews: list[dict[str, Any]] = []
+        for index, segment in enumerate(parsed_segments):
+            label = f"preview_g2_segment_{index + 1:03d}"
+            candidate = CurveCandidate(label=label, points=segment["points"], source="fit_preview_g2")
+            curve = SingleSpanFitter(FittingOptions(degree=7)).fit_candidate(candidate)
+            fitted_curves.append(curve)
+            candidates.append(candidate)
+        _apply_g2_endpoint_fairing(
+            fitted_curves,
+            [segment["points"] for segment in parsed_segments],
+            closed=bool(closed),
+        )
+        for index, (segment, curve) in enumerate(zip(parsed_segments, fitted_curves, strict=False)):
+            report = validator.validate(curve, segment["points"])
+            samples = evaluate_bezier(curve.cvs, np.linspace(0.0, 1.0, 120), curve.weights)
+            warnings = list(report.warnings)
+            warnings.append("G2 chain preview")
+            adjustment = split_diagnostics.get(index, {})
+            if adjustment.get("auto_adjusted"):
+                warnings.append(f"G2 split moved {adjustment.get('shift_px')} px")
+            previews.append(
+                {
+                    "ok": True,
+                    "segment_index": index,
+                    "degree": curve.degree,
+                    "span": curve.span_count,
+                    "samples": _round_xy(samples),
+                    "cvs": _round_xy(curve.cvs),
+                    "passed": report.passed,
+                    "color": _quality_color(report.warnings),
+                    "warnings": warnings,
+                    "metrics": report.metrics,
+                }
+            )
+        return {
+            "ok": True,
+            "segments": previews,
+            "segment_count": len(previews),
+            "passed_count": sum(1 for item in previews if item.get("passed")),
+            "continuity": "G2",
+        }
+    except Exception:
+        return None
 
 
 def _fit_preview_lowest_degree(
@@ -655,6 +950,9 @@ button:disabled { opacity:.45; cursor:default; }
 .miniBad { width:auto; min-height:26px; padding:0 8px; border-color:#df9b9b; background:#fff0f0; color:#a52424; font-size:12px; }
 .floating { position:absolute; left:12px; top:12px; background:rgba(255,255,255,.92); border:1px solid var(--line); border-radius:6px; padding:8px 10px; color:var(--muted); pointer-events:none; }
 .hidden { display:none; }
+.progress { height:10px; border-radius:999px; overflow:hidden; background:#e7ebe8; border:1px solid #d3dad5; }
+.progress > div { height:100%; width:0%; background:linear-gradient(90deg,#0b6dff,#28b875); transition:width .35s ease; }
+.subtle { color:var(--muted); font-size:12px; }
 a { color:#075fd7; }
 </style>
 </head>
@@ -684,6 +982,9 @@ a { color:#075fd7; }
           <option value="door_opening">门洞/车窗</option>
           <option value="wheel_arch">轮拱</option>
           <option value="beltline">腰线/特征线</option>
+          <option value="roofline">车顶线</option>
+          <option value="lamp">灯具轮廓</option>
+          <option value="bumper">保险杠/裙边</option>
           <option value="detail_line" selected>细节线</option>
         </select>
         <div class="grid2">
@@ -707,6 +1008,18 @@ a { color:#075fd7; }
       </div>
       <div class="box" id="branchBox" style="margin-top:8px">暂无分支候选</div>
       <div class="box" id="qualityBox" style="margin-top:8px">暂无拟合质量</div>
+
+      <h2>AI 辅助分线</h2>
+      <div class="stack">
+        <button class="warn" id="btnAiSuggest">AI 建议分线点</button>
+        <div class="box">
+          <div id="aiBox">AI 会看原图和红色完整骨架，自动生成可编辑的分线点；生成后你可以继续拖拽、删除、保存和导出。</div>
+          <div id="aiProgressWrap" class="hidden" style="margin-top:8px">
+            <div class="progress"><div id="aiProgressFill"></div></div>
+            <div class="subtle" id="aiProgressText" style="margin-top:6px">0%</div>
+          </div>
+        </div>
+      </div>
 
       <h2>显示</h2>
       <div class="grid2">
@@ -764,6 +1077,8 @@ let pointDraggingIndex = null;
 let pointDragMoved = false;
 let suppressNextClick = false;
 let snapRequestId = 0;
+let aiSuggestRequestId = 0;
+let aiPollTimer = null;
 
 function api(path) { return path + (path.includes("?") ? "&" : "?") + "sid=" + encodeURIComponent(sid); }
 
@@ -1071,6 +1386,7 @@ async function refreshFitPreview() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         route_segments: routePreview.segments.map(cleanRouteSegment),
+        closed: closedCurve,
         degree: document.getElementById("degree").value
       })
     });
@@ -1081,6 +1397,106 @@ async function refreshFitPreview() {
     if (requestId !== fitPreviewRequestId) return;
     fitPreview = null;
   }
+}
+
+async function runAiSuggest() {
+  if (!sid || !graph) return;
+  const requestId = ++aiSuggestRequestId;
+  const btn = document.getElementById("btnAiSuggest");
+  btn.disabled = true;
+  if (aiPollTimer) clearInterval(aiPollTimer);
+  const startedAt = Date.now();
+  setAiProgress(1, "正在创建 AI 后台任务", startedAt);
+  try {
+    const res = await fetch(api("/api/ai-suggest-start"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        max_curves: 12,
+        max_points_per_curve: 12,
+        snap_max_distance: 96
+      })
+    });
+    const result = await res.json();
+    if (requestId !== aiSuggestRequestId) return;
+    if (!result.ok) {
+      setAiProgress(100, "AI 建议失败：" + (result.error || "unknown"), startedAt);
+      btn.disabled = false;
+      return;
+    }
+    setAiProgress(3, "AI 后台任务已启动，正在等待进度", startedAt);
+    aiPollTimer = setInterval(() => {
+      pollAiSuggestJob(result.job_id, requestId, startedAt);
+    }, 1000);
+    await pollAiSuggestJob(result.job_id, requestId, startedAt);
+  } catch (err) {
+    if (requestId !== aiSuggestRequestId) return;
+    setAiProgress(100, "AI 建议失败：" + (err && err.message ? err.message : String(err)), startedAt);
+    btn.disabled = false;
+  }
+}
+
+async function pollAiSuggestJob(jobId, requestId, startedAt) {
+  const btn = document.getElementById("btnAiSuggest");
+  try {
+    const res = await fetch(api("/api/ai-suggest-status") + "&job=" + encodeURIComponent(jobId));
+    const result = await res.json();
+    if (requestId !== aiSuggestRequestId) return;
+    if (!result.ok) {
+      setAiProgress(100, "AI 状态读取失败：" + (result.error || "unknown"), startedAt);
+      if (aiPollTimer) clearInterval(aiPollTimer);
+      btn.disabled = false;
+      return;
+    }
+    const rawProgress = Number(result.progress || 0);
+    const elapsed = Math.max(0, (Date.now() - startedAt) / 1000);
+    let displayProgress = rawProgress;
+    if (result.status === "running" || result.status === "queued") {
+      const softCeiling = rawProgress < 62 ? 61 : 88;
+      displayProgress = Math.max(rawProgress, Math.min(softCeiling, rawProgress + elapsed * 0.6));
+    }
+    setAiProgress(displayProgress, result.message || "AI 正在处理", startedAt);
+    if (result.status === "failed") {
+      if (aiPollTimer) clearInterval(aiPollTimer);
+      setAiProgress(100, "AI 建议失败：" + (result.error || result.message || "unknown"), startedAt);
+      btn.disabled = false;
+      return;
+    }
+    if (result.status !== "done") return;
+    if (aiPollTimer) clearInterval(aiPollTimer);
+    const curves = result.result && result.result.curves ? result.result.curves : [];
+    if (!curves.length) {
+      setAiProgress(100, "AI 没有返回可用曲线。可以换更清晰图片，或者先打开完整骨架确认线条是否被提取。", startedAt);
+      btn.disabled = false;
+      return;
+    }
+    for (const curve of curves) designCurves.push(curve);
+    await saveAll();
+    setAiProgress(100, `AI 已生成 ${curves.length} 条候选曲线，已经加入下面的曲线列表。`, startedAt);
+    const box = document.getElementById("aiBox");
+    box.innerHTML += `<br>${result.result.model || ""}<br>${result.result.context_image || ""}`;
+    updatePanel();
+    render();
+    btn.disabled = false;
+  } catch (err) {
+    if (requestId !== aiSuggestRequestId) return;
+    setAiProgress(100, "AI 状态读取失败：" + (err && err.message ? err.message : String(err)), startedAt);
+    if (aiPollTimer) clearInterval(aiPollTimer);
+    btn.disabled = false;
+  }
+}
+
+function setAiProgress(percent, message, startedAt) {
+  const wrap = document.getElementById("aiProgressWrap");
+  const fill = document.getElementById("aiProgressFill");
+  const text = document.getElementById("aiProgressText");
+  const box = document.getElementById("aiBox");
+  const p = Math.max(0, Math.min(100, Math.round(percent)));
+  wrap.classList.remove("hidden");
+  fill.style.width = p + "%";
+  const elapsed = startedAt ? Math.round((Date.now() - startedAt) / 1000) : 0;
+  box.textContent = message;
+  text.textContent = `${p}% · 已等待 ${elapsed}s`;
 }
 
 async function saveCurrent(startNext=false) {
@@ -1254,6 +1670,7 @@ function updatePanel() {
   document.getElementById("btnUndo").disabled = cutPoints.length < 1;
   document.getElementById("btnDelete").disabled = selectedCutIndex == null;
   document.getElementById("btnClose").disabled = cutPoints.length < 3;
+  document.getElementById("btnAiSuggest").disabled = !graph;
   renderCurveList();
 }
 
@@ -1398,6 +1815,7 @@ document.getElementById("btnSkeleton").onclick = () => { showSkeleton = !showSke
 document.getElementById("btnFullSkeleton").onclick = () => { showFullSkeleton = !showFullSkeleton; updatePanel(); render(); };
 document.getElementById("btnAliasPreview").onclick = () => { showAliasPreview = !showAliasPreview; updatePanel(); render(); };
 document.getElementById("degree").onchange = () => { refreshFitPreview().then(() => { updatePanel(); render(); }); };
+document.getElementById("btnAiSuggest").onclick = runAiSuggest;
 document.getElementById("btnReset").onclick = resetView;
 document.getElementById("btnExport").onclick = exportIges;
 resize();
