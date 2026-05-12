@@ -219,6 +219,7 @@ def _make_handler(
                         route_segments,
                         degree=degree,
                         closed=bool(payload.get("closed", False)),
+                        high_quality=payload.get("quality") == "export",
                     )
                 )
             except Exception as exc:
@@ -602,11 +603,12 @@ def _fit_preview_segments(
     degree: int | str = "auto",
     *,
     closed: bool = False,
+    high_quality: bool = False,
 ) -> dict[str, Any]:
     parsed_degree = _parse_preview_degree(degree)
     validator = ClassAValidator()
     previews: list[dict[str, Any]] = []
-    if len(route_segments) > 1:
+    if high_quality and len(route_segments) >= 1:
         chain_preview = _fit_preview_g2_chain(route_segments, parsed_degree, closed=closed, validator=validator)
         if chain_preview is not None:
             return chain_preview
@@ -623,6 +625,8 @@ def _fit_preview_segments(
             curve = _fit_preview_lowest_degree(candidate, points, parsed_degree, validator)
             report = validator.validate(curve, points)
             samples = evaluate_bezier(curve.cvs, np.linspace(0.0, 1.0, 120), curve.weights)
+            warnings = list(report.warnings)
+            warnings.append("快速预览：最终导出会再做高质量 G2/CV 优化")
             previews.append(
                 {
                     "ok": True,
@@ -633,7 +637,7 @@ def _fit_preview_segments(
                     "cvs": _round_xy(curve.cvs),
                     "passed": report.passed,
                     "color": _quality_color(report.warnings),
-                    "warnings": report.warnings,
+                    "warnings": warnings,
                     "metrics": report.metrics,
                 }
             )
@@ -664,45 +668,46 @@ def _fit_preview_g2_chain(
 ) -> dict[str, Any] | None:
     try:
         from autoalias.review.fit_reviewed import (
-            G2_SPLIT_MAX_SHIFT_PX,
-            _apply_g2_endpoint_fairing,
-            _auto_adjust_g2_split_points,
+            _fit_design_curve_chain,
         )
 
         parsed_segments: list[dict[str, Any]] = []
-        for segment in route_segments:
+        segment_count = len(route_segments)
+        for index, segment in enumerate(route_segments):
             points = remove_duplicate_points(_as_points3(segment.get("points") or []), eps=0.5)
             points = _ensure_preview_points(points)
             if len(points) < 4:
                 return None
-            parsed_segments.append({"points": points})
-        parsed_segments, split_diagnostics = _auto_adjust_g2_split_points(
+            parsed_segments.append(
+                {
+                    "points": points,
+                    "start_order": index,
+                    "end_order": 0 if bool(closed) and index == segment_count - 1 else index + 1,
+                    "segment_count": segment_count,
+                }
+            )
+        fitted = _fit_design_curve_chain(
+            {
+                "id": "fit_preview",
+                "semantic": "preview",
+                "closed": bool(closed),
+                "manual_points": [{} for _ in range(max(2, segment_count + (0 if closed else 1)))],
+            },
+            Path("fit_preview.topology_corrections.json"),
+            1,
             parsed_segments,
-            closed=bool(closed),
-            max_shift_px=G2_SPLIT_MAX_SHIFT_PX,
+            degree,
+            validator,
         )
-        fitted_curves = []
-        candidates = []
         previews: list[dict[str, Any]] = []
-        for index, segment in enumerate(parsed_segments):
-            label = f"preview_g2_segment_{index + 1:03d}"
-            candidate = CurveCandidate(label=label, points=segment["points"], source="fit_preview_g2")
-            curve = SingleSpanFitter(FittingOptions(degree=7)).fit_candidate(candidate)
-            fitted_curves.append(curve)
-            candidates.append(candidate)
-        _apply_g2_endpoint_fairing(
-            fitted_curves,
-            [segment["points"] for segment in parsed_segments],
-            closed=bool(closed),
-        )
-        for index, (segment, curve) in enumerate(zip(parsed_segments, fitted_curves, strict=False)):
-            report = validator.validate(curve, segment["points"])
+        for index, (curve, _candidate, report) in enumerate(fitted):
             samples = evaluate_bezier(curve.cvs, np.linspace(0.0, 1.0, 120), curve.weights)
             warnings = list(report.warnings)
-            warnings.append("G2 chain preview")
-            adjustment = split_diagnostics.get(index, {})
-            if adjustment.get("auto_adjusted"):
-                warnings.append(f"G2 split moved {adjustment.get('shift_px')} px")
+            warnings.append("Export-matched CV preview")
+            merge_count = curve.metadata.get("chain_merged_segment_count")
+            original_count = curve.metadata.get("chain_original_segment_count")
+            if merge_count is not None and original_count is not None and merge_count != original_count:
+                warnings.append(f"preview uses export merge: {original_count} -> {merge_count}")
             previews.append(
                 {
                     "ok": True,
@@ -722,7 +727,7 @@ def _fit_preview_g2_chain(
             "segments": previews,
             "segment_count": len(previews),
             "passed_count": sum(1 for item in previews if item.get("passed")),
-            "continuity": "G2",
+            "continuity": "export-matched",
         }
     except Exception:
         return None
@@ -1025,6 +1030,7 @@ a { color:#075fd7; }
       <div class="grid2">
         <button class="primary" id="btnFullSkeleton">隐藏完整骨架</button>
         <button class="primary" id="btnSkeleton">隐藏切段骨架</button>
+        <button class="primary" id="btnCvPreview">隐藏CV预览</button>
         <button id="btnReset">重置视图</button>
       </div>
 
@@ -1070,6 +1076,7 @@ let activeCurve = null;
 let showSkeleton = true;
 let showFullSkeleton = true;
 let showAliasPreview = true;
+let showCvPreview = true;
 let transform = { scale: 1, x: 0, y: 0 };
 let dragging = false;
 let lastMouse = null;
@@ -1228,7 +1235,48 @@ function drawFitPreview() {
   for (const seg of fitPreview.segments) {
     if (!seg.ok || !seg.samples) continue;
     drawPolyline(seg.samples, seg.color || "#14a05a", 4.0, 0.95);
+    if (showCvPreview) drawCvPreview(seg);
   }
+}
+
+function drawCvPreview(seg) {
+  const cvs = seg.cvs || [];
+  if (!cvs || cvs.length < 2) return;
+  ctx.save();
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.setLineDash([7 / transform.scale, 5 / transform.scale]);
+  ctx.strokeStyle = "rgba(255,135,0,.92)";
+  ctx.lineWidth = Math.max(1.55 / transform.scale, 0.75);
+  ctx.beginPath();
+  ctx.moveTo(cvs[0][0], cvs[0][1]);
+  for (let i = 1; i < cvs.length; i++) ctx.lineTo(cvs[i][0], cvs[i][1]);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  const radius = Math.max(5.2 / transform.scale, 2.8);
+  const fontSize = Math.max(10.5 / transform.scale, 5.8);
+  for (let i = 0; i < cvs.length; i++) {
+    const p = cvs[i];
+    ctx.beginPath();
+    ctx.fillStyle = i === 0 || i === cvs.length - 1 ? "#ffcf33" : "#fff35c";
+    ctx.strokeStyle = "#6b4a00";
+    ctx.lineWidth = Math.max(1.45 / transform.scale, 0.7);
+    ctx.arc(p[0], p[1], radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = "#332400";
+    ctx.font = `${fontSize}px sans-serif`;
+    ctx.fillText(String(i), p[0] + radius * 1.25, p[1] - radius * 0.9);
+  }
+
+  if (seg.degree != null) {
+    const p = cvs[Math.floor(cvs.length / 2)];
+    ctx.fillStyle = "rgba(20,20,20,.72)";
+    ctx.font = `${Math.max(12 / transform.scale, 6.5)}px sans-serif`;
+    ctx.fillText(`d${seg.degree} · ${cvs.length}CV`, p[0] + radius * 1.4, p[1] + radius * 1.7);
+  }
+  ctx.restore();
 }
 
 function drawCutPoints() {
@@ -1387,7 +1435,8 @@ async function refreshFitPreview() {
       body: JSON.stringify({
         route_segments: routePreview.segments.map(cleanRouteSegment),
         closed: closedCurve,
-        degree: document.getElementById("degree").value
+        degree: document.getElementById("degree").value,
+        quality: "fast"
       })
     });
     const result = await res.json();
@@ -1665,6 +1714,8 @@ function updatePanel() {
   document.getElementById("btnFullSkeleton").textContent = showFullSkeleton ? "隐藏完整骨架" : "显示完整骨架";
   document.getElementById("btnAliasPreview").classList.toggle("primary", showAliasPreview);
   document.getElementById("btnAliasPreview").textContent = showAliasPreview ? "隐藏拟合预览" : "显示拟合预览";
+  document.getElementById("btnCvPreview").classList.toggle("primary", showCvPreview);
+  document.getElementById("btnCvPreview").textContent = showCvPreview ? "隐藏CV预览" : "显示CV预览";
   document.getElementById("btnSave").disabled = cutPoints.length < 2;
   document.getElementById("btnSaveNext").disabled = cutPoints.length < 2;
   document.getElementById("btnUndo").disabled = cutPoints.length < 1;
@@ -1814,6 +1865,7 @@ document.getElementById("btnClear").onclick = clearCurrent;
 document.getElementById("btnSkeleton").onclick = () => { showSkeleton = !showSkeleton; updatePanel(); render(); };
 document.getElementById("btnFullSkeleton").onclick = () => { showFullSkeleton = !showFullSkeleton; updatePanel(); render(); };
 document.getElementById("btnAliasPreview").onclick = () => { showAliasPreview = !showAliasPreview; updatePanel(); render(); };
+document.getElementById("btnCvPreview").onclick = () => { showCvPreview = !showCvPreview; updatePanel(); render(); };
 document.getElementById("degree").onchange = () => { refreshFitPreview().then(() => { updatePanel(); render(); }); };
 document.getElementById("btnAiSuggest").onclick = runAiSuggest;
 document.getElementById("btnReset").onclick = resetView;
