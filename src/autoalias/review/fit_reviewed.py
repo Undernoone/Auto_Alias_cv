@@ -369,6 +369,9 @@ def _fit_design_curve_chain(
     if not isinstance(degree, int):
         _promote_bad_layout_degrees(fitted_curves, validator, closed=closed)
         _apply_g2_endpoint_fairing([item[0] for item in fitted_curves], [item[2] for item in fitted_curves], closed=closed)
+    _refit_chain_with_current_g2_constraints(fitted_curves, validator, requested_degree=degree, closed=closed)
+    _apply_g2_endpoint_fairing([item[0] for item in fitted_curves], [item[2] for item in fitted_curves], closed=closed)
+    _fair_free_interior_cvs_for_chain(fitted_curves, closed=closed)
     for curve, candidate, points, segment, segment_index in fitted_curves:
         _stamp_cv_side_diagnostics(curve, points)
         _stamp_cv_target_corridor_diagnostics(curve, points)
@@ -561,6 +564,116 @@ def _promote_failed_chain_degrees(
         )
 
 
+def _refit_chain_with_current_g2_constraints(
+    fitted_curves: list[tuple[NURBSCurve, CurveCandidate, np.ndarray, dict[str, Any], int]],
+    validator: ClassAValidator,
+    *,
+    requested_degree: int | str,
+    closed: bool,
+) -> None:
+    if len(fitted_curves) <= 1:
+        return
+    curves = [item[0] for item in fitted_curves]
+    target_segments = [item[2] for item in fitted_curves]
+    base_score = _chain_total_quality_score(curves, target_segments, validator, closed=closed)
+    base_jump = _chain_total_endpoint_jump(curves, target_segments, closed=closed)
+    if base_jump < 180.0:
+        return
+
+    constraints = _current_chain_g2_constraints(curves, closed=closed)
+    trial_curves: list[NURBSCurve] = []
+    for index, (curve, candidate, points, segment, segment_index) in enumerate(fitted_curves):
+        start_constraint = None
+        end_constraint = None
+        if index > 0 or (closed and len(fitted_curves) > 2):
+            start_constraint = constraints.get((index - 1) % len(fitted_curves))
+        if index < len(fitted_curves) - 1 or (closed and len(fitted_curves) > 2):
+            end_constraint = constraints.get(index)
+        if start_constraint is None and end_constraint is None:
+            trial_curves.append(_clone_curve(curve))
+            continue
+        if isinstance(requested_degree, int):
+            refit_degree: int | str = max(int(requested_degree), curve.degree)
+        elif start_constraint is not None and end_constraint is not None:
+            refit_degree = 7
+        else:
+            refit_degree = max(curve.degree, 5)
+        refit = _fit_g2_constrained_segment(
+            candidate,
+            points,
+            start_constraint=start_constraint,
+            end_constraint=end_constraint,
+            requested_degree=refit_degree,
+        )
+        refit.source = curve.source
+        refit.metadata = dict(curve.metadata)
+        refit.metadata["g2_constraint_refit"] = True
+        refit.metadata["g2_constraint_refit_from_degree"] = curve.degree
+        refit.metadata["g2_constraint_refit_to_degree"] = refit.degree
+        trial_curves.append(refit)
+
+    _fair_free_interior_cvs_for_curves(trial_curves, closed=closed)
+    if not _chain_passes_g0_g1(trial_curves, target_segments, closed=closed):
+        return
+    trial_score = _chain_total_quality_score(trial_curves, target_segments, validator, closed=closed)
+    trial_jump = _chain_total_endpoint_jump(trial_curves, target_segments, closed=closed)
+    if trial_jump < base_jump * 0.60 and trial_score < base_score * 0.96:
+        for index, updated in enumerate(trial_curves):
+            old = fitted_curves[index]
+            fitted_curves[index] = (updated, old[1], old[2], old[3], old[4])
+
+
+def _current_chain_g2_constraints(curves: list[NURBSCurve], *, closed: bool) -> dict[int, _G2Constraint]:
+    constraints: dict[int, _G2Constraint] = {}
+    if len(curves) <= 1:
+        return constraints
+    join_count = len(curves) if closed and len(curves) > 2 else len(curves) - 1
+    for join_index in range(join_count):
+        left = curves[join_index]
+        right = curves[(join_index + 1) % len(curves)]
+        point = 0.5 * (left.cvs[-1] + right.cvs[0])
+        d1 = 0.5 * (_bezier_d1_end(left) + _bezier_d1_start(right))
+        if np.linalg.norm(d1[:2]) < 1e-8:
+            d1 = _bezier_d1_end(left) if np.linalg.norm(_bezier_d1_end(left)[:2]) > 1e-8 else _bezier_d1_start(right)
+        d2 = 0.5 * (_bezier_d2_end(left) + _bezier_d2_start(right))
+        constraints[join_index] = _G2Constraint(point=point.copy(), d1=d1.copy(), d2=d2.copy())
+    return constraints
+
+
+def _chain_passes_g0_g1(curves: list[NURBSCurve], target_segments: list[np.ndarray], *, closed: bool) -> bool:
+    if len(curves) <= 1:
+        return True
+    join_count = len(curves) if closed and len(curves) > 2 else len(curves) - 1
+    for join_index in range(join_count):
+        local_len = max(
+            min(
+                _polyline_length(target_segments[join_index]),
+                _polyline_length(target_segments[(join_index + 1) % len(curves)]),
+            ),
+            1.0,
+        )
+        if not _join_passes_g0_g1(curves[join_index], curves[(join_index + 1) % len(curves)], local_len):
+            return False
+    return True
+
+
+def _chain_total_endpoint_jump(curves: list[NURBSCurve], target_segments: list[np.ndarray], *, closed: bool) -> float:
+    return float(sum(_curve_endpoint_jump_score(curves, target_segments, index, closed=closed) for index in range(len(curves))))
+
+
+def _chain_total_quality_score(
+    curves: list[NURBSCurve],
+    target_segments: list[np.ndarray],
+    validator: ClassAValidator,
+    *,
+    closed: bool,
+) -> float:
+    score = 0.0
+    for index in range(len(curves)):
+        score += _chain_local_quality_score(curves, target_segments, validator, index, closed=closed)
+    return float(score)
+
+
 def _repair_cv_side_flips(
     fitted_curves: list[tuple[NURBSCurve, CurveCandidate, np.ndarray, dict[str, Any], int]],
     validator: ClassAValidator,
@@ -632,10 +745,16 @@ def _promote_bad_layout_degrees(
     for index, (curve, candidate, points, segment, segment_index) in enumerate(list(fitted_curves)):
         side = _cv_side_consistency_penalty(curve, points)
         corridor = _cv_target_corridor_penalty(curve, points)
+        jump = _curve_endpoint_jump_score(
+            [item[0] for item in fitted_curves],
+            target_segments,
+            index,
+            closed=closed,
+        )
         report = validator.validate(curve, points)
         if curve.degree >= 7:
             continue
-        if report.passed and side < 120.0 and corridor < 120.0:
+        if report.passed and side < 120.0 and corridor < 120.0 and jump < 130.0:
             continue
 
         start_constrained = closed or index > 0
@@ -643,6 +762,7 @@ def _promote_bad_layout_degrees(
         min_degree = 5 if start_constrained and end_constrained else 3
         best_curves: list[NURBSCurve] | None = None
         best_passes = bool(report.passed)
+        best_jump = jump
         best_score = _chain_local_quality_score(
             [item[0] for item in fitted_curves],
             target_segments,
@@ -666,12 +786,17 @@ def _promote_bad_layout_degrees(
                     closed=closed,
                     only_join_indices=_adjacent_join_indices(index, len(trial_curves), closed=closed),
                 )
+                _fair_free_interior_cvs_for_curves(trial_curves, closed=closed)
                 trial_report = validator.validate(trial_curves[index], points)
                 score = _chain_local_quality_score(trial_curves, target_segments, validator, index, closed=closed)
                 score += _cv_side_consistency_penalty(trial_curves[index], points) * 2.8
                 score += _cv_target_corridor_penalty(trial_curves[index], points) * 2.8
-                if (not best_passes and trial_report.passed) or score < best_score:
+                trial_jump = _curve_endpoint_jump_score(trial_curves, target_segments, index, closed=closed)
+                score += trial_jump * 6.0
+                jump_improved = jump > 180.0 and trial_jump < best_jump * 0.88
+                if (not best_passes and trial_report.passed) or score < best_score or jump_improved:
                     best_score = score
+                    best_jump = trial_jump
                     best_passes = bool(trial_report.passed)
                     best_curves = trial_curves
             except Exception:
@@ -709,6 +834,12 @@ def _simplify_simple_chain_degrees(
             index,
             closed=closed,
         )
+        baseline_jump = _curve_endpoint_jump_score(
+            [item[0] for item in fitted_curves],
+            [item[2] for item in fitted_curves],
+            index,
+            closed=closed,
+        )
         for target_degree in target_degrees:
             if target_degree >= curve.degree:
                 continue
@@ -729,6 +860,7 @@ def _simplify_simple_chain_degrees(
                 closed=closed,
                 only_join_indices=_adjacent_join_indices(index, len(trial_curves), closed=closed),
             )
+            _fair_free_interior_cvs_for_curves(trial_curves, closed=closed)
             report = validator.validate(trial_curves[index], points)
             if not report.passed:
                 continue
@@ -737,6 +869,9 @@ def _simplify_simple_chain_degrees(
             if _cv_side_consistency_penalty(trial_curves[index], points) > 30.0:
                 continue
             if _cv_target_corridor_penalty(trial_curves[index], points) > 34.0:
+                continue
+            trial_jump = _curve_endpoint_jump_score(trial_curves, target_segments, index, closed=closed)
+            if trial_jump > max(130.0, baseline_jump * 1.08):
                 continue
             trial_score = _chain_local_quality_score(
                 trial_curves,
@@ -786,8 +921,99 @@ def _chain_local_quality_score(
         score += _cv_dent_penalty(curves[item_index].cvs) * 0.35
         score += _cv_side_consistency_penalty(curves[item_index], target_segments[item_index]) * 1.8
         score += _cv_target_corridor_penalty(curves[item_index], target_segments[item_index]) * 1.9
+        score += _curve_endpoint_jump_score(curves, target_segments, item_index, closed=closed) * 3.2
         score += curves[item_index].degree * 0.08
     return score
+
+
+def _curve_endpoint_jump_score(
+    curves: list[NURBSCurve],
+    target_segments: list[np.ndarray],
+    index: int,
+    *,
+    closed: bool,
+) -> float:
+    if not curves or index < 0 or index >= len(curves):
+        return 0.0
+    score = 0.0
+    curve = curves[index]
+    if index > 0 or (closed and len(curves) > 2):
+        prev_index = (index - 1) % len(curves)
+        local_len = max(min(_polyline_length(target_segments[prev_index]), _polyline_length(target_segments[index])), 1.0)
+        score += _endpoint_cv_jump_penalty(curve, side="start", local_len=local_len)
+    if index < len(curves) - 1 or (closed and len(curves) > 2):
+        next_index = (index + 1) % len(curves)
+        local_len = max(min(_polyline_length(target_segments[index]), _polyline_length(target_segments[next_index])), 1.0)
+        score += _endpoint_cv_jump_penalty(curve, side="end", local_len=local_len)
+    return float(score)
+
+
+def _fair_free_interior_cvs_for_chain(
+    fitted_curves: list[tuple[NURBSCurve, CurveCandidate, np.ndarray, dict[str, Any], int]],
+    *,
+    closed: bool,
+) -> None:
+    curves = [item[0] for item in fitted_curves]
+    _fair_free_interior_cvs_for_curves(curves, closed=closed)
+
+
+def _smooth_endpoint_bridges_for_chain(
+    fitted_curves: list[tuple[NURBSCurve, CurveCandidate, np.ndarray, dict[str, Any], int]],
+    *,
+    closed: bool,
+) -> None:
+    curves = [item[0] for item in fitted_curves]
+    target_segments = [item[2] for item in fitted_curves]
+    _smooth_endpoint_bridges_for_curves(curves, target_segments, closed=closed)
+
+
+def _smooth_endpoint_bridges_for_curves(
+    curves: list[NURBSCurve],
+    target_segments: list[np.ndarray],
+    *,
+    closed: bool,
+) -> None:
+    if len(curves) <= 1:
+        return
+    join_count = len(curves) if closed and len(curves) > 2 else len(curves) - 1
+    for join_index in range(join_count):
+        local_len = max(
+            min(
+                _polyline_length(target_segments[join_index]),
+                _polyline_length(target_segments[(join_index + 1) % len(curves)]),
+            ),
+            1.0,
+        )
+        _smooth_endpoint_bridge_cv(curves[join_index], side="end", local_len=local_len)
+        _smooth_endpoint_bridge_cv(curves[(join_index + 1) % len(curves)], side="start", local_len=local_len)
+
+
+def _fair_free_interior_cvs_for_curves(curves: list[NURBSCurve], *, closed: bool) -> None:
+    if not curves:
+        return
+    for index, curve in enumerate(curves):
+        start_constrained = closed or index > 0
+        end_constrained = closed or index < len(curves) - 1
+        if start_constrained and end_constrained:
+            _fair_free_interior_cvs(curve)
+
+
+def _fair_free_interior_cvs(curve: NURBSCurve, *, strength: float = 0.72) -> None:
+    cvs = curve.cvs
+    count = len(cvs)
+    if count <= 6:
+        return
+    first_free = 3
+    last_free = count - 4
+    if last_free < first_free:
+        return
+    start_anchor = cvs[2].copy()
+    end_anchor = cvs[-3].copy()
+    denom = float((count - 3) - 2)
+    for idx in range(first_free, last_free + 1):
+        t = float(idx - 2) / max(denom, 1.0)
+        target = start_anchor * (1.0 - t) + end_anchor * t
+        cvs[idx] = cvs[idx] * (1.0 - strength) + target * strength
 
 
 def _target_curve_simplicity(points: np.ndarray) -> dict[str, float | bool]:
@@ -1765,13 +1991,19 @@ def _fair_single_g2_join(
         return
     base_left = _clone_curve(left)
     base_right = _clone_curve(right)
+    local_len = max(min(_polyline_length(left_points), _polyline_length(right_points)), 1.0)
+    base_g01 = _join_g0_g1_metrics(base_left, base_right, local_len)
     base_tangent_angle = _angle_between(_bezier_d1_end(base_left), _bezier_d1_start(base_right))
     base_curvature_delta = abs(_bezier_curvature_end(base_left) - _bezier_curvature_start(base_right))
-    base_is_already_g2 = base_tangent_angle < 0.22 and base_curvature_delta < 8e-5
+    base_is_already_g2 = (
+        bool(base_g01["g0_ok"])
+        and bool(base_g01["g1_ok"])
+        and base_tangent_angle < 0.22
+        and base_curvature_delta < 8e-5
+    )
     best_left: NURBSCurve | None = base_left if base_is_already_g2 else None
     best_right: NURBSCurve | None = base_right if base_is_already_g2 else None
     best_score = _pair_fairness_score(base_left, base_right, left_points, right_points) if base_is_already_g2 else float("inf")
-    local_len = max(min(_polyline_length(left_points), _polyline_length(right_points)), 1.0)
     target_curvature = _target_join_curvature(left_points, right_points)
     desired_curvature = _desired_join_curvature(
         _bezier_curvature_end(base_left),
@@ -1882,6 +2114,10 @@ def _apply_g2_join_variant(
 
     _apply_end_derivatives(left, point, d1, d2)
     _apply_start_derivatives(right, point, d1, d2)
+    _smooth_endpoint_bridge_cv(left, side="end", local_len=local_len)
+    _smooth_endpoint_bridge_cv(right, side="start", local_len=local_len)
+    if not _join_passes_g0_g1(left, right, local_len):
+        return False
     if _endpoint_cv_dent_penalty(left, side="end") > 260.0:
         return False
     if _endpoint_cv_dent_penalty(right, side="start") > 260.0:
@@ -1908,8 +2144,15 @@ def _pair_fairness_score(
     flow_shape = _join_curvature_flow_penalty(left, right, left_points, right_points)
     flow = _curve_end_flow_penalty(left, side="end") + _curve_end_flow_penalty(right, side="start")
     collapse = _join_curvature_collapse_penalty(left, right, left_points, right_points)
+    local_len = max(min(_polyline_length(left_points), _polyline_length(right_points)), 1.0)
+    hierarchy = _join_g0_g1_penalty(left, right, local_len)
+    endpoint_jump = (
+        _endpoint_cv_jump_penalty(left, side="end", local_len=local_len)
+        + _endpoint_cv_jump_penalty(right, side="start", local_len=local_len)
+    )
     return (
-        join_gap * 500.0
+        min(hierarchy, 5000.0)
+        + join_gap * 500.0
         + tangent_angle * tangent_angle * 18.0
         + min(curvature_delta * 90000.0, 140.0)
         + min(error * 1.6, 120.0)
@@ -1922,7 +2165,156 @@ def _pair_fairness_score(
         + min(flow_shape, 520.0)
         + min(flow, 180.0)
         + min(collapse, 520.0)
+        + min(endpoint_jump * 8.0, 520.0)
     )
+
+
+def _join_g0_g1_metrics(left: NURBSCurve, right: NURBSCurve, local_len: float) -> dict[str, float | bool]:
+    gap = float(np.linalg.norm(left.cvs[-1, :2] - right.cvs[0, :2]))
+    left_d1 = _bezier_d1_end(left)
+    right_d1 = _bezier_d1_start(right)
+    left_speed = float(np.linalg.norm(left_d1[:2]))
+    right_speed = float(np.linalg.norm(right_d1[:2]))
+    tangent_angle = _angle_between(left_d1, right_d1)
+    gap_tol = max(float(local_len) * 1e-4, 0.025)
+    tangent_tol = 0.22
+    speed_ok = left_speed > 1e-7 and right_speed > 1e-7
+    return {
+        "gap": gap,
+        "gap_tol": gap_tol,
+        "tangent_angle_deg": tangent_angle,
+        "tangent_tol_deg": tangent_tol,
+        "left_speed": left_speed,
+        "right_speed": right_speed,
+        "g0_ok": bool(gap <= gap_tol),
+        "g1_ok": bool(gap <= gap_tol and speed_ok and tangent_angle <= tangent_tol),
+    }
+
+
+def _join_passes_g0_g1(left: NURBSCurve, right: NURBSCurve, local_len: float) -> bool:
+    metrics = _join_g0_g1_metrics(left, right, local_len)
+    return bool(metrics["g0_ok"]) and bool(metrics["g1_ok"])
+
+
+def _join_g0_g1_penalty(left: NURBSCurve, right: NURBSCurve, local_len: float) -> float:
+    metrics = _join_g0_g1_metrics(left, right, local_len)
+    gap = float(metrics["gap"])
+    gap_tol = float(metrics["gap_tol"])
+    tangent = float(metrics["tangent_angle_deg"])
+    tangent_tol = float(metrics["tangent_tol_deg"])
+    penalty = 0.0
+    if gap > gap_tol:
+        penalty += ((gap - gap_tol) / max(gap_tol, 1e-6)) ** 2 * 2800.0
+    if tangent > tangent_tol:
+        penalty += ((tangent - tangent_tol) / max(tangent_tol, 1e-6)) ** 2 * 1800.0
+    if float(metrics["left_speed"]) <= 1e-7 or float(metrics["right_speed"]) <= 1e-7:
+        penalty += 3200.0
+    return float(penalty)
+
+
+def _endpoint_cv_jump_penalty(curve: NURBSCurve, *, side: str, local_len: float) -> float:
+    cvs = np.asarray(curve.cvs[:, :2], dtype=float)
+    if len(cvs) < 4:
+        return 0.0
+    if side == "start":
+        origin = cvs[0]
+        tangent = _unit(_bezier_d1_start(curve)[:2])
+        local = cvs[: min(len(cvs), 5)]
+        rel = local - origin
+    else:
+        origin = cvs[-1]
+        tangent = _unit(_bezier_d1_end(curve)[:2])
+        local = cvs[max(0, len(cvs) - 5) :][::-1]
+        rel = origin - local
+    if np.linalg.norm(tangent) < 1e-9 or len(local) < 4:
+        return 240.0
+
+    normal = np.array([-tangent[1], tangent[0]], dtype=float)
+    proj = rel @ tangent
+    normal_offsets = (local - origin) @ normal
+    if side == "end":
+        normal_offsets = -normal_offsets
+
+    tol = max(float(local_len) * 0.006, 0.55)
+    penalty = 0.0
+    handle_proj = proj[1:]
+    if len(handle_proj):
+        penalty += float(np.sum(np.clip(-handle_proj, 0.0, None)) / tol * 80.0)
+    if len(handle_proj) >= 2:
+        increments = np.diff(handle_proj)
+        penalty += float(np.sum(np.clip(-increments - tol * 0.20, 0.0, None)) / tol * 70.0)
+
+    active = [value for value in normal_offsets[1:] if abs(float(value)) > tol]
+    if len(active) >= 2:
+        signs = np.sign(active)
+        penalty += float(np.sum(signs[1:] * signs[:-1] < 0.0) * 90.0)
+    if len(normal_offsets) >= 4:
+        second = np.diff(normal_offsets, n=2)
+        limit = max(tol * 2.8, float(local_len) * 0.018)
+        penalty += float(np.sum(np.clip(np.abs(second) - limit, 0.0, None)) / max(limit, 1e-6) * 34.0)
+
+    if len(handle_proj) >= 2 and handle_proj[0] > 1e-6:
+        ratio = handle_proj[1] / max(handle_proj[0], 1e-6)
+        if ratio < 0.95:
+            penalty += (0.95 - ratio) * 95.0
+        elif ratio > 5.8:
+            penalty += min(ratio - 5.8, 5.0) * 18.0
+    return min(float(penalty), 420.0)
+
+
+def _smooth_endpoint_bridge_cv(curve: NURBSCurve, *, side: str, local_len: float) -> None:
+    cvs = curve.cvs
+    if len(cvs) < 7:
+        return
+    if side == "start":
+        origin = cvs[0, :2]
+        tangent = _unit(_bezier_d1_start(curve)[:2])
+        local = cvs[: min(len(cvs), 5), :2]
+        rel = local - origin
+        bridge_index = 3
+        to_world_sign = 1.0
+    else:
+        origin = cvs[-1, :2]
+        tangent = _unit(_bezier_d1_end(curve)[:2])
+        local = cvs[max(0, len(cvs) - 5) :, :2][::-1]
+        rel = origin - local
+        bridge_index = len(cvs) - 4
+        to_world_sign = -1.0
+    if np.linalg.norm(tangent) < 1e-9 or len(local) < 4:
+        return
+
+    normal = np.array([-tangent[1], tangent[0]], dtype=float)
+    proj = rel @ tangent
+    normal_offsets = rel @ normal
+    step_1 = max(float(proj[1] - proj[0]), 1.0)
+    step_2 = max(float(proj[2] - proj[1]), step_1 * 0.55, 1.0)
+    min_step = max(step_2 * 0.55, float(local_len) * 0.008, 0.8)
+    max_step = max(step_2 * 2.25, float(local_len) * 0.095, 4.0)
+    current_proj = float(proj[3])
+    target_proj = float(proj[2] + min(max(step_2 * 1.18, min_step), max_step))
+    if current_proj < proj[2] + min_step or current_proj > proj[2] + max_step * 1.35:
+        new_proj = target_proj * 0.78 + current_proj * 0.22
+    else:
+        new_proj = target_proj * 0.35 + current_proj * 0.65
+    new_proj = max(new_proj, float(proj[2] + min_step))
+
+    current_normal = float(normal_offsets[3])
+    target_normal = float(normal_offsets[2] + (normal_offsets[2] - normal_offsets[1]) * 0.62)
+    normal_limit = max(float(local_len) * 0.055, 5.0)
+    target_normal = float(np.clip(target_normal, normal_offsets[2] - normal_limit, normal_offsets[2] + normal_limit))
+    sign_flip = (
+        abs(current_normal) > max(float(local_len) * 0.006, 0.55)
+        and abs(float(normal_offsets[2])) > max(float(local_len) * 0.006, 0.55)
+        and current_normal * float(normal_offsets[2]) < 0.0
+    )
+    if sign_flip or abs(current_normal - target_normal) > normal_limit * 1.25:
+        new_normal = target_normal * 0.82 + current_normal * 0.18
+    else:
+        new_normal = target_normal * 0.42 + current_normal * 0.58
+
+    xy = origin + to_world_sign * (tangent * new_proj + normal * new_normal)
+    curve.cvs[bridge_index, 0] = xy[0]
+    curve.cvs[bridge_index, 1] = xy[1]
 
 
 def _curve_end_flow_penalty(curve: NURBSCurve, *, side: str) -> float:
@@ -2299,6 +2691,7 @@ def _stamp_g2_diagnostics(
             ),
             1.0,
         )
+        g01 = _join_g0_g1_metrics(left, right, local_len)
         desired_curvature = _desired_join_curvature(
             left_curvature,
             right_curvature,
@@ -2319,7 +2712,13 @@ def _stamp_g2_diagnostics(
             fitted[join_index][1].points,
             fitted[(join_index + 1) % len(fitted)][1].points,
         )
+        endpoint_jump = (
+            _endpoint_cv_jump_penalty(left, side="end", local_len=local_len)
+            + _endpoint_cv_jump_penalty(right, side="start", local_len=local_len)
+        )
         left.metadata[f"g2_join_{join_index}_gap"] = gap
+        left.metadata[f"g2_join_{join_index}_g0_ok"] = bool(g01["g0_ok"])
+        left.metadata[f"g2_join_{join_index}_g1_ok"] = bool(g01["g1_ok"])
         left.metadata[f"g2_join_{join_index}_tangent_angle_deg"] = tan
         left.metadata[f"g2_join_{join_index}_curvature_delta"] = curv
         left.metadata[f"g2_join_{join_index}_left_curvature"] = left_curvature
@@ -2328,7 +2727,10 @@ def _stamp_g2_diagnostics(
         left.metadata[f"g2_join_{join_index}_desired_curvature"] = desired_curvature
         left.metadata[f"g2_join_{join_index}_curvature_flow_penalty"] = flow
         left.metadata[f"g2_join_{join_index}_curvature_collapse_penalty"] = collapse
+        left.metadata[f"g2_join_{join_index}_endpoint_cv_jump_penalty"] = endpoint_jump
         right.metadata[f"g2_join_{join_index}_gap"] = gap
+        right.metadata[f"g2_join_{join_index}_g0_ok"] = bool(g01["g0_ok"])
+        right.metadata[f"g2_join_{join_index}_g1_ok"] = bool(g01["g1_ok"])
         right.metadata[f"g2_join_{join_index}_tangent_angle_deg"] = tan
         right.metadata[f"g2_join_{join_index}_curvature_delta"] = curv
         right.metadata[f"g2_join_{join_index}_left_curvature"] = left_curvature
@@ -2337,6 +2739,7 @@ def _stamp_g2_diagnostics(
         right.metadata[f"g2_join_{join_index}_desired_curvature"] = desired_curvature
         right.metadata[f"g2_join_{join_index}_curvature_flow_penalty"] = flow
         right.metadata[f"g2_join_{join_index}_curvature_collapse_penalty"] = collapse
+        right.metadata[f"g2_join_{join_index}_endpoint_cv_jump_penalty"] = endpoint_jump
 
 
 def _bezier_d1_start(curve: NURBSCurve) -> np.ndarray:
