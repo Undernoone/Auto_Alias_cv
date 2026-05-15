@@ -7,6 +7,10 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+try:
+    from scipy.optimize import minimize
+except Exception:  # pragma: no cover - scipy is optional for portable installs.
+    minimize = None
 
 from autoalias.exporters import write_iges, write_json_bundle, write_svg_preview
 from autoalias.geometry.bezier import bernstein_basis, evaluate_bezier, signed_curvature_2d
@@ -33,6 +37,8 @@ class _G2Constraint:
 
 
 G2_SPLIT_MAX_SHIFT_PX = 18.0
+ENABLE_G2_CONSTRAINTS = False
+ENABLE_G2_EDITOR_OVERRIDES = False
 
 
 def fit_reviewed_annotations(
@@ -89,6 +95,47 @@ def fit_reviewed_annotations(
                 except Exception:
                     skipped += 1
             if not segments:
+                continue
+
+            overrides = _curve_alias_overrides(design_curve, expected_count=len(segments))
+            if overrides:
+                for segment_index, (segment, override) in enumerate(zip(segments, overrides, strict=False), start=1):
+                    points = segment["points"]
+                    label = _curve_label(
+                        design_curve,
+                        annotation_path,
+                        index,
+                        segment_index,
+                        segment["segment_count"],
+                    )
+                    candidate = _make_candidate(label, points, annotation_path, design_curve)
+                    cvs = _as_points3(override.get("cvs") or override.get("cv") or [])
+                    degree = int(override.get("degree") or max(len(cvs) - 1, 3))
+                    if len(cvs) != degree + 1:
+                        degree = len(cvs) - 1
+                    if degree < 3 or degree > 7 or len(cvs) != degree + 1:
+                        skipped += 1
+                        continue
+                    curve = NURBSCurve.single_span(
+                        label=label,
+                        degree=degree,
+                        cvs=cvs,
+                        confidence=1.0,
+                        source="manual_g2_constraint_cv_override",
+                        metadata=_curve_metadata(
+                            design_curve,
+                            annotation_path,
+                            segment,
+                            points,
+                            segment_index,
+                            fit_policy="manual_dynamic_g2_cv_override",
+                        ),
+                    )
+                    curve.metadata["dynamic_g2_override"] = True
+                    report = validator.validate(curve, points)
+                    curves.append(curve)
+                    candidates.append(candidate)
+                    reports.append(report)
                 continue
 
             fitted = _fit_design_curve_chain(
@@ -157,17 +204,34 @@ def _fit_lowest_degree(
     validator: ClassAValidator,
 ) -> NURBSCurve:
     if isinstance(degree, int):
-        return SingleSpanFitter(FittingOptions(degree=degree)).fit_candidate(candidate)
+        curve = SingleSpanFitter(FittingOptions(degree=degree)).fit_candidate(candidate)
+        return _refine_non_s_single_side_curve(curve, target_points)
     best_curve: NURBSCurve | None = None
     best_score = float("inf")
     for candidate_degree in (3, 4, 5, 6, 7):
         curve = SingleSpanFitter(FittingOptions(degree=candidate_degree)).fit_candidate(candidate)
+        curve = _refine_non_s_single_side_curve(curve, target_points)
         report = validator.validate(curve, target_points)
         chamfer = float(report.metrics.get("chamfer_mean", 999.0))
         side = _cv_side_consistency_penalty(curve, target_points)
+        forbidden_side = _has_forbidden_cv_side_switch(curve, target_points)
+        forbidden_curvature = _has_forbidden_curvature_sign_change(curve, target_points)
+        blend_fairness = _curve_blend_fairness_metrics(curve, target_points)
+        exceeds_precision = _curve_exceeds_precision_budget(curve, target_points)
         warnings = len(report.warnings)
-        score = warnings * 1000.0 + chamfer + side * 2.6 + candidate_degree * 0.01
-        if report.passed and side < 34.0:
+        score = (
+            warnings * 1000.0
+            + chamfer
+            + side * 2.6
+            + (10000.0 if forbidden_side else 0.0)
+            + (10000.0 if forbidden_curvature else 0.0)
+            + (8000.0 if bool(blend_fairness["forbidden"]) else 0.0)
+            + float(blend_fairness["penalty"]) * 40.0
+            + _curvature_sign_penalty(curve, target_points)
+            + (5000.0 if exceeds_precision else 0.0)
+            + candidate_degree * 0.01
+        )
+        if report.passed and not forbidden_side and not forbidden_curvature and not bool(blend_fairness["forbidden"]) and not exceeds_precision and side < 34.0:
             return curve
         if score < best_score:
             best_score = score
@@ -188,14 +252,14 @@ def _fit_chain_lowest_degree(
     closed: bool,
 ) -> NURBSCurve:
     if isinstance(degree, int):
-        return SingleSpanFitter(FittingOptions(degree=degree)).fit_candidate(candidate)
+        curve = SingleSpanFitter(FittingOptions(degree=degree)).fit_candidate(candidate)
+        return _refine_non_s_single_side_curve(curve, target_points)
     start_constrained = closed or segment_index > 1
     end_constrained = closed or segment_index < segment_count
     simplicity = _target_curve_simplicity(target_points)
-    # Two-sided G2 needs independent start/end derivative CVs. Degree 3/4 can
-    # look clean in isolation, but the two ends fight over the same control
-    # points, so middle/closed segments must start at degree 5.
-    if start_constrained and end_constrained:
+    # Two-sided G2 needs independent start/end derivative CVs. When G2 is
+    # disabled we allow low degree again so fitting quality can be isolated.
+    if ENABLE_G2_CONSTRAINTS and start_constrained and end_constrained:
         degrees = (5, 6, 7)
     else:
         degrees = (3, 4, 5, 6, 7)
@@ -203,6 +267,7 @@ def _fit_chain_lowest_degree(
     best_score = float("inf")
     for candidate_degree in degrees:
         curve = SingleSpanFitter(FittingOptions(degree=candidate_degree)).fit_candidate(candidate)
+        curve = _refine_non_s_single_side_curve(curve, target_points)
         report = validator.validate(curve, target_points)
         chamfer = float(report.metrics.get("chamfer_mean", 999.0))
         spacing = float(report.metrics.get("cv_spacing_ratio", 999.0))
@@ -211,6 +276,10 @@ def _fit_chain_lowest_degree(
         side = _cv_side_consistency_penalty(curve, target_points)
         corridor = _cv_target_corridor_penalty(curve, target_points)
         layout = _cv_layout_penalty(curve.cvs)
+        forbidden_side = _has_forbidden_cv_side_switch(curve, target_points)
+        forbidden_curvature = _has_forbidden_curvature_sign_change(curve, target_points)
+        blend_fairness = _curve_blend_fairness_metrics(curve, target_points)
+        exceeds_precision = _curve_exceeds_precision_budget(curve, target_points)
         warnings = len(report.warnings)
         if bool(simplicity["simple"]):
             score = (
@@ -222,9 +291,15 @@ def _fit_chain_lowest_degree(
                 + side * 2.2
                 + corridor * 2.4
                 + layout * 0.14
+                + (10000.0 if forbidden_side else 0.0)
+                + (10000.0 if forbidden_curvature else 0.0)
+                + (8000.0 if bool(blend_fairness["forbidden"]) else 0.0)
+                + float(blend_fairness["penalty"]) * 40.0
+                + _curvature_sign_penalty(curve, target_points)
+                + (5000.0 if exceeds_precision else 0.0)
                 + candidate_degree * 42.0
             )
-            if report.passed and dent < 18.0 and side < 32.0 and corridor < 34.0 and spacing < 5.6:
+            if report.passed and not forbidden_side and not forbidden_curvature and not bool(blend_fairness["forbidden"]) and not exceeds_precision and dent < 18.0 and side < 32.0 and corridor < 34.0 and spacing < 5.6:
                 curve.metadata["degree_selected_for_simple_curve"] = True
                 curve.metadata["simplicity_sinuosity"] = simplicity["sinuosity"]
                 curve.metadata["simplicity_max_angle_deg"] = simplicity["max_angle_deg"]
@@ -239,10 +314,20 @@ def _fit_chain_lowest_degree(
                 + side * 2.7
                 + corridor * 2.8
                 + layout * 0.18
+                + (10000.0 if forbidden_side else 0.0)
+                + (10000.0 if forbidden_curvature else 0.0)
+                + (8000.0 if bool(blend_fairness["forbidden"]) else 0.0)
+                + float(blend_fairness["penalty"]) * 40.0
+                + _curvature_sign_penalty(curve, target_points)
+                + (5000.0 if exceeds_precision else 0.0)
                 + candidate_degree * 0.05
             )
         if (
             report.passed
+            and not forbidden_side
+            and not forbidden_curvature
+            and not bool(blend_fairness["forbidden"])
+            and not exceeds_precision
             and dent < 14.0
             and side < 30.0
             and corridor < 32.0
@@ -288,6 +373,7 @@ def _fit_design_curve_chain(
             )
             candidate = _make_candidate(label, points, annotation_path, design_curve)
             curve = _fit_lowest_degree(candidate, points, degree, validator)
+            fit_notes = _fit_metadata_notes(curve)
             curve.source = "manual_review_fit"
             curve.metadata = _curve_metadata(
                 design_curve,
@@ -297,6 +383,11 @@ def _fit_design_curve_chain(
                 segment_index,
                 fit_policy="split_boundaries_then_single_span_degree_3_to_7",
             )
+            curve.metadata.update(fit_notes)
+            _stamp_cv_side_diagnostics(curve, points)
+            _stamp_cv_target_corridor_diagnostics(curve, points)
+            _stamp_curvature_sign_diagnostics(curve, points)
+            _stamp_blend_fairness_diagnostics(curve, points)
             out.append((curve, candidate, validator.validate(curve, points)))
         return out
 
@@ -312,11 +403,14 @@ def _fit_design_curve_chain(
         )
     else:
         merge_diagnostics = {}
-    segments, split_diagnostics = _auto_adjust_g2_split_points(
-        segments,
-        closed=closed,
-        max_shift_px=G2_SPLIT_MAX_SHIFT_PX,
-    )
+    if ENABLE_G2_CONSTRAINTS:
+        segments, split_diagnostics = _auto_adjust_g2_split_points(
+            segments,
+            closed=closed,
+            max_shift_px=G2_SPLIT_MAX_SHIFT_PX,
+        )
+    else:
+        split_diagnostics = {}
     fitted_curves: list[tuple[NURBSCurve, CurveCandidate, np.ndarray, dict[str, Any], int]] = []
     out = []
     for segment_index, segment in enumerate(segments, start=1):
@@ -338,47 +432,66 @@ def _fit_design_curve_chain(
             segment_count=segment["segment_count"],
             closed=closed,
         )
-        curve.source = "manual_review_g2_fit"
+        fit_notes = _fit_metadata_notes(curve)
+        curve.source = "manual_review_g2_fit" if ENABLE_G2_CONSTRAINTS else "manual_review_fit"
         curve.metadata = _curve_metadata(
             design_curve,
             annotation_path,
             segment,
             points,
             segment_index,
-            fit_policy="manual_split_boundaries_with_lowest_degree_g2_fairing",
+            fit_policy=(
+                "manual_split_boundaries_with_lowest_degree_g2_fairing"
+                if ENABLE_G2_CONSTRAINTS
+                else "manual_split_boundaries_with_lowest_degree_no_g2"
+            ),
         )
-        curve.metadata["g2_chain"] = True
-        curve.metadata["g2_method"] = "limited_split_adjustment_plus_local_fairness_search"
+        curve.metadata["g2_chain"] = bool(ENABLE_G2_CONSTRAINTS)
+        curve.metadata["g2_method"] = (
+            "limited_split_adjustment_plus_local_fairness_search"
+            if ENABLE_G2_CONSTRAINTS
+            else "disabled_for_fit_debugging"
+        )
         curve.metadata["chain_original_segment_count"] = original_segment_count
         curve.metadata["chain_merged_segment_count"] = len(segments)
         curve.metadata["chain_merge"] = merge_diagnostics.get(segment_index - 1, {})
         curve.metadata["g2_split_adjustment"] = split_diagnostics.get(segment_index - 1, {})
+        curve.metadata.update(fit_notes)
         fitted_curves.append((curve, candidate, points, segment, segment_index))
 
-    _apply_g2_endpoint_fairing([item[0] for item in fitted_curves], [item[2] for item in fitted_curves], closed=closed)
+    if ENABLE_G2_CONSTRAINTS:
+        _apply_g2_endpoint_fairing([item[0] for item in fitted_curves], [item[2] for item in fitted_curves], closed=closed)
     if not isinstance(degree, int):
         _simplify_simple_chain_degrees(fitted_curves, validator, closed=closed)
     _promote_failed_chain_degrees(fitted_curves, validator, closed=closed)
     _repair_cv_side_flips(fitted_curves, validator, closed=closed)
-    _apply_g2_endpoint_fairing([item[0] for item in fitted_curves], [item[2] for item in fitted_curves], closed=closed)
+    if ENABLE_G2_CONSTRAINTS:
+        _apply_g2_endpoint_fairing([item[0] for item in fitted_curves], [item[2] for item in fitted_curves], closed=closed)
     if not isinstance(degree, int):
         _promote_bad_layout_degrees(fitted_curves, validator, closed=closed)
-        _apply_g2_endpoint_fairing([item[0] for item in fitted_curves], [item[2] for item in fitted_curves], closed=closed)
+        if ENABLE_G2_CONSTRAINTS:
+            _apply_g2_endpoint_fairing([item[0] for item in fitted_curves], [item[2] for item in fitted_curves], closed=closed)
     _repair_cv_side_flips(fitted_curves, validator, closed=closed)
-    _apply_g2_endpoint_fairing([item[0] for item in fitted_curves], [item[2] for item in fitted_curves], closed=closed)
+    if ENABLE_G2_CONSTRAINTS:
+        _apply_g2_endpoint_fairing([item[0] for item in fitted_curves], [item[2] for item in fitted_curves], closed=closed)
     if not isinstance(degree, int):
         _promote_bad_layout_degrees(fitted_curves, validator, closed=closed)
+        if ENABLE_G2_CONSTRAINTS:
+            _apply_g2_endpoint_fairing([item[0] for item in fitted_curves], [item[2] for item in fitted_curves], closed=closed)
+    if ENABLE_G2_CONSTRAINTS:
+        _refit_chain_with_current_g2_constraints(fitted_curves, validator, requested_degree=degree, closed=closed)
         _apply_g2_endpoint_fairing([item[0] for item in fitted_curves], [item[2] for item in fitted_curves], closed=closed)
-    _refit_chain_with_current_g2_constraints(fitted_curves, validator, requested_degree=degree, closed=closed)
-    _apply_g2_endpoint_fairing([item[0] for item in fitted_curves], [item[2] for item in fitted_curves], closed=closed)
     _fair_free_interior_cvs_for_chain(fitted_curves, closed=closed)
     for curve, candidate, points, segment, segment_index in fitted_curves:
         _stamp_cv_side_diagnostics(curve, points)
         _stamp_cv_target_corridor_diagnostics(curve, points)
-        curve.metadata["g2_start_constrained"] = closed or segment_index > 1
-        curve.metadata["g2_end_constrained"] = closed or segment_index < len(fitted_curves)
+        _stamp_curvature_sign_diagnostics(curve, points)
+        _stamp_blend_fairness_diagnostics(curve, points)
+        curve.metadata["g2_start_constrained"] = bool(ENABLE_G2_CONSTRAINTS and (closed or segment_index > 1))
+        curve.metadata["g2_end_constrained"] = bool(ENABLE_G2_CONSTRAINTS and (closed or segment_index < len(fitted_curves)))
         out.append((curve, candidate, validator.validate(curve, points)))
-    _stamp_g2_diagnostics(out, closed=closed)
+    if ENABLE_G2_CONSTRAINTS:
+        _stamp_g2_diagnostics(out, closed=closed)
     if allow_auto_merge and len(segments) < original_segment_count and any(not item[2].passed for item in out):
         return _fit_design_curve_chain(
             design_curve,
@@ -448,6 +561,15 @@ def _curve_metadata(
     }
 
 
+def _fit_metadata_notes(curve: NURBSCurve) -> dict[str, Any]:
+    prefixes = (
+        "non_s_",
+        "degree_selected_",
+        "simplicity_",
+    )
+    return {key: value for key, value in curve.metadata.items() if any(key.startswith(prefix) for prefix in prefixes)}
+
+
 def _fit_g2_constrained_segment(
     candidate: CurveCandidate,
     target_points: np.ndarray,
@@ -490,6 +612,8 @@ def _apply_g2_endpoint_fairing(
     closed: bool,
     only_join_indices: set[int] | None = None,
 ) -> None:
+    if not ENABLE_G2_CONSTRAINTS:
+        return
     if len(curves) <= 1:
         return
     join_count = len(curves) if closed and len(curves) > 2 else len(curves) - 1
@@ -529,6 +653,7 @@ def _promote_failed_chain_degrees(
         for candidate_degree in range(curve.degree + 1, 8):
             try:
                 promoted = SingleSpanFitter(FittingOptions(degree=candidate_degree)).fit_candidate(candidate)
+                promoted = _refine_non_s_single_side_curve(promoted, points)
                 promoted.source = curve.source
                 promoted.metadata = dict(curve.metadata)
                 promoted.metadata["degree_promoted_after_fairing"] = True
@@ -539,6 +664,14 @@ def _promote_failed_chain_degrees(
                 new_spacing = float(new_report.metrics.get("cv_spacing_ratio", 999.0))
                 side = _cv_side_consistency_penalty(promoted, points)
                 corridor = _cv_target_corridor_penalty(promoted, points)
+                hard_failure = (
+                    _has_forbidden_cv_side_switch(promoted, points)
+                    or _has_forbidden_curvature_sign_change(promoted, points)
+                    or bool(_curve_blend_fairness_metrics(promoted, points)["forbidden"])
+                    or _curve_exceeds_precision_budget(promoted, points)
+                )
+                if hard_failure:
+                    continue
                 score = (
                     len(new_report.warnings) * 1000.0
                     + new_chamfer * 20.0
@@ -571,6 +704,8 @@ def _refit_chain_with_current_g2_constraints(
     requested_degree: int | str,
     closed: bool,
 ) -> None:
+    if not ENABLE_G2_CONSTRAINTS:
+        return
     if len(fitted_curves) <= 1:
         return
     curves = [item[0] for item in fitted_curves]
@@ -612,7 +747,7 @@ def _refit_chain_with_current_g2_constraints(
         refit.metadata["g2_constraint_refit_to_degree"] = refit.degree
         trial_curves.append(refit)
 
-    _fair_free_interior_cvs_for_curves(trial_curves, closed=closed)
+    _fair_free_interior_cvs_for_curves(trial_curves, target_segments=target_segments, closed=closed)
     if not _chain_passes_g0_g1(trial_curves, target_segments, closed=closed):
         return
     trial_score = _chain_total_quality_score(trial_curves, target_segments, validator, closed=closed)
@@ -683,7 +818,10 @@ def _repair_cv_side_flips(
     for index, (curve, candidate, points, segment, segment_index) in enumerate(list(fitted_curves)):
         current_side = _cv_side_consistency_penalty(curve, points)
         current_corridor = _cv_target_corridor_penalty(curve, points)
-        if current_side <= 48.0 and current_corridor <= 54.0:
+        current_forbidden = _has_forbidden_cv_side_switch(curve, points)
+        current_curv_forbidden = _has_forbidden_curvature_sign_change(curve, points)
+        current_blend_forbidden = bool(_curve_blend_fairness_metrics(curve, points)["forbidden"])
+        if not current_forbidden and not current_curv_forbidden and not current_blend_forbidden and current_side <= 32.0 and current_corridor <= 36.0:
             continue
         best_curve = curve
         best_score = _side_repair_score(curve, points, validator)
@@ -693,6 +831,7 @@ def _repair_cv_side_flips(
         for candidate_degree in range(min_degree, 8):
             try:
                 trial = SingleSpanFitter(FittingOptions(degree=candidate_degree)).fit_candidate(candidate)
+                trial = _refine_non_s_single_side_curve(trial, points)
                 trial.source = curve.source
                 trial.metadata = dict(curve.metadata)
                 trial.metadata["cv_side_repaired"] = True
@@ -706,9 +845,16 @@ def _repair_cv_side_flips(
                 continue
         repaired_side = _cv_side_consistency_penalty(best_curve, points)
         repaired_corridor = _cv_target_corridor_penalty(best_curve, points)
+        repaired_forbidden = _has_forbidden_cv_side_switch(best_curve, points)
+        repaired_curv_forbidden = _has_forbidden_curvature_sign_change(best_curve, points)
+        repaired_blend_forbidden = bool(_curve_blend_fairness_metrics(best_curve, points)["forbidden"])
         if (
             best_curve is not curve
-            and repaired_side + repaired_corridor <= current_side + current_corridor - 32.0
+            and not repaired_forbidden
+            and not repaired_curv_forbidden
+            and not repaired_blend_forbidden
+            and repaired_side + repaired_corridor <= current_side + current_corridor - (18.0 if current_forbidden else 32.0)
+            and not _curve_exceeds_precision_budget(best_curve, points)
         ):
             fitted_curves[index] = (best_curve, candidate, points, segment, segment_index)
 
@@ -721,6 +867,10 @@ def _side_repair_score(curve: NURBSCurve, points: np.ndarray, validator: ClassAV
     side = _cv_side_consistency_penalty(curve, points)
     corridor = _cv_target_corridor_penalty(curve, points)
     dent = _cv_dent_penalty(curve.cvs)
+    forbidden_side = _has_forbidden_cv_side_switch(curve, points)
+    forbidden_curvature = _has_forbidden_curvature_sign_change(curve, points)
+    blend_fairness = _curve_blend_fairness_metrics(curve, points)
+    exceeds_precision = _curve_exceeds_precision_budget(curve, points)
     return (
         side * 14.0
         + corridor * 14.0
@@ -729,6 +879,12 @@ def _side_repair_score(curve: NURBSCurve, points: np.ndarray, validator: ClassAV
         + max(0.0, spacing - 4.2) * 45.0
         + max(0.0, oscillation - 0.52) * 120.0
         + dent * 0.8
+        + (10000.0 if forbidden_side else 0.0)
+        + (10000.0 if forbidden_curvature else 0.0)
+        + (8000.0 if bool(blend_fairness["forbidden"]) else 0.0)
+        + float(blend_fairness["penalty"]) * 36.0
+        + _curvature_sign_penalty(curve, points)
+        + (5000.0 if exceeds_precision else 0.0)
         + curve.degree * 4.0
     )
 
@@ -745,6 +901,9 @@ def _promote_bad_layout_degrees(
     for index, (curve, candidate, points, segment, segment_index) in enumerate(list(fitted_curves)):
         side = _cv_side_consistency_penalty(curve, points)
         corridor = _cv_target_corridor_penalty(curve, points)
+        forbidden_side = _has_forbidden_cv_side_switch(curve, points)
+        forbidden_curvature = _has_forbidden_curvature_sign_change(curve, points)
+        blend_forbidden = bool(_curve_blend_fairness_metrics(curve, points)["forbidden"])
         jump = _curve_endpoint_jump_score(
             [item[0] for item in fitted_curves],
             target_segments,
@@ -754,7 +913,7 @@ def _promote_bad_layout_degrees(
         report = validator.validate(curve, points)
         if curve.degree >= 7:
             continue
-        if report.passed and side < 120.0 and corridor < 120.0 and jump < 130.0:
+        if report.passed and not forbidden_side and not forbidden_curvature and not blend_forbidden and side < 120.0 and corridor < 120.0 and jump < 130.0:
             continue
 
         start_constrained = closed or index > 0
@@ -774,6 +933,7 @@ def _promote_bad_layout_degrees(
             try:
                 trial_curves = [_clone_curve(item[0]) for item in fitted_curves]
                 trial = SingleSpanFitter(FittingOptions(degree=target_degree)).fit_candidate(candidate)
+                trial = _refine_non_s_single_side_curve(trial, points)
                 trial.source = curve.source
                 trial.metadata = dict(curve.metadata)
                 trial.metadata["degree_promoted_for_cv_layout"] = True
@@ -786,11 +946,30 @@ def _promote_bad_layout_degrees(
                     closed=closed,
                     only_join_indices=_adjacent_join_indices(index, len(trial_curves), closed=closed),
                 )
-                _fair_free_interior_cvs_for_curves(trial_curves, closed=closed)
+                _fair_free_interior_cvs_for_curves(trial_curves, target_segments=target_segments, closed=closed)
                 trial_report = validator.validate(trial_curves[index], points)
+                trial_has_hard_failure = (
+                    _has_forbidden_cv_side_switch(trial_curves[index], points)
+                    or _has_forbidden_curvature_sign_change(trial_curves[index], points)
+                    or bool(_curve_blend_fairness_metrics(trial_curves[index], points)["forbidden"])
+                    or _curve_exceeds_precision_budget(trial_curves[index], points)
+                )
+                if trial_has_hard_failure:
+                    continue
                 score = _chain_local_quality_score(trial_curves, target_segments, validator, index, closed=closed)
                 score += _cv_side_consistency_penalty(trial_curves[index], points) * 2.8
                 score += _cv_target_corridor_penalty(trial_curves[index], points) * 2.8
+                if _has_forbidden_cv_side_switch(trial_curves[index], points):
+                    score += 10000.0
+                if _has_forbidden_curvature_sign_change(trial_curves[index], points):
+                    score += 10000.0
+                blend_fairness = _curve_blend_fairness_metrics(trial_curves[index], points)
+                if bool(blend_fairness["forbidden"]):
+                    score += 8000.0
+                score += float(blend_fairness["penalty"]) * 36.0
+                score += _curvature_sign_penalty(trial_curves[index], points)
+                if _curve_exceeds_precision_budget(trial_curves[index], points):
+                    score += 5000.0
                 trial_jump = _curve_endpoint_jump_score(trial_curves, target_segments, index, closed=closed)
                 score += trial_jump * 6.0
                 jump_improved = jump > 180.0 and trial_jump < best_jump * 0.88
@@ -845,6 +1024,7 @@ def _simplify_simple_chain_degrees(
                 continue
             trial_curves = [_clone_curve(item[0]) for item in fitted_curves]
             trial = SingleSpanFitter(FittingOptions(degree=target_degree)).fit_candidate(candidate)
+            trial = _refine_non_s_single_side_curve(trial, points)
             trial.source = curve.source
             trial.metadata = dict(curve.metadata)
             trial.metadata["degree_simplified_from"] = curve.degree
@@ -860,9 +1040,17 @@ def _simplify_simple_chain_degrees(
                 closed=closed,
                 only_join_indices=_adjacent_join_indices(index, len(trial_curves), closed=closed),
             )
-            _fair_free_interior_cvs_for_curves(trial_curves, closed=closed)
+            _fair_free_interior_cvs_for_curves(trial_curves, target_segments=target_segments, closed=closed)
             report = validator.validate(trial_curves[index], points)
             if not report.passed:
+                continue
+            if _has_forbidden_cv_side_switch(trial_curves[index], points):
+                continue
+            if _has_forbidden_curvature_sign_change(trial_curves[index], points):
+                continue
+            if bool(_curve_blend_fairness_metrics(trial_curves[index], points)["forbidden"]):
+                continue
+            if _curve_exceeds_precision_budget(trial_curves[index], points):
                 continue
             if _cv_dent_penalty(trial_curves[index].cvs) > 14.0:
                 continue
@@ -921,6 +1109,17 @@ def _chain_local_quality_score(
         score += _cv_dent_penalty(curves[item_index].cvs) * 0.35
         score += _cv_side_consistency_penalty(curves[item_index], target_segments[item_index]) * 1.8
         score += _cv_target_corridor_penalty(curves[item_index], target_segments[item_index]) * 1.9
+        if _has_forbidden_cv_side_switch(curves[item_index], target_segments[item_index]):
+            score += 10000.0
+        if _has_forbidden_curvature_sign_change(curves[item_index], target_segments[item_index]):
+            score += 10000.0
+        blend_fairness = _curve_blend_fairness_metrics(curves[item_index], target_segments[item_index])
+        if bool(blend_fairness["forbidden"]):
+            score += 8000.0
+        score += float(blend_fairness["penalty"]) * 28.0
+        score += _curvature_sign_penalty(curves[item_index], target_segments[item_index])
+        if _curve_exceeds_precision_budget(curves[item_index], target_segments[item_index]):
+            score += 5000.0
         score += _curve_endpoint_jump_score(curves, target_segments, item_index, closed=closed) * 3.2
         score += curves[item_index].degree * 0.08
     return score
@@ -954,7 +1153,8 @@ def _fair_free_interior_cvs_for_chain(
     closed: bool,
 ) -> None:
     curves = [item[0] for item in fitted_curves]
-    _fair_free_interior_cvs_for_curves(curves, closed=closed)
+    target_segments = [item[2] for item in fitted_curves]
+    _fair_free_interior_cvs_for_curves(curves, target_segments=target_segments, closed=closed)
 
 
 def _smooth_endpoint_bridges_for_chain(
@@ -988,17 +1188,63 @@ def _smooth_endpoint_bridges_for_curves(
         _smooth_endpoint_bridge_cv(curves[(join_index + 1) % len(curves)], side="start", local_len=local_len)
 
 
-def _fair_free_interior_cvs_for_curves(curves: list[NURBSCurve], *, closed: bool) -> None:
+def _fair_free_interior_cvs_for_curves(
+    curves: list[NURBSCurve],
+    *,
+    closed: bool,
+    target_segments: list[np.ndarray] | None = None,
+) -> None:
     if not curves:
         return
     for index, curve in enumerate(curves):
         start_constrained = closed or index > 0
         end_constrained = closed or index < len(curves) - 1
         if start_constrained and end_constrained:
-            _fair_free_interior_cvs(curve)
+            if target_segments is None:
+                continue
+            _fair_free_interior_cvs_guarded(curve, target_segments[index])
 
 
-def _fair_free_interior_cvs(curve: NURBSCurve, *, strength: float = 0.72) -> None:
+def _fair_free_interior_cvs_guarded(curve: NURBSCurve, points: np.ndarray) -> None:
+    base = _clone_curve(curve)
+    base_mean = _bezier_mean_error(base, points)
+    base_max = _bezier_max_error(base, points)
+    base_layout = _cv_layout_penalty(base.cvs)
+    base_dent = _cv_dent_penalty(base.cvs)
+    base_side = _cv_side_consistency_penalty(base, points)
+    base_corridor = _cv_target_corridor_penalty(base, points)
+    best: NURBSCurve | None = None
+    best_score = base_layout * 0.7 + base_dent + base_side * 2.0 + base_corridor * 2.0 + base_mean * 8.0
+    for strength in (0.16, 0.28, 0.40):
+        trial = _clone_curve(base)
+        _fair_free_interior_cvs(trial, strength=strength)
+        mean = _bezier_mean_error(trial, points)
+        max_error = _bezier_max_error(trial, points)
+        if mean > min(_mean_fit_budget(points), base_mean + max(0.45, base_mean * 0.12)):
+            continue
+        if max_error > min(_max_fit_budget(points), base_max + max(1.2, base_max * 0.12)):
+            continue
+        if _has_forbidden_cv_side_switch(trial, points):
+            continue
+        if _has_forbidden_curvature_sign_change(trial, points):
+            continue
+        if bool(_curve_blend_fairness_metrics(trial, points)["forbidden"]):
+            continue
+        side = _cv_side_consistency_penalty(trial, points)
+        corridor = _cv_target_corridor_penalty(trial, points)
+        if side > base_side + 5.0 or corridor > base_corridor + 5.0:
+            continue
+        layout = _cv_layout_penalty(trial.cvs)
+        dent = _cv_dent_penalty(trial.cvs)
+        score = layout * 0.7 + dent + side * 2.0 + corridor * 2.0 + mean * 8.0
+        if score < best_score - 3.0:
+            best_score = score
+            best = trial
+    if best is not None:
+        curve.cvs = best.cvs
+
+
+def _fair_free_interior_cvs(curve: NURBSCurve, *, strength: float = 0.28) -> None:
     cvs = curve.cvs
     count = len(cvs)
     if count <= 6:
@@ -1451,6 +1697,573 @@ def _bezier_mean_error(curve: NURBSCurve, points: np.ndarray) -> float:
     return float(np.mean(np.linalg.norm(sampled[:, :2] - pts[:, :2], axis=1)))
 
 
+def _bezier_max_error(curve: NURBSCurve, points: np.ndarray) -> float:
+    if len(points) < 2:
+        return 0.0
+    pts = remove_duplicate_points(points, eps=0.5)
+    u = chord_length_parameter(pts)
+    sampled = evaluate_bezier(curve.cvs, u, curve.weights)
+    return float(np.max(np.linalg.norm(sampled[:, :2] - pts[:, :2], axis=1)))
+
+
+def _mean_fit_budget(points: np.ndarray) -> float:
+    length = max(_polyline_length(points), 1.0)
+    return max(3.2, min(8.0, length * 0.012))
+
+
+def _max_fit_budget(points: np.ndarray) -> float:
+    length = max(_polyline_length(points), 1.0)
+    return max(8.0, min(22.0, length * 0.035))
+
+
+def _curve_exceeds_precision_budget(curve: NURBSCurve, points: np.ndarray) -> bool:
+    return _bezier_mean_error(curve, points) > _mean_fit_budget(points) or _bezier_max_error(curve, points) > _max_fit_budget(points)
+
+
+def _curve_curvature_sign_metrics(curve: NURBSCurve, target_points: np.ndarray, sample_count: int = 120) -> dict[str, float | int | bool]:
+    u = np.linspace(0.0, 1.0, max(sample_count, 24))
+    d1_cvs = curve.degree * np.diff(curve.cvs, axis=0)
+    d2_cvs = curve.degree * (curve.degree - 1) * np.diff(curve.cvs, n=2, axis=0)
+    d1 = evaluate_bezier(d1_cvs, u)
+    d2 = evaluate_bezier(d2_cvs, u)
+    speed = np.linalg.norm(d1[:, :2], axis=1)
+    cross_vals = d1[:, 0] * d2[:, 1] - d1[:, 1] * d2[:, 0]
+    curvature = np.divide(cross_vals, np.maximum(speed, 1e-9) ** 3)
+    curvature = curvature[np.isfinite(curvature)]
+    if len(curvature) == 0:
+        return {
+            "forbidden": False,
+            "sign_flips": 0,
+            "positive": 0,
+            "negative": 0,
+            "k_min": 0.0,
+            "k_max": 0.0,
+            "target_is_s_curve": False,
+        }
+    target_is_s_curve = _target_has_macro_s_shape(target_points)
+    max_abs = float(np.nanmax(np.abs(curvature)))
+    length = max(_polyline_length(target_points), 1.0)
+    # Ignore numerical fuzz on nearly straight spans, but do not ignore visible
+    # curvature reversals. The length-scaled floor avoids treating pure lines as S.
+    eps = max(max_abs * 0.035, 1.0 / (length * length) * 0.35, 1e-8)
+    signs = np.sign(np.where(np.abs(curvature) < eps, 0.0, curvature))
+    nonzero = signs[signs != 0]
+    positive = int(np.sum(nonzero > 0))
+    negative = int(np.sum(nonzero < 0))
+    sign_flips = int(np.sum(nonzero[1:] * nonzero[:-1] < 0.0)) if len(nonzero) > 1 else 0
+    forbidden = bool((not target_is_s_curve) and positive > 0 and negative > 0)
+    return {
+        "forbidden": forbidden,
+        "sign_flips": sign_flips,
+        "positive": positive,
+        "negative": negative,
+        "k_min": float(np.nanmin(curvature)),
+        "k_max": float(np.nanmax(curvature)),
+        "target_is_s_curve": bool(target_is_s_curve),
+    }
+
+
+def _has_forbidden_curvature_sign_change(curve: NURBSCurve, target_points: np.ndarray) -> bool:
+    return bool(_curve_curvature_sign_metrics(curve, target_points)["forbidden"])
+
+
+def _stamp_curvature_sign_diagnostics(curve: NURBSCurve, target_points: np.ndarray) -> None:
+    metrics = _curve_curvature_sign_metrics(curve, target_points)
+    curve.metadata["curvature_sign_forbidden"] = bool(metrics["forbidden"])
+    curve.metadata["curvature_sign_flips"] = int(metrics["sign_flips"])
+    curve.metadata["curvature_positive_samples"] = int(metrics["positive"])
+    curve.metadata["curvature_negative_samples"] = int(metrics["negative"])
+    curve.metadata["curvature_k_min"] = round(float(metrics["k_min"]), 9)
+    curve.metadata["curvature_k_max"] = round(float(metrics["k_max"]), 9)
+    curve.metadata["target_macro_s_curve"] = bool(metrics["target_is_s_curve"])
+
+
+def _stamp_blend_fairness_diagnostics(curve: NURBSCurve, target_points: np.ndarray) -> None:
+    metrics = _curve_blend_fairness_metrics(curve, target_points)
+    curve.metadata["blend_fairness_forbidden"] = bool(metrics["forbidden"])
+    curve.metadata["blend_fairness_penalty"] = round(float(metrics["penalty"]), 4)
+    curve.metadata["blend_strict_side_leak"] = bool(metrics["strict_side_leak"])
+    curve.metadata["blend_lobe_extrema"] = int(metrics["lobe_extrema"])
+    curve.metadata["blend_lobe_penalty"] = round(float(metrics["lobe_penalty"]), 4)
+    curve.metadata["blend_max_cv_turn_deg"] = round(float(metrics["max_cv_turn_deg"]), 4)
+    curve.metadata["blend_strict_wrong_curvature"] = round(float(metrics["strict_wrong_curvature"]), 9)
+    curve.metadata["blend_wrong_cv_turn_count"] = int(metrics["wrong_cv_turn_count"])
+    curve.metadata["blend_max_wrong_cv_turn"] = round(float(metrics["max_wrong_cv_turn"]), 6)
+
+
+def _curvature_sign_penalty(curve: NURBSCurve, target_points: np.ndarray) -> float:
+    metrics = _curve_curvature_sign_metrics(curve, target_points)
+    if bool(metrics["target_is_s_curve"]):
+        return 0.0
+    positive = int(metrics["positive"])
+    negative = int(metrics["negative"])
+    flips = int(metrics["sign_flips"])
+    weaker = min(positive, negative)
+    return float(weaker * 180.0 + flips * 420.0)
+
+
+def _refine_non_s_single_side_curve(curve: NURBSCurve, target_points: np.ndarray) -> NURBSCurve:
+    """Nudge a fitted Bezier away from false inflections on non-S manual segments.
+
+    The manual split path is allowed to be noisy, but a normal automotive
+    segment should not make Alias' curvature comb jump to the other side.  This
+    local optimizer keeps the same single-span degree and fixed endpoints while
+    penalizing opposite signed curvature and CVs crossing the outside side.
+    """
+    if minimize is None or curve.degree < 3 or _target_has_macro_s_shape(target_points):
+        return curve
+    target = remove_duplicate_points(np.asarray(target_points, dtype=float), eps=0.5)
+    if len(target) < 6 or _polyline_length(target) < 6.0:
+        return curve
+
+    side_forbidden = _has_forbidden_cv_side_switch(curve, target)
+    curv_forbidden = _has_forbidden_curvature_sign_change(curve, target)
+    blend_metrics = _curve_blend_fairness_metrics(curve, target)
+    blend_forbidden = bool(blend_metrics["forbidden"])
+    if not side_forbidden and not curv_forbidden and not blend_forbidden:
+        return curve
+
+    desired_curvature_sign = _dominant_curve_curvature_sign(curve, target)
+    if desired_curvature_sign == 0:
+        desired_curvature_sign = _dominant_target_polyline_curvature_sign(target)
+    if desired_curvature_sign == 0:
+        desired_curvature_sign = 1
+
+    desired_cv_side = _dominant_cv_target_side(curve, target)
+    if desired_cv_side == 0:
+        desired_cv_side = -desired_curvature_sign
+
+    work_count = int(min(180, max(80, len(target))))
+    work_target = smooth_polyline(resample_polyline(target, work_count), window=5)
+    u_fit = chord_length_parameter(work_target)
+    basis = bernstein_basis(curve.degree, u_fit)
+    target_xy = work_target[:, :2]
+
+    u_curv = np.linspace(0.015, 0.985, 96)
+    d1_basis = bernstein_basis(curve.degree - 1, u_curv)
+    d2_basis = bernstein_basis(curve.degree - 2, u_curv) if curve.degree >= 2 else np.zeros((len(u_curv), 1))
+
+    base = np.asarray(curve.cvs, dtype=float).copy()
+    base_xy = base[:, :2].copy()
+    p0 = base[0].copy()
+    p1 = base[-1].copy()
+    length = max(_polyline_length(target), 1.0)
+    fit_scale = max(_mean_fit_budget(target), 1.0)
+    drift_limit = max(length * 0.12, 12.0)
+    side_eps = 0.12
+    refs: list[np.ndarray] = []
+    tangents: list[np.ndarray] = []
+    for cv_index in range(1, curve.degree):
+        ref, tangent = _target_point_tangent_at_fraction(work_target, cv_index / float(curve.degree))
+        refs.append(ref)
+        tangents.append(tangent)
+    refs_arr = np.asarray(refs, dtype=float)
+    tangents_arr = np.asarray(tangents, dtype=float)
+
+    base_k = _signed_curvature_samples_from_cvs(base_xy, d1_basis, d2_basis, curve.degree)
+    finite_base_k = base_k[np.isfinite(base_k)]
+    k_scale = (
+        max(float(np.nanpercentile(np.abs(finite_base_k), 80)), 1.0 / max(length * 2.2, 1.0), 1e-5)
+        if len(finite_base_k)
+        else max(1.0 / max(length * 2.2, 1.0), 1e-5)
+    )
+
+    def build_cvs(x: np.ndarray) -> np.ndarray:
+        cvs = base.copy()
+        cvs[1:-1, :2] = x.reshape(curve.degree - 1, 2)
+        cvs[0] = p0
+        cvs[-1] = p1
+        return cvs
+
+    def objective_factory(curvature_weight: float):
+        def objective(x: np.ndarray) -> float:
+            cvs = build_cvs(x)
+            xy = cvs[:, :2]
+            sampled = basis @ xy
+            data = float(np.mean(np.sum((sampled - target_xy) ** 2, axis=1)) / (fit_scale**2))
+            d2 = np.diff(xy, n=2, axis=0)
+            d3 = np.diff(xy, n=3, axis=0) if len(xy) >= 4 else np.zeros((0, 2))
+            fair = float(np.mean(np.sum(d2**2, axis=1)) / (length**2)) if len(d2) else 0.0
+            jerk = float(np.mean(np.sum(d3**2, axis=1)) / (length**2)) if len(d3) else 0.0
+            drift = float(np.mean(np.sum((xy[1:-1] - base_xy[1:-1]) ** 2, axis=1)) / (drift_limit**2))
+
+            k = _signed_curvature_samples_from_cvs(xy, d1_basis, d2_basis, curve.degree)
+            wrong_k = np.clip(-desired_curvature_sign * k, 0.0, None)
+            curv_sign = float(np.mean((wrong_k / k_scale) ** 2))
+            fair_k = desired_curvature_sign * k
+            strict_wrong_k = np.clip(-(fair_k) - k_scale * 0.006, 0.0, None)
+            comb_leak = float(np.mean((strict_wrong_k / k_scale) ** 2))
+            lobe = _curvature_lobe_penalty_from_values(fair_k, scale=k_scale)
+
+            side_penalty = 0.0
+            if desired_cv_side != 0 and len(refs_arr):
+                signed = tangents_arr[:, 0] * (xy[1:-1, 1] - refs_arr[:, 1]) - tangents_arr[:, 1] * (
+                    xy[1:-1, 0] - refs_arr[:, 0]
+                )
+                wrong_side = np.clip(-(desired_cv_side * signed) - side_eps, 0.0, None)
+                side_penalty = float(np.mean((wrong_side / max(side_eps * 4.0, 1.0)) ** 2))
+
+            edge = np.diff(xy, axis=0)
+            edge_len = np.linalg.norm(edge, axis=1)
+            unit = edge / np.maximum(edge_len[:, None], 1e-9)
+            turn = 0.0
+            if len(unit) >= 2:
+                dots = np.sum(unit[:-1] * unit[1:], axis=1)
+                turn = float(np.mean(np.clip(-dots - 0.02, 0.0, None) ** 2))
+                angles = np.arccos(np.clip(dots, -1.0, 1.0))
+                cv_turn = float(np.mean(np.clip(angles - np.deg2rad(24.0), 0.0, None) ** 2))
+                cross_turn = edge[:-1, 0] * edge[1:, 1] - edge[:-1, 1] * edge[1:, 0]
+                cross_norm = cross_turn / np.maximum(edge_len[:-1] * edge_len[1:], 1e-9)
+                bad_turn_side = np.clip(-(desired_curvature_sign * cross_norm) - 0.003, 0.0, None)
+                cv_turn_side = float(np.mean(bad_turn_side**2))
+            else:
+                cv_turn = 0.0
+                cv_turn_side = 0.0
+
+            return (
+                data * 34.0
+                + fair * 16.0
+                + jerk * 5.5
+                + drift * 2.2
+                + curv_sign * curvature_weight
+                + comb_leak * curvature_weight * 2.6
+                + lobe * 240.0
+                + side_penalty * 110.0
+                + turn * 180.0
+                + cv_turn * 260.0
+                + cv_turn_side * 620.0
+            )
+
+        return objective
+
+    base_score = _single_side_acceptance_score(curve, target)
+    best_curve = curve
+    best_score = base_score
+    x0 = base[1:-1, :2].reshape(-1)
+    max_shift = max(length * 0.28, 18.0)
+    bounds = [(float(value - max_shift), float(value + max_shift)) for value in x0]
+    for curvature_weight in (140.0, 420.0, 1100.0):
+        try:
+            result = minimize(
+                objective_factory(curvature_weight),
+                x0,
+                method="L-BFGS-B",
+                bounds=bounds,
+                options={"maxiter": 140, "ftol": 1e-7, "maxls": 20},
+            )
+        except Exception:
+            continue
+        if not hasattr(result, "x"):
+            continue
+        trial = _clone_curve(curve)
+        trial.cvs = build_cvs(np.asarray(result.x, dtype=float))
+        _repair_cv_turn_side(trial, desired_curvature_sign, target)
+        if _bezier_mean_error(trial, target) > min(_mean_fit_budget(target), _bezier_mean_error(curve, target) + 2.4):
+            continue
+        if _bezier_max_error(trial, target) > min(_max_fit_budget(target), _bezier_max_error(curve, target) + 7.5):
+            continue
+        trial_blend = _curve_blend_fairness_metrics(trial, target)
+        if bool(trial_blend["strict_side_leak"]) and not bool(blend_metrics["strict_side_leak"]):
+            continue
+        score = _single_side_acceptance_score(trial, target)
+        if score < best_score - 18.0:
+            best_score = score
+            best_curve = trial
+
+    if best_curve is not curve:
+        best_curve.metadata = dict(curve.metadata)
+        best_curve.metadata["non_s_single_side_refined"] = True
+        best_curve.metadata["non_s_single_side_from_score"] = round(float(base_score), 4)
+        best_curve.metadata["non_s_single_side_to_score"] = round(float(best_score), 4)
+        best_curve.metadata["non_s_desired_curvature_sign"] = int(desired_curvature_sign)
+        best_curve.metadata["non_s_desired_cv_side"] = int(desired_cv_side)
+    return best_curve
+
+
+def _single_side_acceptance_score(curve: NURBSCurve, target_points: np.ndarray) -> float:
+    blend = _curve_blend_fairness_metrics(curve, target_points)
+    return float(
+        _bezier_mean_error(curve, target_points) * 24.0
+        + _bezier_max_error(curve, target_points) * 2.4
+        + _cv_side_consistency_penalty(curve, target_points) * 14.0
+        + _cv_target_corridor_penalty(curve, target_points) * 12.0
+        + _curvature_sign_penalty(curve, target_points) * 3.2
+        + float(blend["penalty"]) * 24.0
+        + _cv_layout_penalty(curve.cvs) * 3.0
+        + _cv_dent_penalty(curve.cvs) * 1.4
+        + (25000.0 if _has_forbidden_curvature_sign_change(curve, target_points) else 0.0)
+        + (18000.0 if _has_forbidden_cv_side_switch(curve, target_points) else 0.0)
+        + (14000.0 if bool(blend["forbidden"]) else 0.0)
+    )
+
+
+def _curve_blend_fairness_metrics(curve: NURBSCurve, target_points: np.ndarray) -> dict[str, float | int | bool]:
+    if _target_has_macro_s_shape(target_points):
+        return {
+            "forbidden": False,
+            "penalty": 0.0,
+            "strict_side_leak": False,
+            "lobe_extrema": 0,
+            "lobe_penalty": 0.0,
+            "max_cv_turn_deg": 0.0,
+            "strict_wrong_curvature": 0.0,
+            "wrong_cv_turn_count": 0,
+            "max_wrong_cv_turn": 0.0,
+        }
+    u = np.linspace(0.01, 0.99, 140)
+    d1_cvs = curve.degree * np.diff(curve.cvs[:, :2], axis=0)
+    d2_cvs = curve.degree * (curve.degree - 1) * np.diff(curve.cvs[:, :2], n=2, axis=0)
+    d1 = evaluate_bezier(d1_cvs, u)
+    d2 = evaluate_bezier(d2_cvs, u)
+    speed = np.linalg.norm(d1, axis=1)
+    k = np.divide(d1[:, 0] * d2[:, 1] - d1[:, 1] * d2[:, 0], np.maximum(speed, 1e-9) ** 3)
+    k = k[np.isfinite(k)]
+    if len(k) < 16:
+        return {
+            "forbidden": False,
+            "penalty": 0.0,
+            "strict_side_leak": False,
+            "lobe_extrema": 0,
+            "lobe_penalty": 0.0,
+            "max_cv_turn_deg": 0.0,
+            "strict_wrong_curvature": 0.0,
+            "wrong_cv_turn_count": 0,
+            "max_wrong_cv_turn": 0.0,
+        }
+    desired = _dominant_curve_curvature_sign(curve, target_points)
+    if desired == 0:
+        desired = _dominant_target_polyline_curvature_sign(target_points)
+    if desired == 0:
+        desired = 1
+    fair_k = desired * k
+    length = max(_polyline_length(target_points), 1.0)
+    k_scale = max(float(np.nanpercentile(np.abs(k), 88)), 1.0 / max(length * 2.2, 1.0), 1e-6)
+    strict_wrong = float(max(0.0, -float(np.nanmin(fair_k))))
+    strict_side_leak = bool(strict_wrong > max(k_scale * 0.006, 1.0 / max(length * length * 18.0, 1.0)))
+    lobe_penalty, lobe_extrema = _curvature_lobe_penalty_from_values(fair_k, scale=k_scale, return_extrema=True)
+    max_cv_turn, mean_bad_turn = _cv_turn_metrics(curve.cvs)
+    wrong_cv_turn_count, max_wrong_cv_turn = _cv_turn_side_metrics(curve.cvs, desired)
+    penalty = (
+        lobe_penalty * 1.8
+        + max(0.0, max_cv_turn - 34.0) * 0.18
+        + mean_bad_turn * 5.0
+        + (strict_wrong / k_scale) * 38.0
+        + wrong_cv_turn_count * 18.0
+        + max_wrong_cv_turn * 42.0
+    )
+    forbidden = bool(
+        strict_side_leak
+        or lobe_extrema > 2
+        or max_cv_turn > 48.0
+        or lobe_penalty > 1.75
+        or wrong_cv_turn_count > 0
+    )
+    return {
+        "forbidden": forbidden,
+        "penalty": float(min(penalty, 260.0)),
+        "strict_side_leak": strict_side_leak,
+        "lobe_extrema": int(lobe_extrema),
+        "lobe_penalty": float(lobe_penalty),
+        "max_cv_turn_deg": float(max_cv_turn),
+        "strict_wrong_curvature": float(strict_wrong),
+        "wrong_cv_turn_count": int(wrong_cv_turn_count),
+        "max_wrong_cv_turn": float(max_wrong_cv_turn),
+    }
+
+
+def _curvature_lobe_penalty_from_values(
+    signed_k: np.ndarray,
+    *,
+    scale: float,
+    return_extrema: bool = False,
+) -> float | tuple[float, int]:
+    values = np.asarray(signed_k, dtype=float)
+    values = values[np.isfinite(values)]
+    if len(values) < 12:
+        return (0.0, 0) if return_extrema else 0.0
+    kk = np.maximum(values, 0.0)
+    window = 9 if len(kk) >= 40 else 5
+    kernel = np.ones(window, dtype=float) / float(window)
+    smooth = np.convolve(kk, kernel, mode="same")
+    dk = np.diff(smooth)
+    eps = max(float(np.nanmax(np.abs(dk))) * 0.08, scale * 0.004, 1e-10)
+    signs = np.sign(np.where(np.abs(dk) < eps, 0.0, dk))
+    nonzero = signs[signs != 0]
+    extrema = int(np.sum(nonzero[1:] * nonzero[:-1] < 0.0)) if len(nonzero) > 1 else 0
+
+    peak = int(np.nanargmax(smooth))
+    before = np.diff(smooth[: peak + 1])
+    after = np.diff(smooth[peak:])
+    wrong_before = np.clip(-before, 0.0, None)
+    wrong_after = np.clip(after, 0.0, None)
+    monotone = (
+        float(np.mean((wrong_before / max(scale, 1e-9)) ** 2)) if len(wrong_before) else 0.0
+    ) + (
+        float(np.mean((wrong_after / max(scale, 1e-9)) ** 2)) if len(wrong_after) else 0.0
+    )
+    rough = np.diff(smooth, n=2)
+    roughness = float(np.mean(np.abs(rough)) / max(scale, 1e-9)) if len(rough) else 0.0
+    penalty = float(monotone * 34.0 + roughness * 4.5 + max(0, extrema - 1) * 0.45)
+    return (penalty, extrema) if return_extrema else penalty
+
+
+def _cv_turn_metrics(cvs: np.ndarray) -> tuple[float, float]:
+    pts = np.asarray(cvs[:, :2], dtype=float)
+    if len(pts) < 4:
+        return 0.0, 0.0
+    edge = np.diff(pts, axis=0)
+    length = np.linalg.norm(edge, axis=1)
+    if np.count_nonzero(length > 1e-6) < 3:
+        return 180.0, 180.0
+    unit = edge / np.maximum(length[:, None], 1e-9)
+    dots = np.sum(unit[:-1] * unit[1:], axis=1)
+    angles = np.degrees(np.arccos(np.clip(dots, -1.0, 1.0)))
+    max_turn = float(np.nanmax(angles)) if len(angles) else 0.0
+    bad = np.clip(angles - 24.0, 0.0, None)
+    mean_bad = float(np.mean(bad / 24.0)) if len(bad) else 0.0
+    return max_turn, mean_bad
+
+
+def _cv_turn_side_metrics(cvs: np.ndarray, desired_sign: int) -> tuple[int, float]:
+    if desired_sign == 0:
+        return 0, 0.0
+    pts = np.asarray(cvs[:, :2], dtype=float)
+    if len(pts) < 4:
+        return 0, 0.0
+    edge = np.diff(pts, axis=0)
+    length = np.linalg.norm(edge, axis=1)
+    if np.count_nonzero(length > 1e-6) < 3:
+        return 0, 0.0
+    cross = edge[:-1, 0] * edge[1:, 1] - edge[:-1, 1] * edge[1:, 0]
+    normalized = cross / np.maximum(length[:-1] * length[1:], 1e-9)
+    wrong = -(desired_sign * normalized)
+    active = wrong > 0.003
+    if not np.any(active):
+        return 0, 0.0
+    return int(np.sum(active)), float(np.nanmax(wrong[active]))
+
+
+def _repair_cv_turn_side(curve: NURBSCurve, desired_sign: int, target_points: np.ndarray) -> None:
+    if desired_sign == 0 or _target_has_macro_s_shape(target_points):
+        return
+    cvs = np.asarray(curve.cvs, dtype=float).copy()
+    if len(cvs) < 5:
+        return
+    length = max(_polyline_length(target_points), 1.0)
+    max_step = max(1.2, min(9.0, length * 0.035))
+    margin = 0.010
+    for _ in range(5):
+        changed = False
+        pts = cvs[:, :2]
+        edge = np.diff(pts, axis=0)
+        lens = np.linalg.norm(edge, axis=1)
+        for turn_index in range(len(edge) - 1):
+            a = edge[turn_index]
+            b = edge[turn_index + 1]
+            la = float(lens[turn_index])
+            lb = float(lens[turn_index + 1])
+            if la < 1e-6 or lb < 1e-6:
+                continue
+            signed = desired_sign * float(a[0] * b[1] - a[1] * b[0])
+            target_cross = margin * la * lb
+            if signed >= target_cross:
+                continue
+            if turn_index >= len(edge) - 2:
+                move_index = turn_index
+                if move_index <= 0 or move_index >= len(cvs) - 1:
+                    continue
+                normal = desired_sign * np.array([-b[1], b[0]], dtype=float) / max(lb, 1e-9)
+                delta = (target_cross - signed) / max(lb, 1e-9)
+            else:
+                move_index = turn_index + 2
+                if move_index <= 0 or move_index >= len(cvs) - 1:
+                    continue
+                normal = desired_sign * np.array([-a[1], a[0]], dtype=float) / max(la, 1e-9)
+                delta = (target_cross - signed) / max(la, 1e-9)
+            delta = float(np.clip(delta, 0.0, max_step))
+            cvs[move_index, :2] += normal * delta
+            changed = True
+        if not changed:
+            break
+    repaired = _clone_curve(curve)
+    repaired.cvs = cvs
+    if _bezier_mean_error(repaired, target_points) <= _bezier_mean_error(curve, target_points) + 1.8 and _bezier_max_error(
+        repaired, target_points
+    ) <= _bezier_max_error(curve, target_points) + 6.0:
+        curve.cvs = cvs
+        curve.metadata["cv_turn_side_repaired"] = True
+
+
+def _signed_curvature_samples_from_cvs(
+    cvs_xy: np.ndarray,
+    d1_basis: np.ndarray,
+    d2_basis: np.ndarray,
+    degree: int,
+) -> np.ndarray:
+    d1_cvs = degree * np.diff(cvs_xy, axis=0)
+    d2_cvs = degree * (degree - 1) * np.diff(cvs_xy, n=2, axis=0)
+    d1 = d1_basis @ d1_cvs
+    d2 = d2_basis @ d2_cvs
+    speed = np.linalg.norm(d1, axis=1)
+    cross = d1[:, 0] * d2[:, 1] - d1[:, 1] * d2[:, 0]
+    return np.divide(cross, np.maximum(speed, 1e-9) ** 3)
+
+
+def _dominant_curve_curvature_sign(curve: NURBSCurve, target_points: np.ndarray) -> int:
+    metrics = _curve_curvature_sign_metrics(curve, target_points, sample_count=120)
+    positive = int(metrics["positive"])
+    negative = int(metrics["negative"])
+    if positive >= max(6, negative * 1.25):
+        return 1
+    if negative >= max(6, positive * 1.25):
+        return -1
+    return 0
+
+
+def _dominant_target_polyline_curvature_sign(points: np.ndarray) -> int:
+    pts = remove_duplicate_points(np.asarray(points, dtype=float), eps=0.5)
+    if len(pts) < 8:
+        return 0
+    pts = smooth_polyline(resample_polyline(pts, 120), window=9)
+    v1 = pts[1:-1, :2] - pts[:-2, :2]
+    v2 = pts[2:, :2] - pts[1:-1, :2]
+    cross = v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0]
+    if len(cross) == 0:
+        return 0
+    eps = max(float(np.nanpercentile(np.abs(cross), 70)) * 0.08, 1e-6)
+    signs = np.sign(np.where(np.abs(cross) < eps, 0.0, cross))
+    positive = int(np.sum(signs > 0.0))
+    negative = int(np.sum(signs < 0.0))
+    if positive >= max(4, negative * 1.25):
+        return 1
+    if negative >= max(4, positive * 1.25):
+        return -1
+    return 0
+
+
+def _dominant_cv_target_side(curve: NURBSCurve, target_points: np.ndarray) -> int:
+    target = remove_duplicate_points(np.asarray(target_points, dtype=float), eps=0.5)
+    if len(target) < 4:
+        return 0
+    signs: list[int] = []
+    length = max(_polyline_length(target), 1.0)
+    eps = max(length * 0.004, 0.65)
+    for cv_index in range(1, len(curve.cvs) - 1):
+        ref, tangent = _target_point_tangent_at_fraction(target, cv_index / float(len(curve.cvs) - 1))
+        signed = float(tangent[0] * (curve.cvs[cv_index, 1] - ref[1]) - tangent[1] * (curve.cvs[cv_index, 0] - ref[0]))
+        if abs(signed) > eps:
+            signs.append(1 if signed > 0.0 else -1)
+    if not signs:
+        return _dominant_target_chord_side(target)
+    positive = sum(1 for value in signs if value > 0)
+    negative = sum(1 for value in signs if value < 0)
+    if positive > negative:
+        return 1
+    if negative > positive:
+        return -1
+    return 0
+
+
 def _cv_layout_penalty(cvs: np.ndarray) -> float:
     if len(cvs) < 4:
         return 0.0
@@ -1522,6 +2335,16 @@ def _cv_side_consistency_penalty(curve: NURBSCurve, target_points: np.ndarray) -
     return float(_cv_side_consistency_metrics(curve, target_points)["penalty"])
 
 
+def _has_forbidden_cv_side_switch(curve: NURBSCurve, target_points: np.ndarray) -> bool:
+    metrics = _cv_side_consistency_metrics(curve, target_points)
+    if _target_has_macro_s_shape(target_points):
+        return False
+    if int(metrics["side_switches"]) > int(metrics["allowed_switches"]):
+        return True
+    corridor = _cv_target_corridor_metrics(curve, target_points)
+    return int(corridor["target_side_switches"]) > 0 or int(corridor["wrong_side_count"]) > 0
+
+
 def _stamp_cv_side_diagnostics(curve: NURBSCurve, target_points: np.ndarray) -> None:
     metrics = _cv_side_consistency_metrics(curve, target_points)
     curve.metadata["cv_side_penalty"] = round(float(metrics["penalty"]), 4)
@@ -1557,8 +2380,10 @@ def _cv_target_corridor_metrics(curve: NURBSCurve, target_points: np.ndarray) ->
         }
 
     signature = _target_curvature_signature(target)
-    target_is_s_curve = bool(signature["s_like"])
-    dominant_side = _dominant_target_curvature_side(signature)
+    target_is_s_curve = _target_has_macro_s_shape(target)
+    dominant_side = _dominant_target_chord_side(target)
+    if dominant_side == 0:
+        dominant_side = _dominant_target_curvature_side(signature)
     chord = float(np.linalg.norm(target[-1, :2] - target[0, :2]))
     if chord > 1e-6:
         sag = float(np.nanmax(np.abs((target[-1, 0] - target[0, 0]) * (target[:, 1] - target[0, 1]) - (target[-1, 1] - target[0, 1]) * (target[:, 0] - target[0, 0])) / chord))
@@ -1629,6 +2454,32 @@ def _dominant_target_curvature_side(signature: dict[str, float | int | bool]) ->
         return 1
     if negative >= max(3, positive * 2):
         return -1
+    return 0
+
+
+def _dominant_target_chord_side(points: np.ndarray) -> int:
+    target = remove_duplicate_points(np.asarray(points, dtype=float), eps=0.5)
+    if len(target) < 4:
+        return 0
+    start = target[0, :2]
+    end = target[-1, :2]
+    chord = end - start
+    chord_len = float(np.linalg.norm(chord))
+    if chord_len < 1e-9:
+        return 0
+    signed_distance = (
+        chord[0] * (target[:, 1] - start[1]) - chord[1] * (target[:, 0] - start[0])
+    ) / chord_len
+    eps = max(chord_len * 0.004, 0.55)
+    positive = int(np.sum(signed_distance > eps))
+    negative = int(np.sum(signed_distance < -eps))
+    if positive >= max(4, negative * 2):
+        return 1
+    if negative >= max(4, positive * 2):
+        return -1
+    median = float(np.nanmedian(signed_distance))
+    if abs(median) > eps * 1.6:
+        return 1 if median > 0.0 else -1
     return 0
 
 
@@ -1739,7 +2590,7 @@ def _cv_side_consistency_metrics(curve: NURBSCurve, target_points: np.ndarray) -
 
     side_switches = int(sum(a * b < 0 for a, b in zip(nonzero[:-1], nonzero[1:])))
     target_signature = _target_curvature_signature(target)
-    target_is_s_curve = bool(target_signature["s_like"])
+    target_is_s_curve = _target_has_macro_s_shape(target)
     allowed_switches = 1 if target_is_s_curve else 0
     positive = int(sum(sign > 0 for sign in nonzero))
     negative = int(sum(sign < 0 for sign in nonzero))
@@ -1796,6 +2647,28 @@ def _target_curvature_signature(points: np.ndarray) -> dict[str, float | int | b
         "negative": negative,
         "s_like": s_like,
     }
+
+
+def _target_has_macro_s_shape(points: np.ndarray) -> bool:
+    pts = remove_duplicate_points(np.asarray(points, dtype=float), eps=0.5)
+    if len(pts) < 8:
+        return False
+    length = _polyline_length(pts)
+    chord = pts[-1, :2] - pts[0, :2]
+    chord_len = float(np.linalg.norm(chord))
+    if length < 1e-6 or chord_len < 1e-6:
+        return False
+    if len(pts) > 96:
+        pts = smooth_polyline(resample_polyline(pts, 96), window=9)
+    signed = ((pts[-1, 0] - pts[0, 0]) * (pts[:, 1] - pts[0, 1]) - (pts[-1, 1] - pts[0, 1]) * (pts[:, 0] - pts[0, 0])) / chord_len
+    tol = max(length * 0.012, 1.25)
+    pos = signed[signed > tol]
+    neg = signed[signed < -tol]
+    if len(pos) < max(3, len(signed) * 0.08) or len(neg) < max(3, len(signed) * 0.08):
+        return False
+    pos_amp = float(np.nanpercentile(pos, 80)) if len(pos) else 0.0
+    neg_amp = float(abs(np.nanpercentile(neg, 20))) if len(neg) else 0.0
+    return bool(min(pos_amp, neg_amp) > max(length * 0.025, 3.0))
 
 
 def _endpoint_cv_dent_penalty(curve: NURBSCurve, *, side: str) -> float:
@@ -1864,7 +2737,7 @@ def _join_curvature_flow_penalty(
             return 0.0
 
         target = _combine_join_points(np.asarray(left_points, dtype=float), np.asarray(right_points, dtype=float))
-        target_is_s = bool(_target_curvature_signature(target).get("s_like", False))
+        target_is_s = _target_has_macro_s_shape(target)
         peak = float(np.nanpercentile(np.abs(k), 92))
         if peak < 1e-8:
             return 0.0
@@ -2033,6 +2906,8 @@ def _fair_single_g2_join(
                     curvature_scale=curvature_scale,
                 ):
                     continue
+                if _pair_precision_regression_too_high(base_left, base_right, trial_left, trial_right, left_points, right_points):
+                    continue
                 score = _pair_fairness_score(trial_left, trial_right, left_points, right_points)
                 if score < best_score:
                     best_score = score
@@ -2043,6 +2918,33 @@ def _fair_single_g2_join(
         return
     left.cvs = best_left.cvs
     right.cvs = best_right.cvs
+
+
+def _pair_precision_regression_too_high(
+    base_left: NURBSCurve,
+    base_right: NURBSCurve,
+    trial_left: NURBSCurve,
+    trial_right: NURBSCurve,
+    left_points: np.ndarray,
+    right_points: np.ndarray,
+) -> bool:
+    base_mean = _bezier_mean_error(base_left, left_points) + _bezier_mean_error(base_right, right_points)
+    trial_mean = _bezier_mean_error(trial_left, left_points) + _bezier_mean_error(trial_right, right_points)
+    base_max = max(_bezier_max_error(base_left, left_points), _bezier_max_error(base_right, right_points))
+    trial_max = max(_bezier_max_error(trial_left, left_points), _bezier_max_error(trial_right, right_points))
+    mean_budget = _mean_fit_budget(left_points) + _mean_fit_budget(right_points)
+    max_budget = max(_max_fit_budget(left_points), _max_fit_budget(right_points))
+    if trial_mean > min(mean_budget, base_mean + max(0.9, base_mean * 0.18)):
+        return True
+    if trial_max > min(max_budget, base_max + max(1.8, base_max * 0.18)):
+        return True
+    base_side = _cv_side_consistency_penalty(base_left, left_points) + _cv_side_consistency_penalty(base_right, right_points)
+    trial_side = _cv_side_consistency_penalty(trial_left, left_points) + _cv_side_consistency_penalty(trial_right, right_points)
+    base_corridor = _cv_target_corridor_penalty(base_left, left_points) + _cv_target_corridor_penalty(base_right, right_points)
+    trial_corridor = _cv_target_corridor_penalty(trial_left, left_points) + _cv_target_corridor_penalty(trial_right, right_points)
+    if trial_side > base_side + 12.0 or trial_corridor > base_corridor + 12.0:
+        return True
+    return False
 
 
 def _apply_g2_join_variant(
@@ -2121,6 +3023,10 @@ def _apply_g2_join_variant(
     if _endpoint_cv_dent_penalty(left, side="end") > 260.0:
         return False
     if _endpoint_cv_dent_penalty(right, side="start") > 260.0:
+        return False
+    if _has_forbidden_cv_side_switch(left, left_points) or _has_forbidden_cv_side_switch(right, right_points):
+        return False
+    if _curve_exceeds_precision_budget(left, left_points) or _curve_exceeds_precision_budget(right, right_points):
         return False
     return True
 
@@ -2928,6 +3834,61 @@ def _line_points(a: tuple[float, float], b: tuple[float, float], count: int = 8)
         ]
     )
     return arr
+
+
+def _curve_alias_overrides(curve: dict[str, Any], *, expected_count: int) -> list[dict[str, Any]]:
+    """Return user-edited single-span CV overrides when they match the split chain.
+
+    The web editor stores dynamic G2 CVs separately from the routed skeleton points.
+    Export must use those CVs verbatim; otherwise Alias shows a different curve than
+    the user approved in the browser.
+    """
+    if not ENABLE_G2_EDITOR_OVERRIDES:
+        return []
+    if expected_count <= 0:
+        return []
+    raw = curve.get("alias_curve_overrides") or curve.get("alias_overrides") or []
+    if not isinstance(raw, list) or not raw:
+        return []
+
+    slots: list[dict[str, Any] | None] = [None] * expected_count
+    loose: list[dict[str, Any]] = []
+    for fallback_index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            continue
+        cvs = _as_points3(item.get("cvs") or item.get("cv") or [])
+        if len(cvs) < 4:
+            continue
+        try:
+            degree = int(item.get("degree") or (len(cvs) - 1))
+        except Exception:
+            degree = len(cvs) - 1
+        if len(cvs) != degree + 1:
+            degree = len(cvs) - 1
+        if degree < 3 or degree > 7 or len(cvs) != degree + 1:
+            continue
+        clean = {
+            **item,
+            "degree": degree,
+            "cvs": cvs.tolist(),
+            "span": 1,
+        }
+        try:
+            segment_index = int(item.get("segment_index", fallback_index))
+        except Exception:
+            segment_index = fallback_index
+        if 0 <= segment_index < expected_count and slots[segment_index] is None:
+            slots[segment_index] = clean
+        else:
+            loose.append(clean)
+
+    loose_iter = iter(loose)
+    for index, value in enumerate(slots):
+        if value is None:
+            slots[index] = next(loose_iter, None)
+    if any(value is None for value in slots):
+        return []
+    return [value for value in slots if value is not None]
 
 
 def _curve_label(curve: dict[str, Any], path: Path, index: int, segment_index: int, segment_count: int) -> str:

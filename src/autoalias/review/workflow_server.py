@@ -1031,6 +1031,7 @@ a { color:#075fd7; }
         <button class="primary" id="btnFullSkeleton">隐藏完整骨架</button>
         <button class="primary" id="btnSkeleton">隐藏切段骨架</button>
         <button class="primary" id="btnCvPreview">隐藏CV预览</button>
+        <button id="btnG2Edit">G2 Edit OFF</button>
         <button id="btnReset">重置视图</button>
       </div>
 
@@ -1069,6 +1070,7 @@ let routePreview = null;
 let routeRequestId = 0;
 let routeStatus = "";
 let fitPreview = null;
+let editableFitPreview = null;
 let fitPreviewRequestId = 0;
 let branchChoices = [];
 let closedCurve = false;
@@ -1077,6 +1079,12 @@ let showSkeleton = true;
 let showFullSkeleton = true;
 let showAliasPreview = true;
 let showCvPreview = true;
+let g2EditMode = false;
+const G2_CONSTRAINTS_ENABLED = false;
+let selectedCv = null;
+let cvDragging = null;
+let cvDragMoved = false;
+let aliasOverrideDirty = false;
 let transform = { scale: 1, x: 0, y: 0 };
 let dragging = false;
 let lastMouse = null;
@@ -1145,6 +1153,68 @@ function resetView() {
 
 function worldToScreen(p) { return [p[0] * transform.scale + transform.x, p[1] * transform.scale + transform.y]; }
 function screenToWorld(x, y) { return [(x - transform.x) / transform.scale, (y - transform.y) / transform.scale]; }
+
+function v2(p) { return [Number(p[0] || 0), Number(p[1] || 0), Number(p[2] || 0)]; }
+function vAdd(a, b) { return [a[0] + b[0], a[1] + b[1], (a[2] || 0) + (b[2] || 0)]; }
+function vSub(a, b) { return [a[0] - b[0], a[1] - b[1], (a[2] || 0) - (b[2] || 0)]; }
+function vScale(a, s) { return [a[0] * s, a[1] * s, (a[2] || 0) * s]; }
+function clonePoint(p) { return [round3(Number(p[0] || 0)), round3(Number(p[1] || 0)), round3(Number(p[2] || 0))]; }
+
+function cloneFitPreview(src) {
+  if (!src || !src.segments) return null;
+  return JSON.parse(JSON.stringify(src));
+}
+
+function activeFitPreview() {
+  return editableFitPreview || fitPreview;
+}
+
+function clearEditableFitPreview() {
+  editableFitPreview = null;
+  selectedCv = null;
+  cvDragging = null;
+  cvDragMoved = false;
+}
+
+function ensureEditableFitPreview() {
+  if (!editableFitPreview) {
+    if (!fitPreview || !fitPreview.segments) return false;
+    editableFitPreview = cloneFitPreview(fitPreview);
+    refreshEditableSamples();
+  }
+  return true;
+}
+
+function sampleBezier(cvs, steps=120) {
+  if (!cvs || cvs.length < 2) return [];
+  const degree = cvs.length - 1;
+  const samples = [];
+  for (let s = 0; s < steps; s++) {
+    const u = steps <= 1 ? 0 : s / (steps - 1);
+    const work = cvs.map(v2);
+    for (let r = 1; r <= degree; r++) {
+      for (let i = 0; i <= degree - r; i++) {
+        work[i] = [
+          work[i][0] * (1 - u) + work[i + 1][0] * u,
+          work[i][1] * (1 - u) + work[i + 1][1] * u,
+          work[i][2] * (1 - u) + work[i + 1][2] * u
+        ];
+      }
+    }
+    samples.push([round3(work[0][0]), round3(work[0][1])]);
+  }
+  return samples;
+}
+
+function refreshEditableSamples() {
+  if (!editableFitPreview || !editableFitPreview.segments) return;
+  for (const seg of editableFitPreview.segments) {
+    if (!seg || !seg.cvs || seg.cvs.length < 2) continue;
+    seg.samples = sampleBezier(seg.cvs, 120);
+    seg.span = 1;
+    seg.ok = true;
+  }
+}
 
 function render() {
   const rect = canvas.getBoundingClientRect();
@@ -1231,15 +1301,19 @@ function drawBranchAlternatives() {
 }
 
 function drawFitPreview() {
-  if (!fitPreview || !fitPreview.segments) return;
-  for (const seg of fitPreview.segments) {
-    if (!seg.ok || !seg.samples) continue;
-    drawPolyline(seg.samples, seg.color || "#14a05a", 4.0, 0.95);
-    if (showCvPreview) drawCvPreview(seg);
+  const preview = activeFitPreview();
+  if (!preview || !preview.segments) return;
+  for (let segIndex = 0; segIndex < preview.segments.length; segIndex++) {
+    const seg = preview.segments[segIndex];
+    if (!seg || !seg.ok) continue;
+    const samples = editableFitPreview && seg.cvs ? sampleBezier(seg.cvs, 120) : seg.samples;
+    if (!samples || !samples.length) continue;
+    drawPolyline(samples, seg.color || "#14a05a", 4.0, 0.95);
+    if (showCvPreview) drawCvPreview(seg, segIndex);
   }
 }
 
-function drawCvPreview(seg) {
+function drawCvPreview(seg, segIndex) {
   const cvs = seg.cvs || [];
   if (!cvs || cvs.length < 2) return;
   ctx.save();
@@ -1258,11 +1332,12 @@ function drawCvPreview(seg) {
   const fontSize = Math.max(10.5 / transform.scale, 5.8);
   for (let i = 0; i < cvs.length; i++) {
     const p = cvs[i];
+    const isSelected = selectedCv && selectedCv.segIndex === segIndex && selectedCv.cvIndex === i;
     ctx.beginPath();
-    ctx.fillStyle = i === 0 || i === cvs.length - 1 ? "#ffcf33" : "#fff35c";
-    ctx.strokeStyle = "#6b4a00";
-    ctx.lineWidth = Math.max(1.45 / transform.scale, 0.7);
-    ctx.arc(p[0], p[1], radius, 0, Math.PI * 2);
+    ctx.fillStyle = isSelected ? "#2b84ff" : (i === 0 || i === cvs.length - 1 ? "#ffcf33" : "#fff35c");
+    ctx.strokeStyle = isSelected ? "#ffffff" : "#6b4a00";
+    ctx.lineWidth = Math.max((isSelected ? 2.6 : 1.45) / transform.scale, 0.7);
+    ctx.arc(p[0], p[1], isSelected ? radius * 1.25 : radius, 0, Math.PI * 2);
     ctx.fill();
     ctx.stroke();
     ctx.fillStyle = "#332400";
@@ -1310,6 +1385,93 @@ function pickCutPoint(wx, wy) {
   return best ? best.index : null;
 }
 
+function pickCv(wx, wy) {
+  const preview = activeFitPreview();
+  if (!preview || !preview.segments) return null;
+  const threshold = Math.max(13 / transform.scale, 4.5);
+  let best = null;
+  for (let segIndex = 0; segIndex < preview.segments.length; segIndex++) {
+    const cvs = preview.segments[segIndex].cvs || [];
+    for (let cvIndex = 0; cvIndex < cvs.length; cvIndex++) {
+      const p = cvs[cvIndex];
+      const d = Math.hypot(wx - p[0], wy - p[1]);
+      if (d <= threshold && (!best || d < best.d)) best = { segIndex, cvIndex, d };
+    }
+  }
+  return best;
+}
+
+function nextSegmentIndex(segIndex) {
+  const preview = activeFitPreview();
+  if (!preview || !preview.segments || !preview.segments.length) return null;
+  if (segIndex + 1 < preview.segments.length) return segIndex + 1;
+  return closedCurve && preview.segments.length > 1 ? 0 : null;
+}
+
+function prevSegmentIndex(segIndex) {
+  const preview = activeFitPreview();
+  if (!preview || !preview.segments || !preview.segments.length) return null;
+  if (segIndex > 0) return segIndex - 1;
+  return closedCurve && preview.segments.length > 1 ? preview.segments.length - 1 : null;
+}
+
+function enforceJoinFromLeft(leftIndex) {
+  if (!editableFitPreview || !editableFitPreview.segments) return;
+  const rightIndex = nextSegmentIndex(leftIndex);
+  if (rightIndex == null) return;
+  const left = editableFitPreview.segments[leftIndex];
+  const right = editableFitPreview.segments[rightIndex];
+  const lc = left && left.cvs ? left.cvs : [];
+  const rc = right && right.cvs ? right.cvs : [];
+  if (lc.length < 4 || rc.length < 4) return;
+  const pL = Math.max(1, Number(left.degree || lc.length - 1));
+  const pR = Math.max(1, Number(right.degree || rc.length - 1));
+  const n = lc.length - 1;
+  const end = v2(lc[n]);
+  const d1 = vScale(vSub(v2(lc[n]), v2(lc[n - 1])), pL);
+  const d2 = vScale(vAdd(vSub(v2(lc[n]), vScale(v2(lc[n - 1]), 2)), v2(lc[n - 2])), pL * (pL - 1));
+  rc[0] = clonePoint(end);
+  rc[1] = clonePoint(vAdd(end, vScale(d1, 1 / pR)));
+  rc[2] = clonePoint(vAdd(vSub(vScale(v2(rc[1]), 2), v2(rc[0])), vScale(d2, 1 / (pR * (pR - 1)))));
+}
+
+function enforceJoinFromRight(rightIndex) {
+  if (!editableFitPreview || !editableFitPreview.segments) return;
+  const leftIndex = prevSegmentIndex(rightIndex);
+  if (leftIndex == null) return;
+  const left = editableFitPreview.segments[leftIndex];
+  const right = editableFitPreview.segments[rightIndex];
+  const lc = left && left.cvs ? left.cvs : [];
+  const rc = right && right.cvs ? right.cvs : [];
+  if (lc.length < 4 || rc.length < 4) return;
+  const pL = Math.max(1, Number(left.degree || lc.length - 1));
+  const pR = Math.max(1, Number(right.degree || rc.length - 1));
+  const n = lc.length - 1;
+  const start = v2(rc[0]);
+  const d1 = vScale(vSub(v2(rc[1]), v2(rc[0])), pR);
+  const d2 = vScale(vAdd(vSub(v2(rc[2]), vScale(v2(rc[1]), 2)), v2(rc[0])), pR * (pR - 1));
+  lc[n] = clonePoint(start);
+  lc[n - 1] = clonePoint(vSub(start, vScale(d1, 1 / pL)));
+  lc[n - 2] = clonePoint(vAdd(vSub(vScale(v2(lc[n - 1]), 2), v2(lc[n])), vScale(d2, 1 / (pL * (pL - 1)))));
+}
+
+function applyG2ConstraintFromCv(segIndex, cvIndex) {
+  const preview = editableFitPreview;
+  if (!preview || !preview.segments || !preview.segments[segIndex]) return;
+  const cvs = preview.segments[segIndex].cvs || [];
+  const n = cvs.length - 1;
+  if (n < 3) return;
+  let startZone = cvIndex <= 2;
+  let endZone = n - cvIndex <= 2;
+  if (startZone && endZone) {
+    startZone = cvIndex <= n / 2;
+    endZone = !startZone;
+  }
+  if (startZone) enforceJoinFromRight(segIndex);
+  if (endZone) enforceJoinFromLeft(segIndex);
+  refreshEditableSamples();
+}
+
 async function addCutPoint(wx, wy) {
   let snapped;
   try {
@@ -1320,6 +1482,7 @@ async function addCutPoint(wx, wy) {
   }
   cutPoints.push({ x: round3(snapped.x), y: round3(snapped.y), order: cutPoints.length, snap_distance: snapped.distance });
   selectedCutIndex = cutPoints.length - 1;
+  aliasOverrideDirty = true;
   refreshRoutePreview();
   updatePanel();
   render();
@@ -1346,6 +1509,103 @@ function cleanRouteSegment(segment) {
     selected_candidate: segment.selected_candidate || 0,
     length: segment.length || 0
   };
+}
+
+function buildAliasOverrides() {
+  if (!G2_CONSTRAINTS_ENABLED) return [];
+  if (!g2EditMode || !editableFitPreview || !editableFitPreview.segments) return [];
+  refreshEditableSamples();
+  const out = [];
+  for (let i = 0; i < editableFitPreview.segments.length; i++) {
+    const seg = editableFitPreview.segments[i];
+    const cvs = seg && seg.cvs ? seg.cvs : [];
+    if (cvs.length < 4) continue;
+    const degree = Number(seg.degree || cvs.length - 1);
+    if (degree < 3 || degree > 7 || cvs.length !== degree + 1) continue;
+    out.push({
+      segment_index: i,
+      degree,
+      span: 1,
+      cvs: cvs.map(p => [round3(Number(p[0] || 0)), round3(Number(p[1] || 0)), round3(Number(p[2] || 0))]),
+      source: "dynamic_g2_cv_editor"
+    });
+  }
+  return out;
+}
+
+function overridesToFitPreview(curve) {
+  const overrides = curve && curve.alias_curve_overrides ? curve.alias_curve_overrides : [];
+  if (!overrides.length) return null;
+  const segments = [];
+  for (let i = 0; i < overrides.length; i++) {
+    const ov = overrides[i] || {};
+    const cvs = (ov.cvs || ov.cv || []).map(clonePoint);
+    const degree = Number(ov.degree || cvs.length - 1);
+    if (degree < 3 || degree > 7 || cvs.length !== degree + 1) continue;
+    segments.push({
+      ok: true,
+      segment_index: i,
+      degree,
+      span: 1,
+      samples: sampleBezier(cvs, 120),
+      cvs,
+      passed: true,
+      color: "#14a05a",
+      warnings: ["Saved G2 constrained CV override"],
+      metrics: {}
+    });
+  }
+  if (!segments.length) return null;
+  return {
+    ok: true,
+    segments,
+    segment_count: segments.length,
+    passed_count: segments.length,
+    continuity: "dynamic-g2-cv-editor"
+  };
+}
+
+function restoreAliasOverrides(curve) {
+  if (!G2_CONSTRAINTS_ENABLED) return false;
+  const preview = overridesToFitPreview(curve);
+  if (!preview) return false;
+  fitPreview = preview;
+  editableFitPreview = cloneFitPreview(preview);
+  g2EditMode = true;
+  selectedCv = null;
+  aliasOverrideDirty = false;
+  return true;
+}
+
+async function toggleG2Edit() {
+  if (!G2_CONSTRAINTS_ENABLED) {
+    g2EditMode = false;
+    clearEditableFitPreview();
+    setStatus("G2 constraint is disabled. 当前只调试基础拟合。");
+    updatePanel();
+    render();
+    return;
+  }
+  if (g2EditMode) {
+    g2EditMode = false;
+    clearEditableFitPreview();
+    setStatus("G2 Edit OFF");
+    updatePanel();
+    render();
+    return;
+  }
+  if (!fitPreview && routePreview && routePreview.segments && routePreview.segments.length) {
+    await refreshFitPreview();
+  }
+  if (!ensureEditableFitPreview()) {
+    setStatus("请先生成蓝色分段线，再打开 G2 Edit");
+    return;
+  }
+  g2EditMode = true;
+  showCvPreview = true;
+  setStatus("G2 Edit ON：拖动连接端附近的 CV，会联动相邻曲线的 G0/G1/G2 CV");
+  updatePanel();
+  render();
 }
 
 async function snapPoint(wx, wy) {
@@ -1375,7 +1635,10 @@ async function moveDraggedPoint(index, wx, wy) {
   cutPoints[index].snap_distance = snapped.distance;
   selectedCutIndex = index;
   pointDragMoved = true;
+  aliasOverrideDirty = true;
   routePreview = null;
+  fitPreview = null;
+  clearEditableFitPreview();
   routeStatus = "正在拖动分线点，松开后重新生成蓝线";
   updatePanel();
   render();
@@ -1383,6 +1646,7 @@ async function moveDraggedPoint(index, wx, wy) {
 
 async function refreshRoutePreview() {
   const requestId = ++routeRequestId;
+  clearEditableFitPreview();
   if (cutPoints.length < 2) {
     routePreview = null;
     fitPreview = null;
@@ -1416,6 +1680,7 @@ async function refreshRoutePreview() {
     if (requestId !== routeRequestId) return;
     routePreview = null;
     fitPreview = null;
+    clearEditableFitPreview();
     routeStatus = "路径生成失败";
   }
   updatePanel();
@@ -1426,6 +1691,7 @@ async function refreshFitPreview() {
   const requestId = ++fitPreviewRequestId;
   if (!routePreview || !routePreview.segments || routePreview.segments.length < 1) {
     fitPreview = null;
+    clearEditableFitPreview();
     return;
   }
   try {
@@ -1436,15 +1702,22 @@ async function refreshFitPreview() {
         route_segments: routePreview.segments.map(cleanRouteSegment),
         closed: closedCurve,
         degree: document.getElementById("degree").value,
-        quality: "fast"
+        quality: "export"
       })
     });
     const result = await res.json();
     if (requestId !== fitPreviewRequestId) return;
     fitPreview = result.ok ? result : null;
+    if (g2EditMode && fitPreview) {
+      editableFitPreview = cloneFitPreview(fitPreview);
+      refreshEditableSamples();
+    } else if (!g2EditMode) {
+      clearEditableFitPreview();
+    }
   } catch (_err) {
     if (requestId !== fitPreviewRequestId) return;
     fitPreview = null;
+    clearEditableFitPreview();
   }
 }
 
@@ -1551,6 +1824,9 @@ function setAiProgress(percent, message, startedAt) {
 async function saveCurrent(startNext=false) {
   if (cutPoints.length < 2) return;
   if (!routePreview || !routePreview.points || routePreview.points.length < 2) await refreshRoutePreview();
+  const previous = designCurves.find(c => c.id === activeCurve) || null;
+  const aliasOverrides = buildAliasOverrides();
+  const preservedAliasOverrides = previous && !aliasOverrideDirty ? (previous.alias_curve_overrides || []) : [];
   const item = {
     id: activeCurve || makeId(),
     type: "manual_design_curve",
@@ -1563,6 +1839,8 @@ async function saveCurrent(startNext=false) {
     route_segments: routePreview && routePreview.segments ? routePreview.segments.map(cleanRouteSegment) : [],
     branch_choices: branchChoices.slice(),
     route_ok: routePreview ? !!routePreview.ok : false,
+    alias_curve_overrides: G2_CONSTRAINTS_ENABLED ? (aliasOverrides.length ? aliasOverrides : preservedAliasOverrides) : [],
+    alias_constraint_mode: G2_CONSTRAINTS_ENABLED ? (aliasOverrides.length ? "dynamic_g2_cv_editor" : (preservedAliasOverrides.length ? ((previous && previous.alias_constraint_mode) || "dynamic_g2_cv_editor") : "")) : "",
     created_at: new Date().toISOString()
   };
   const idx = designCurves.findIndex(c => c.id === item.id);
@@ -1570,6 +1848,7 @@ async function saveCurrent(startNext=false) {
   else designCurves.push(item);
   activeCurve = item.id;
   await saveAll();
+  aliasOverrideDirty = false;
   if (startNext) clearCurrent();
   updatePanel();
   render();
@@ -1616,10 +1895,13 @@ function clearCurrent() {
   selectedCutIndex = null;
   routePreview = null;
   fitPreview = null;
+  clearEditableFitPreview();
+  g2EditMode = false;
   routeStatus = "";
   branchChoices = [];
   closedCurve = false;
   activeCurve = null;
+  aliasOverrideDirty = false;
   updatePanel();
   render();
 }
@@ -1627,6 +1909,7 @@ function clearCurrent() {
 function undoPoint() {
   if (!cutPoints.length) return;
   cutPoints.pop();
+  aliasOverrideDirty = true;
   selectedCutIndex = cutPoints.length ? cutPoints.length - 1 : null;
   if (cutPoints.length < 3) closedCurve = false;
   normalizeBranchChoices();
@@ -1636,6 +1919,7 @@ function undoPoint() {
 function deleteSelected() {
   if (selectedCutIndex == null) return;
   cutPoints.splice(selectedCutIndex, 1);
+  aliasOverrideDirty = true;
   selectedCutIndex = cutPoints.length ? Math.min(selectedCutIndex, cutPoints.length - 1) : null;
   if (cutPoints.length < 3) closedCurve = false;
   normalizeBranchChoices();
@@ -1645,6 +1929,7 @@ function deleteSelected() {
 function toggleClosed() {
   if (cutPoints.length < 3) return;
   closedCurve = !closedCurve;
+  aliasOverrideDirty = true;
   normalizeBranchChoices();
   refreshRoutePreview();
 }
@@ -1676,13 +1961,20 @@ function renderCurveList() {
       closedCurve = !!curve.closed;
       branchChoices = (curve.branch_choices || []).slice();
       normalizeBranchChoices();
+      aliasOverrideDirty = false;
       routePreview = { ok: !!curve.route_ok, points: curve.routed_points || [], segments: curve.route_segments || [] };
       routeStatus = routePreview.points.length ? `已加载蓝线：${routePreview.points.length} 个骨架点` : "";
       document.getElementById("semantic").value = curve.semantic || "detail_line";
       selectedCutIndex = null;
+      const restoredCv = restoreAliasOverrides(curve);
+      if (!restoredCv) clearEditableFitPreview();
       updatePanel();
       render();
-      refreshRoutePreview();
+      if (!routePreview.points.length) {
+        refreshRoutePreview();
+      } else if (!restoredCv) {
+        refreshFitPreview().then(() => { updatePanel(); render(); });
+      }
     };
     list.appendChild(item);
   }
@@ -1716,6 +2008,9 @@ function updatePanel() {
   document.getElementById("btnAliasPreview").textContent = showAliasPreview ? "隐藏拟合预览" : "显示拟合预览";
   document.getElementById("btnCvPreview").classList.toggle("primary", showCvPreview);
   document.getElementById("btnCvPreview").textContent = showCvPreview ? "隐藏CV预览" : "显示CV预览";
+  document.getElementById("btnG2Edit").classList.toggle("primary", G2_CONSTRAINTS_ENABLED && g2EditMode);
+  document.getElementById("btnG2Edit").disabled = !G2_CONSTRAINTS_ENABLED;
+  document.getElementById("btnG2Edit").textContent = G2_CONSTRAINTS_ENABLED ? (g2EditMode ? "G2 Edit ON" : "G2 Edit OFF") : "G2 Disabled";
   document.getElementById("btnSave").disabled = cutPoints.length < 2;
   document.getElementById("btnSaveNext").disabled = cutPoints.length < 2;
   document.getElementById("btnUndo").disabled = cutPoints.length < 1;
@@ -1750,6 +2045,7 @@ function renderBranchControls() {
       const seg = parseInt(btn.getAttribute("data-seg") || "0", 10);
       const alt = parseInt(btn.getAttribute("data-alt") || "0", 10);
       branchChoices[seg] = alt;
+      aliasOverrideDirty = true;
       refreshRoutePreview();
     };
   }
@@ -1757,17 +2053,19 @@ function renderBranchControls() {
 
 function renderQualityPreview() {
   const box = document.getElementById("qualityBox");
-  if (!fitPreview || !fitPreview.segments || fitPreview.segments.length === 0) {
+  const preview = activeFitPreview();
+  if (!preview || !preview.segments || preview.segments.length === 0) {
     box.innerHTML = "暂无拟合质量";
     return;
   }
-  const rows = fitPreview.segments.map((seg, i) => {
+  const rows = preview.segments.map((seg, i) => {
     const color = seg.color || "#888";
     const status = seg.passed ? "通过" : "警告";
     const degree = seg.degree ? `d${seg.degree}` : "未拟合";
     const warn = seg.warnings && seg.warnings.length ? seg.warnings.slice(0, 2).join("；") : "曲率/CV 检查正常";
     return `<div style="border-left:6px solid ${color};padding:4px 0 5px 8px;margin:4px 0"><strong>第 ${i + 1} 段 ${status} ${degree}</strong><br><small>${warn}</small></div>`;
   });
+  if (g2EditMode) rows.unshift(`<div style="border-left:6px solid #2b84ff;padding:4px 0 5px 8px;margin:4px 0"><strong>G2 Edit ON</strong><br><small>导出会优先使用当前受约束 CV，不再重新拟合覆盖。</small></div>`);
   box.innerHTML = rows.join("");
 }
 
@@ -1777,6 +2075,18 @@ canvas.addEventListener("mousedown", e => {
   if (graph && e.button === 0 && !e.altKey) {
     const rect = canvas.getBoundingClientRect();
     const [wx, wy] = screenToWorld(e.clientX - rect.left, e.clientY - rect.top);
+    if (g2EditMode && ensureEditableFitPreview()) {
+      const cvHit = pickCv(wx, wy);
+      if (cvHit) {
+        cvDragging = cvHit;
+        selectedCv = cvHit;
+        cvDragMoved = false;
+        updatePanel();
+        render();
+        e.preventDefault();
+        return;
+      }
+    }
     const hit = pickCutPoint(wx, wy);
     if (hit != null) {
       pointDraggingIndex = hit;
@@ -1795,6 +2105,22 @@ canvas.addEventListener("mousedown", e => {
   }
 });
 canvas.addEventListener("mousemove", e => {
+  if (cvDragging != null && editableFitPreview && editableFitPreview.segments) {
+    const rect = canvas.getBoundingClientRect();
+    const [wx, wy] = screenToWorld(e.clientX - rect.left, e.clientY - rect.top);
+    const seg = editableFitPreview.segments[cvDragging.segIndex];
+    const cvs = seg && seg.cvs ? seg.cvs : null;
+    if (cvs && cvs[cvDragging.cvIndex]) {
+      cvs[cvDragging.cvIndex] = [round3(wx), round3(wy), Number(cvs[cvDragging.cvIndex][2] || 0)];
+      selectedCv = { segIndex: cvDragging.segIndex, cvIndex: cvDragging.cvIndex };
+      cvDragMoved = true;
+      suppressNextClick = true;
+      applyG2ConstraintFromCv(cvDragging.segIndex, cvDragging.cvIndex);
+      render();
+    }
+    e.preventDefault();
+    return;
+  }
   if (pointDraggingIndex != null) {
     const rect = canvas.getBoundingClientRect();
     const [wx, wy] = screenToWorld(e.clientX - rect.left, e.clientY - rect.top);
@@ -1810,6 +2136,15 @@ canvas.addEventListener("mousemove", e => {
   render();
 });
 window.addEventListener("mouseup", () => {
+  if (cvDragging != null) {
+    if (cvDragMoved) {
+      suppressNextClick = true;
+      setStatus("G2 constrained CV updated. 点击保存当前后会写入 JSON/IGES。");
+      updatePanel();
+    }
+    cvDragging = null;
+    cvDragMoved = false;
+  }
   if (pointDraggingIndex != null) {
     const needsRoute = pointDragMoved;
     pointDraggingIndex = null;
@@ -1830,6 +2165,15 @@ canvas.addEventListener("click", e => {
   if (!graph || e.altKey) return;
   const rect = canvas.getBoundingClientRect();
   const [wx, wy] = screenToWorld(e.clientX - rect.left, e.clientY - rect.top);
+  if (g2EditMode && ensureEditableFitPreview()) {
+    const cvHit = pickCv(wx, wy);
+    if (cvHit) {
+      selectedCv = cvHit;
+      updatePanel();
+      render();
+      return;
+    }
+  }
   const hit = pickCutPoint(wx, wy);
   if (hit != null) {
     selectedCutIndex = hit;
@@ -1866,6 +2210,7 @@ document.getElementById("btnSkeleton").onclick = () => { showSkeleton = !showSke
 document.getElementById("btnFullSkeleton").onclick = () => { showFullSkeleton = !showFullSkeleton; updatePanel(); render(); };
 document.getElementById("btnAliasPreview").onclick = () => { showAliasPreview = !showAliasPreview; updatePanel(); render(); };
 document.getElementById("btnCvPreview").onclick = () => { showCvPreview = !showCvPreview; updatePanel(); render(); };
+document.getElementById("btnG2Edit").onclick = toggleG2Edit;
 document.getElementById("degree").onchange = () => { refreshFitPreview().then(() => { updatePanel(); render(); }); };
 document.getElementById("btnAiSuggest").onclick = runAiSuggest;
 document.getElementById("btnReset").onclick = resetView;
