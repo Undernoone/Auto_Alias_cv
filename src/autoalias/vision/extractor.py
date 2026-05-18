@@ -36,7 +36,7 @@ class OpenCVCurveExtractor:
         if image is None:
             raise FileNotFoundError(f"cannot read image: {path}")
 
-        if _is_line_art(image):
+        if _is_line_art(image) or _is_white_on_black_sketch(image):
             candidates = self._line_art_candidates(image)
             if candidates:
                 return sorted(
@@ -62,20 +62,19 @@ class OpenCVCurveExtractor:
         return candidates[: self.options.max_curves]
 
     def _line_art_candidates(self, image: np.ndarray) -> list[CurveCandidate]:
-        cv2 = _require_cv2()
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (3, 3), 0)
-        _, ink = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        # Keep anti-aliased black strokes connected, remove isolated specks.
-        small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
-        ink = cv2.morphologyEx(ink, cv2.MORPH_OPEN, small, iterations=1)
-        ink = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, small, iterations=1)
-
+        gray, ink, mode = _line_art_ink(image)
         skeleton = _skeletonize_zhang_suen(ink > 0)
+        if mode == "white_on_black_sketch":
+            skeleton = _prune_skeleton_artifacts(
+                skeleton,
+                max_spur_length=18.0,
+                min_component_pixels=4,
+                min_component_extent=4.0,
+            )
         chains = _trace_skeleton_chains(skeleton)
         candidates: list[CurveCandidate] = []
         image_diag = float(np.hypot(*gray.shape[:2]))
-        min_len = max(14.0, image_diag * 0.008)
+        min_len = max(14.0, image_diag * (0.018 if mode == "white_on_black_sketch" else 0.008))
         for chain in chains:
             if len(chain) < 6:
                 continue
@@ -274,6 +273,82 @@ def _is_line_art(image: np.ndarray) -> bool:
     return bright_ratio > 0.55 and 0.003 < dark_ratio < 0.35 and color_delta < 8.0
 
 
+def _is_white_on_black_sketch(image: np.ndarray) -> bool:
+    cv2 = _require_cv2()
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    dark_ratio = float(np.mean(gray < 32))
+    stroke_ratio = float(np.mean(gray > 45))
+    highlight_ratio = float(np.mean(gray > 120))
+    color_delta = float(np.mean(np.std(image.astype(float), axis=2)))
+    return (
+        dark_ratio > 0.70
+        and 0.003 < stroke_ratio < 0.22
+        and highlight_ratio < 0.10
+        and color_delta < 10.0
+        and float(np.std(gray)) > 6.0
+    )
+
+
+def _line_art_ink(image: np.ndarray) -> tuple[np.ndarray, np.ndarray, str]:
+    cv2 = _require_cv2()
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    if _is_white_on_black_sketch(image):
+        return gray, _white_on_black_sketch_ink(gray), "white_on_black_sketch"
+
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    _, ink = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    # Keep anti-aliased black strokes connected, remove isolated specks.
+    small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+    ink = cv2.morphologyEx(ink, cv2.MORPH_OPEN, small, iterations=1)
+    ink = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, small, iterations=1)
+    return gray, ink, "black_on_white_line_art"
+
+
+def _white_on_black_sketch_ink(gray: np.ndarray) -> np.ndarray:
+    """Extract sparse bright sketch strokes without eroding one-pixel design lines."""
+    cv2 = _require_cv2()
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    otsu_threshold, otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    p98 = float(np.percentile(blur, 98.0))
+    p99 = float(np.percentile(blur, 99.0))
+    high = max(24.0, min(150.0, max(p98, p99 * 0.65)))
+    low = max(10.0, min(float(otsu_threshold), high * 0.55))
+
+    strong = (blur >= high).astype(np.uint8)
+    weak = (blur >= low).astype(np.uint8)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    marker = strong.copy()
+    for _ in range(24):
+        grown = cv2.dilate(marker, kernel, iterations=1)
+        grown = cv2.bitwise_and(grown, weak)
+        if np.array_equal(grown, marker):
+            break
+        marker = grown
+
+    mask = cv2.bitwise_or(marker, (otsu > 0).astype(np.uint8))
+    mask = _remove_tiny_ink_components(mask, min_area=3, min_extent=3)
+    close = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    mask = cv2.morphologyEx(mask * 255, cv2.MORPH_CLOSE, close, iterations=1)
+    return mask
+
+
+def _remove_tiny_ink_components(
+    mask: np.ndarray,
+    *,
+    min_area: int,
+    min_extent: int,
+) -> np.ndarray:
+    cv2 = _require_cv2()
+    num, labels, stats, _ = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8), 8)
+    out = np.zeros(mask.shape, np.uint8)
+    for idx in range(1, num):
+        x, y, w, h, area = [int(v) for v in stats[idx]]
+        if area < min_area and max(w, h) < min_extent:
+            continue
+        out[labels == idx] = 1
+    return out
+
+
 def _skeletonize_zhang_suen(binary: np.ndarray) -> np.ndarray:
     cv2 = _require_cv2()
     binary = binary.astype(np.uint8)
@@ -425,6 +500,100 @@ def _neighbors(p: tuple[int, int], pixels: set[tuple[int, int]]) -> list[tuple[i
             if q in pixels:
                 out.append(q)
     return out
+
+
+def _prune_skeleton_artifacts(
+    skeleton: np.ndarray,
+    *,
+    max_spur_length: float = 16.0,
+    min_component_pixels: int = 4,
+    min_component_extent: float = 4.0,
+) -> np.ndarray:
+    cv2 = _require_cv2()
+    skel = np.asarray(skeleton, dtype=bool).copy()
+    for _ in range(8):
+        ys, xs = np.where(skel)
+        pixels = set(zip(xs.tolist(), ys.tolist()))
+        if not pixels:
+            break
+        degree = {p: len(_neighbors(p, pixels)) for p in pixels}
+        endpoints = [p for p, value in degree.items() if value == 1]
+        remove: set[tuple[int, int]] = set()
+        for endpoint in endpoints:
+            path = [endpoint]
+            previous: tuple[int, int] | None = None
+            current = endpoint
+            length = 0.0
+            while True:
+                options = [p for p in _neighbors(current, pixels) if p != previous]
+                if not options:
+                    break
+                nxt = options[0]
+                length += float(np.hypot(nxt[0] - current[0], nxt[1] - current[1]))
+                previous, current = current, nxt
+                path.append(current)
+                if degree.get(current, 0) != 2 or length > max_spur_length:
+                    break
+            if length <= max_spur_length and degree.get(current, 0) >= 3:
+                remove.update(path[:-1])
+        if not remove:
+            break
+        for x, y in remove:
+            skel[y, x] = False
+
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(skel.astype(np.uint8), 8)
+    out = np.zeros(skel.shape, bool)
+    for idx in range(1, num):
+        x, y, w, h, area = [int(v) for v in stats[idx]]
+        if area < min_component_pixels and max(w, h) < min_component_extent:
+            continue
+        out[labels == idx] = True
+    return out
+
+
+def _collapse_parallel_strokes(
+    skeleton: np.ndarray,
+    mode: str = "off",
+) -> np.ndarray:
+    """Collapse close parallel sketch strokes into one editable routing spine.
+
+    ControlNet/Canny line art often contains two or three parallel responses for one
+    automotive styling line. This operation is intentionally optional: it dilates the
+    one-pixel skeleton just enough to fuse nearby parallel strokes, then thins the
+    fused ribbon back to a single centerline.
+    """
+    mode = (mode or "off").strip().lower()
+    radius_by_mode = {
+        "soft": 3,
+        "medium": 5,
+        "strong": 8,
+    }
+    radius = radius_by_mode.get(mode, 0)
+    if radius <= 0:
+        return np.asarray(skeleton, dtype=bool)
+
+    cv2 = _require_cv2()
+    src = np.asarray(skeleton, dtype=bool)
+    if not np.any(src):
+        return src
+
+    kernel_size = radius * 2 + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    merged = cv2.dilate(src.astype(np.uint8), kernel, iterations=1) > 0
+    merged = cv2.morphologyEx(
+        merged.astype(np.uint8),
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=1,
+    ) > 0
+    collapsed = _skeletonize_zhang_suen(merged)
+    collapsed = _prune_skeleton_artifacts(
+        collapsed,
+        max_spur_length=max(10.0, radius * 2.5),
+        min_component_pixels=4,
+        min_component_extent=4.0,
+    )
+    return collapsed
 
 
 def _edge_key(

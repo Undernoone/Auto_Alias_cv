@@ -20,6 +20,7 @@ from autoalias.geometry.polyline import remove_duplicate_points
 from autoalias.models import CurveCandidate
 from autoalias.quality import ClassAValidator
 from autoalias.review.fit_reviewed import fit_reviewed_annotations
+from autoalias.review.graph import ReviewGraphOptions
 from autoalias.review.server import ReviewSession
 
 
@@ -170,7 +171,16 @@ def _make_handler(
             target = _unique_path(output_dir / "uploads" / safe_name)
             target.write_bytes(self.rfile.read(length))
             try:
-                session = ReviewSession.create(target, output_dir)
+                extraction_mode = self.headers.get("X-Extraction-Mode", "auto")
+                parallel_collapse = self.headers.get("X-Parallel-Collapse", "off")
+                session = ReviewSession.create(
+                    target,
+                    output_dir,
+                    ReviewGraphOptions(
+                        extraction_mode=_clean_extraction_mode(extraction_mode),
+                        parallel_collapse=_clean_parallel_collapse(parallel_collapse),
+                    ),
+                )
             except Exception as exc:
                 try:
                     target.unlink()
@@ -877,6 +887,23 @@ def _safe_filename(name: str) -> str:
     return safe
 
 
+def _clean_extraction_mode(value: str) -> str:
+    value = (value or "auto").strip().lower()
+    allowed = {
+        "auto",
+        "white_on_black_sketch",
+        "black_on_white_line_art",
+        "canny_edges",
+    }
+    return value if value in allowed else "auto"
+
+
+def _clean_parallel_collapse(value: str) -> str:
+    value = (value or "off").strip().lower()
+    allowed = {"off", "soft", "medium", "strong"}
+    return value if value in allowed else "off"
+
+
 def _unique_path(path: Path) -> Path:
     if not path.exists():
         return path
@@ -972,11 +999,25 @@ a { color:#075fd7; }
 
     <div class="stack" id="uploadBox">
       <input id="fileInput" type="file" accept="image/*" />
+      <select id="extractionMode">
+        <option value="auto" selected>自动识别提取模式</option>
+        <option value="white_on_black_sketch">黑底白线草图</option>
+        <option value="black_on_white_line_art">白底黑线线稿</option>
+        <option value="canny_edges">照片/渲染边缘</option>
+      </select>
+      <select id="parallelCollapse">
+        <option value="off" selected>不合并平行光影线</option>
+        <option value="soft">轻度合并平行线束</option>
+        <option value="medium">中度合并平行线束</option>
+        <option value="strong">强合并平行线束</option>
+      </select>
       <button class="primary" id="btnUpload">上传并提取骨架</button>
     </div>
 
     <div id="workBox" class="hidden">
       <div class="row"><span>骨架线段</span><strong id="edgeCount">0</strong></div>
+      <div class="row"><span>提取模式</span><strong id="modeLabel">auto</strong></div>
+      <div class="row"><span>平行并线</span><strong id="collapseLabel">off</strong></div>
       <div class="row"><span>已保存曲线</span><strong id="curveCount">0</strong></div>
       <div class="row"><span>当前点数</span><strong id="pointCount">0</strong></div>
 
@@ -1028,6 +1069,7 @@ a { color:#075fd7; }
 
       <h2>显示</h2>
       <div class="grid2">
+        <button class="primary" id="btnImage">隐藏原图</button>
         <button class="primary" id="btnFullSkeleton">隐藏完整骨架</button>
         <button class="primary" id="btnSkeleton">隐藏切段骨架</button>
         <button class="primary" id="btnCvPreview">隐藏CV预览</button>
@@ -1075,6 +1117,7 @@ let fitPreviewRequestId = 0;
 let branchChoices = [];
 let closedCurve = false;
 let activeCurve = null;
+let showImage = true;
 let showSkeleton = true;
 let showFullSkeleton = true;
 let showAliasPreview = true;
@@ -1097,15 +1140,38 @@ let aiPollTimer = null;
 
 function api(path) { return path + (path.includes("?") ? "&" : "?") + "sid=" + encodeURIComponent(sid); }
 
+function extractionModeName(mode) {
+  const names = {
+    white_on_black_sketch: "黑底白线草图",
+    black_on_white_line_art: "白底黑线线稿",
+    canny_edges: "照片/渲染边缘"
+  };
+  return names[mode] || "自动识别";
+}
+
+function parallelCollapseName(mode) {
+  const names = {
+    off: "关闭",
+    soft: "轻度",
+    medium: "中度",
+    strong: "强"
+  };
+  return names[mode] || "关闭";
+}
+
 async function uploadImage() {
   const file = document.getElementById("fileInput").files[0];
   if (!file) return;
+  const mode = document.getElementById("extractionMode").value || "auto";
+  const collapse = document.getElementById("parallelCollapse").value || "off";
   setStatus("正在上传并提取骨架...");
   const res = await fetch("/api/upload", {
     method: "POST",
     headers: {
       "Content-Type": "application/octet-stream",
-      "X-Filename": encodeURIComponent(file.name)
+      "X-Filename": encodeURIComponent(file.name),
+      "X-Extraction-Mode": mode,
+      "X-Parallel-Collapse": collapse
     },
     body: file
   });
@@ -1125,6 +1191,8 @@ function loadState(data) {
   document.getElementById("uploadBox").classList.add("hidden");
   document.getElementById("workBox").classList.remove("hidden");
   document.getElementById("edgeCount").textContent = graph.edges.length;
+  document.getElementById("modeLabel").textContent = extractionModeName(graph.extraction_mode);
+  document.getElementById("collapseLabel").textContent = parallelCollapseName(graph.parallel_collapse);
   document.getElementById("pathBox").textContent = state.corrections_path || "";
   img.onload = () => { resize(); resetView(); render(); };
   img.src = api("/image") + "&t=" + Date.now();
@@ -1225,11 +1293,12 @@ function render() {
   ctx.save();
   ctx.translate(transform.x, transform.y);
   ctx.scale(transform.scale, transform.scale);
-  ctx.drawImage(img, 0, 0);
+  if (showImage) ctx.drawImage(img, 0, 0);
   if (showFullSkeleton) drawFullSkeleton();
   if (showSkeleton) drawSkeleton();
   drawBranchAlternatives();
   for (const curve of designCurves) drawPolyline(curve.routed_points || [], "#0b6dff", 2.4, 0.95);
+  drawSavedAnchorPoints();
   if (routePreview && routePreview.points) drawPolyline(routePreview.points, "#006dff", 3.2, 1);
   if (showAliasPreview) drawFitPreview();
   drawCutPoints();
@@ -1279,6 +1348,77 @@ function drawPolyline(points, color, width, alpha) {
   ctx.moveTo(points[0][0], points[0][1]);
   for (let i = 1; i < points.length; i++) ctx.lineTo(points[i][0], points[i][1]);
   ctx.stroke();
+  ctx.restore();
+}
+
+function savedAnchorPoints() {
+  const anchors = [];
+  for (const curve of designCurves) {
+    if (!curve || curve.id === activeCurve) continue;
+    const points = curve.manual_points || curve.cut_points || [];
+    for (let i = 0; i < points.length; i++) {
+      const p = points[i] || {};
+      const x = Number(p.x);
+      const y = Number(p.y);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+      anchors.push({
+        x,
+        y,
+        order: i,
+        curve_id: curve.id || "",
+        semantic: curve.semantic || "manual_design_curve",
+        closed: !!curve.closed
+      });
+    }
+  }
+  return anchors;
+}
+
+function savedAnchorSnapRadius() {
+  const radiusEl = document.getElementById("snapRadius");
+  const configured = radiusEl ? parseFloat(radiusEl.value || "24") : 24;
+  const screenAware = Math.max(10, Math.min(36, 18 / Math.max(transform.scale, 1e-6)));
+  return Math.min(Number.isFinite(configured) ? configured : 24, screenAware);
+}
+
+function snapToSavedAnchor(wx, wy) {
+  const maxDistance = savedAnchorSnapRadius();
+  let best = null;
+  for (const anchor of savedAnchorPoints()) {
+    const d = Math.hypot(wx - anchor.x, wy - anchor.y);
+    if (d <= maxDistance && (!best || d < best.distance)) {
+      best = { ...anchor, distance: d };
+    }
+  }
+  if (!best) return null;
+  return {
+    ok: true,
+    x: round3(best.x),
+    y: round3(best.y),
+    distance: round3(best.distance),
+    source: "saved_curve_anchor",
+    anchor_curve_id: best.curve_id,
+    anchor_point_order: best.order,
+    anchor_semantic: best.semantic,
+    anchor_closed: best.closed
+  };
+}
+
+function drawSavedAnchorPoints() {
+  const anchors = savedAnchorPoints();
+  if (!anchors.length) return;
+  ctx.save();
+  const radius = Math.max(4.8 / transform.scale, 2.4);
+  const lineWidth = Math.max(1.55 / transform.scale, 0.7);
+  for (const p of anchors) {
+    ctx.beginPath();
+    ctx.fillStyle = p.closed ? "rgba(255,194,45,.82)" : "rgba(42,198,255,.68)";
+    ctx.strokeStyle = "rgba(30,38,42,.82)";
+    ctx.lineWidth = lineWidth;
+    ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+  }
   ctx.restore();
 }
 
@@ -1480,8 +1620,20 @@ async function addCutPoint(wx, wy) {
     setStatus("没有找到可吸附的骨架点");
     return;
   }
-  cutPoints.push({ x: round3(snapped.x), y: round3(snapped.y), order: cutPoints.length, snap_distance: snapped.distance });
+  cutPoints.push({
+    x: round3(snapped.x),
+    y: round3(snapped.y),
+    order: cutPoints.length,
+    snap_distance: snapped.distance,
+    snap_source: snapped.source || "skeleton",
+    anchor_curve_id: snapped.anchor_curve_id || "",
+    anchor_point_order: snapped.anchor_point_order,
+    anchor_semantic: snapped.anchor_semantic || ""
+  });
   selectedCutIndex = cutPoints.length - 1;
+  if (snapped.source === "saved_curve_anchor") {
+    setStatus(`已吸附到已保存曲线 ${snapped.anchor_point_order + 1} 号分段点`);
+  }
   aliasOverrideDirty = true;
   refreshRoutePreview();
   updatePanel();
@@ -1611,6 +1763,8 @@ async function toggleG2Edit() {
 async function snapPoint(wx, wy) {
   const radiusEl = document.getElementById("snapRadius");
   const maxDistance = radiusEl ? parseFloat(radiusEl.value || "24") : 24;
+  const savedAnchor = snapToSavedAnchor(wx, wy);
+  if (savedAnchor) return savedAnchor;
   const res = await fetch(api("/api/snap"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -1633,6 +1787,10 @@ async function moveDraggedPoint(index, wx, wy) {
   cutPoints[index].x = round3(snapped.x);
   cutPoints[index].y = round3(snapped.y);
   cutPoints[index].snap_distance = snapped.distance;
+  cutPoints[index].snap_source = snapped.source || "skeleton";
+  cutPoints[index].anchor_curve_id = snapped.anchor_curve_id || "";
+  cutPoints[index].anchor_point_order = snapped.anchor_point_order;
+  cutPoints[index].anchor_semantic = snapped.anchor_semantic || "";
   selectedCutIndex = index;
   pointDragMoved = true;
   aliasOverrideDirty = true;
@@ -1998,6 +2156,8 @@ function updatePanel() {
   document.getElementById("routeBox").textContent = routeStatus || "在图上点击两个或多个点，蓝线会沿骨架自动生成。";
   renderBranchControls();
   renderQualityPreview();
+  document.getElementById("btnImage").classList.toggle("primary", showImage);
+  document.getElementById("btnImage").textContent = showImage ? "隐藏原图" : "显示原图";
   document.getElementById("btnClose").classList.toggle("primary", closedCurve);
   document.getElementById("btnClose").textContent = closedCurve ? "闭合中" : "闭合曲线";
   document.getElementById("btnSkeleton").classList.toggle("primary", showSkeleton);
@@ -2206,6 +2366,7 @@ document.getElementById("btnUndo").onclick = undoPoint;
 document.getElementById("btnDelete").onclick = deleteSelected;
 document.getElementById("btnClose").onclick = toggleClosed;
 document.getElementById("btnClear").onclick = clearCurrent;
+document.getElementById("btnImage").onclick = () => { showImage = !showImage; updatePanel(); render(); };
 document.getElementById("btnSkeleton").onclick = () => { showSkeleton = !showSkeleton; updatePanel(); render(); };
 document.getElementById("btnFullSkeleton").onclick = () => { showFullSkeleton = !showFullSkeleton; updatePanel(); render(); };
 document.getElementById("btnAliasPreview").onclick = () => { showAliasPreview = !showAliasPreview; updatePanel(); render(); };

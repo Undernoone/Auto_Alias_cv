@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from autoalias.review.graph import build_review_graph_bundle, graph_snapshot_for_training
+from autoalias.review.graph import ReviewGraphOptions, build_review_graph_bundle, graph_snapshot_for_training
 
 
 @dataclass(slots=True)
@@ -25,11 +25,16 @@ class ReviewSession:
     design_curves: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
-    def create(cls, image_path: str | Path, output_dir: str | Path) -> "ReviewSession":
+    def create(
+        cls,
+        image_path: str | Path,
+        output_dir: str | Path,
+        graph_options: ReviewGraphOptions | None = None,
+    ) -> "ReviewSession":
         image = Path(image_path).resolve()
         out = Path(output_dir).resolve()
         out.mkdir(parents=True, exist_ok=True)
-        graph, router = build_review_graph_bundle(image)
+        graph, router = build_review_graph_bundle(image, graph_options)
         corrections_path = out / f"{image.stem}.topology_corrections.json"
         corrections: list[dict[str, Any]] = []
         design_curves: list[dict[str, Any]] = []

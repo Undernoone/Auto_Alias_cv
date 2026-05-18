@@ -1,19 +1,31 @@
 from __future__ import annotations
 
 import heapq
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+# 直接运行本文件时（``python .../review/graph.py``），Python 不会自动把仓库的 ``src`` 加入
+# sys.path；未 ``pip install -e .`` 时会报 ``No module named 'auto  alias'``。
+_src = Path(__file__).resolve().parents[2]
+if (_src / "autoalias").is_dir() and str(_src) not in sys.path:
+    sys.path.insert(0, str(_src))
+
 import numpy as np
 
 from autoalias.vision.extractor import (
+    _collapse_parallel_strokes,
     _curve_length,
     _is_line_art,
+    _is_white_on_black_sketch,
+    _line_art_ink,
+    _prune_skeleton_artifacts,
     _require_cv2,
     _semantic_guess,
     _skeletonize_zhang_suen,
     _trace_skeleton_chains,
+    _white_on_black_sketch_ink,
 )
 
 
@@ -22,6 +34,8 @@ class ReviewGraphOptions:
     min_edge_length: float = 3.0
     endpoint_cluster_radius: float = 6.0
     max_points_per_edge: int = 320
+    extraction_mode: str = "auto"
+    parallel_collapse: str = "off"
 
 
 @dataclass(slots=True)
@@ -39,6 +53,7 @@ class SkeletonRouter:
             (-1, -1, 2**0.5),
             (0, -1, 1.0),
             (1, -1, 2**0.5),
+
             (-1, 0, 1.0),
             (1, 0, 1.0),
             (-1, 1, 2**0.5),
@@ -225,24 +240,48 @@ def build_review_graph_bundle(
 
     h, w = image.shape[:2]
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
-    if _is_line_art(image):
-        _, ink = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    extraction_mode = _resolve_extraction_mode(image, options.extraction_mode)
+    if extraction_mode == "white_on_black_sketch":
+        ink = _white_on_black_sketch_ink(gray)
+    elif extraction_mode == "black_on_white_line_art":
+        _gray, ink, extraction_mode = _line_art_ink(image)
+        if options.extraction_mode == "black_on_white_line_art" and extraction_mode != "black_on_white_line_art":
+            gray_blur = cv2.GaussianBlur(gray, (3, 3), 0)
+            _, ink = cv2.threshold(gray_blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+            ink = cv2.morphologyEx(ink, cv2.MORPH_OPEN, small, iterations=1)
+            ink = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, small, iterations=1)
+            extraction_mode = "black_on_white_line_art"
     else:
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
         ink = cv2.Canny(gray, 55, 150)
-    small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
-    ink = cv2.morphologyEx(ink, cv2.MORPH_OPEN, small, iterations=1)
-    ink = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, small, iterations=1)
+        small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+        ink = cv2.morphologyEx(ink, cv2.MORPH_OPEN, small, iterations=1)
+        ink = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, small, iterations=1)
 
     skeleton = _skeletonize_zhang_suen(ink > 0)
+    if extraction_mode == "white_on_black_sketch":
+        skeleton = _prune_skeleton_artifacts(
+            skeleton,
+            max_spur_length=18.0,
+            min_component_pixels=4,
+            min_component_extent=4.0,
+        )
+    parallel_collapse = _clean_parallel_collapse(options.parallel_collapse)
+    if parallel_collapse != "off":
+        skeleton = _collapse_parallel_strokes(skeleton, parallel_collapse)
     router = SkeletonRouter.from_skeleton(skeleton)
     chains = _trace_skeleton_chains(skeleton)
     raw_edges: list[dict[str, Any]] = []
     coverage_fragments: list[list[list[float]]] = []
+    image_diag = float(np.hypot(h, w))
+    min_edge_length = options.min_edge_length
+    if extraction_mode == "white_on_black_sketch":
+        min_edge_length = max(min_edge_length, image_diag * 0.018)
     for chain in chains:
         points = _as_points3(chain)
         length = _curve_length(points)
-        if length < options.min_edge_length or len(points) < 3:
+        if length < min_edge_length or len(points) < 3:
             coverage_fragments.append(_round_points(_downsample_points(points, 12)))
             continue
         bbox = _bbox(points)
@@ -295,6 +334,8 @@ def build_review_graph_bundle(
         "version": 1,
         "image": str(path),
         "image_name": path.name,
+        "extraction_mode": extraction_mode,
+        "parallel_collapse": parallel_collapse,
         "image_size": {"width": int(w), "height": int(h)},
         "edge_count": len(edges),
         "node_count": len(node_list),
@@ -310,6 +351,8 @@ def graph_snapshot_for_training(graph: dict[str, Any]) -> dict[str, Any]:
         "version": graph.get("version", 1),
         "image": graph.get("image"),
         "image_name": graph.get("image_name"),
+        "extraction_mode": graph.get("extraction_mode"),
+        "parallel_collapse": graph.get("parallel_collapse"),
         "image_size": graph.get("image_size"),
         "edge_count": graph.get("edge_count", 0),
         "node_count": graph.get("node_count", 0),
@@ -326,6 +369,44 @@ def graph_snapshot_for_training(graph: dict[str, Any]) -> dict[str, Any]:
         ],
         "nodes": graph.get("nodes", []),
     }
+
+
+def _resolve_extraction_mode(image: np.ndarray, requested: str) -> str:
+    requested = (requested or "auto").strip().lower()
+    aliases = {
+        "dark_sketch": "white_on_black_sketch",
+        "white_on_black": "white_on_black_sketch",
+        "bright_on_dark": "white_on_black_sketch",
+        "line_art": "black_on_white_line_art",
+        "black_on_white": "black_on_white_line_art",
+        "canny": "canny_edges",
+        "edges": "canny_edges",
+    }
+    requested = aliases.get(requested, requested)
+    if requested in {"white_on_black_sketch", "black_on_white_line_art", "canny_edges"}:
+        return requested
+    if _is_white_on_black_sketch(image):
+        return "white_on_black_sketch"
+    if _is_line_art(image):
+        return "black_on_white_line_art"
+    return "canny_edges"
+
+
+def _clean_parallel_collapse(value: str) -> str:
+    value = (value or "off").strip().lower()
+    aliases = {
+        "none": "off",
+        "false": "off",
+        "0": "off",
+        "light": "soft",
+        "normal": "medium",
+        "default": "medium",
+        "high": "strong",
+        "true": "medium",
+        "1": "medium",
+    }
+    value = aliases.get(value, value)
+    return value if value in {"off", "soft", "medium", "strong"} else "off"
 
 
 def _as_points3(points: np.ndarray) -> np.ndarray:
@@ -471,3 +552,15 @@ def _edge_coverage_metrics(
         "missed_skeleton_pixels": missed,
         "coverage_ratio": round(float(ratio), 6),
     }
+
+
+if __name__ == "__main__":
+    import sys
+
+    print(
+        "graph.py is a library: running this file does not write images or JSON.\n"
+        "To see skeleton/edges output:\n"
+        "  - Run graph_pipeline_walkthrough.py (set IDE_IMAGE / IDE_DEBUG_OUT -> PNG + graph_summary.json)\n"
+        "  - Or: autoalias skeleton-review / review-image in browser\n",
+        file=sys.stdout,
+    )
