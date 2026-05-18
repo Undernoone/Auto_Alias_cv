@@ -138,6 +138,12 @@ def _make_handler(
                     return
                 self._handle_ai_start(session)
                 return
+            if parsed.path == "/api/auto-segment":
+                session = self._require_session(parsed)
+                if session is None:
+                    return
+                self._handle_auto_segment(session)
+                return
             if parsed.path == "/api/ai-suggest":
                 session = self._require_session(parsed)
                 if session is None:
@@ -343,6 +349,14 @@ def _make_handler(
             try:
                 payload = self._read_json(required=False)
                 result = _ai_suggest_curves(session, payload, output_dir)
+                self._send_json(result)
+            except Exception as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+
+        def _handle_auto_segment(self, session: ReviewSession) -> None:
+            try:
+                payload = self._read_json(required=False)
+                result = _auto_segment_curves(session, payload)
                 self._send_json(result)
             except Exception as exc:
                 self._send_json({"ok": False, "error": str(exc)}, status=400)
@@ -570,6 +584,32 @@ def _ai_suggest_curves(
         "curve_count": len(design_curves),
         "curves": design_curves,
         "context_image": result.get("context_image"),
+    }
+
+
+def _auto_segment_curves(
+    session: ReviewSession,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    from autoalias.review.auto_segment import suggest_geometry_segments
+
+    min_length_raw = payload.get("min_length", None)
+    min_length = None
+    if min_length_raw not in (None, "", "auto"):
+        min_length = float(min_length_raw)
+    curves = suggest_geometry_segments(
+        session.graph,
+        max_curves=max(1, min(int(payload.get("max_curves", 32)), 96)),
+        min_length=min_length,
+        max_turn_deg=float(payload.get("max_turn_deg", 28.0)),
+        max_junction_turn_deg=float(payload.get("max_junction_turn_deg", 18.0)),
+        max_chain_edges=max(1, min(int(payload.get("max_chain_edges", 8)), 24)),
+    )
+    return {
+        "ok": True,
+        "curve_count": len(curves),
+        "curves": curves,
+        "source": "geometry_auto_segment",
     }
 
 
@@ -1057,6 +1097,7 @@ a { color:#075fd7; }
 
       <h2>AI 辅助分线</h2>
       <div class="stack">
+        <button class="good" id="btnAutoSegment">几何自动分段</button>
         <button class="warn" id="btnAiSuggest">AI 建议分线点</button>
         <div class="box">
           <div id="aiBox">AI 会看原图和红色完整骨架，自动生成可编辑的分线点；生成后你可以继续拖拽、删除、保存和导出。</div>
@@ -1879,6 +1920,42 @@ async function refreshFitPreview() {
   }
 }
 
+async function runAutoSegment() {
+  if (!sid || !graph) return;
+  const btn = document.getElementById("btnAutoSegment");
+  btn.disabled = true;
+  const box = document.getElementById("aiBox");
+  box.textContent = "正在根据骨架端点、分叉点和切线连续性生成几何自动分段...";
+  try {
+    const res = await fetch(api("/api/auto-segment"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        max_curves: 32,
+        max_turn_deg: 28,
+        max_junction_turn_deg: 18,
+        max_chain_edges: 8
+      })
+    });
+    const result = await res.json();
+    if (!result.ok) {
+      box.textContent = "几何自动分段失败：" + (result.error || "unknown");
+      btn.disabled = false;
+      return;
+    }
+    const curves = result.curves || [];
+    for (const curve of curves) designCurves.push(curve);
+    await saveAll();
+    box.textContent = `几何自动分段已生成 ${curves.length} 条候选曲线，已经加入曲线列表。你可以逐条点击检查、删除或再手动修正。`;
+    activeCurve = null;
+    updatePanel();
+    render();
+  } catch (err) {
+    box.textContent = "几何自动分段失败：" + (err && err.message ? err.message : String(err));
+  }
+  btn.disabled = false;
+}
+
 async function runAiSuggest() {
   if (!sid || !graph) return;
   const requestId = ++aiSuggestRequestId;
@@ -2176,6 +2253,7 @@ function updatePanel() {
   document.getElementById("btnUndo").disabled = cutPoints.length < 1;
   document.getElementById("btnDelete").disabled = selectedCutIndex == null;
   document.getElementById("btnClose").disabled = cutPoints.length < 3;
+  document.getElementById("btnAutoSegment").disabled = !graph;
   document.getElementById("btnAiSuggest").disabled = !graph;
   renderCurveList();
 }
@@ -2373,6 +2451,7 @@ document.getElementById("btnAliasPreview").onclick = () => { showAliasPreview = 
 document.getElementById("btnCvPreview").onclick = () => { showCvPreview = !showCvPreview; updatePanel(); render(); };
 document.getElementById("btnG2Edit").onclick = toggleG2Edit;
 document.getElementById("degree").onchange = () => { refreshFitPreview().then(() => { updatePanel(); render(); }); };
+document.getElementById("btnAutoSegment").onclick = runAutoSegment;
 document.getElementById("btnAiSuggest").onclick = runAiSuggest;
 document.getElementById("btnReset").onclick = resetView;
 document.getElementById("btnExport").onclick = exportIges;
