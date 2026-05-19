@@ -409,6 +409,9 @@ def _make_handler(
                     export_dir,
                     degree=degree,
                     min_points=8,
+                    max_fit_points=int(payload.get("max_fit_points", 180) or 180),
+                    diagnostic_preview=bool(payload.get("diagnostic_preview", False)),
+                    fast_mode=bool(payload.get("fast_mode", True)),
                 )
                 exports[sid] = {
                     "iges": export_dir / "reviewed_curves.igs",
@@ -756,11 +759,13 @@ def _auto_segment_curves(
         min_length = float(min_length_raw)
     curves = suggest_geometry_segments(
         session.graph,
-        max_curves=max(1, min(int(payload.get("max_curves", 32)), 96)),
+        max_curves=max(1, min(int(payload.get("max_curves", 32)), 512)),
         min_length=min_length,
         max_turn_deg=float(payload.get("max_turn_deg", 28.0)),
         max_junction_turn_deg=float(payload.get("max_junction_turn_deg", 18.0)),
-        max_chain_edges=max(1, min(int(payload.get("max_chain_edges", 8)), 24)),
+        max_chain_edges=max(1, min(int(payload.get("max_chain_edges", 8)), 48)),
+        max_gap=float(payload.get("max_gap", 0.0) or 0.0),
+        max_gap_turn_deg=float(payload.get("max_gap_turn_deg", payload.get("max_turn_deg", 28.0))),
     )
     return {
         "ok": True,
@@ -1270,6 +1275,12 @@ a { color:#075fd7; }
 
       <h2>AI 辅助分线</h2>
       <div class="stack">
+        <select id="autoSegmentMode">
+          <option value="main">主线模式</option>
+          <option value="coverage" selected>连续覆盖模式</option>
+          <option value="detail">局部细节模式</option>
+          <option value="full">全量骨架模式</option>
+        </select>
         <button class="good" id="btnAutoSegment">几何自动分段</button>
         <button class="warn" id="btnAiSuggest">AI 建议分线点</button>
         <div class="box">
@@ -2336,22 +2347,69 @@ async function refreshFitPreview() {
   }
 }
 
+function autoSegmentPayload() {
+  const mode = document.getElementById("autoSegmentMode").value || "coverage";
+  const size = graph && graph.image_size ? graph.image_size : { width: 0, height: 0 };
+  const diag = Math.max(1, Math.hypot(size.width || 0, size.height || 0));
+  if (mode === "full") {
+    return {
+      mode,
+      max_curves: 420,
+      min_length: Math.max(2, diag * 0.0025),
+      max_turn_deg: 68,
+      max_junction_turn_deg: 44,
+      max_chain_edges: 28,
+      max_gap: Math.max(6, diag * 0.006),
+      max_gap_turn_deg: 58
+    };
+  }
+  if (mode === "detail") {
+    return {
+      mode,
+      max_curves: 160,
+      min_length: Math.max(5, diag * 0.006),
+      max_turn_deg: 46,
+      max_junction_turn_deg: 32,
+      max_chain_edges: 14,
+      max_gap: Math.max(4, diag * 0.004),
+      max_gap_turn_deg: 42
+    };
+  }
+  if (mode === "main") {
+    return {
+      mode,
+      max_curves: 32,
+      max_turn_deg: 28,
+      max_junction_turn_deg: 18,
+      max_chain_edges: 8,
+      max_gap: 0
+    };
+  }
+  return {
+    mode: "coverage",
+    max_curves: 220,
+    min_length: Math.max(4, diag * 0.005),
+    max_turn_deg: 54,
+    max_junction_turn_deg: 36,
+    max_chain_edges: 36,
+    max_gap: Math.max(8, diag * 0.009),
+    max_gap_turn_deg: 50
+  };
+}
+
 async function runAutoSegment() {
   if (!sid || !graph) return;
   const btn = document.getElementById("btnAutoSegment");
   btn.disabled = true;
   const box = document.getElementById("aiBox");
-  box.textContent = "正在根据骨架端点、分叉点和切线连续性生成几何自动分段...";
+  const payload = autoSegmentPayload();
+  const modeName = document.getElementById("autoSegmentMode").selectedOptions[0].textContent;
+  box.textContent = `正在使用${modeName}，根据骨架端点、分叉点、小断口和切线连续性生成几何自动分段...`;
   try {
     const res = await fetch(api("/api/auto-segment"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        max_curves: 32,
-        max_turn_deg: 28,
-        max_junction_turn_deg: 18,
-        max_chain_edges: 8
-      })
+      body: JSON.stringify(payload)
     });
     const result = await res.json();
     if (!result.ok) {
@@ -2363,7 +2421,7 @@ async function runAutoSegment() {
     for (const curve of curves) designCurves.push(curve);
     invalidateDesignLayer();
     await saveAll();
-    box.textContent = `几何自动分段已生成 ${curves.length} 条候选曲线，已经加入曲线列表。你可以逐条点击检查、删除或再手动修正。`;
+    box.textContent = `${modeName}已生成 ${curves.length} 条候选曲线，已经加入曲线列表。你可以逐条点击检查、删除或再手动修正。`;
     activeCurve = null;
     updatePanel();
     render();
@@ -2527,7 +2585,10 @@ async function exportIges() {
     body: JSON.stringify({
       corrections: [],
       design_curves: designCurves,
-      degree: document.getElementById("degree").value
+      degree: document.getElementById("degree").value,
+      max_fit_points: 180,
+      diagnostic_preview: false,
+      fast_mode: true
     })
   });
   const result = await res.json();

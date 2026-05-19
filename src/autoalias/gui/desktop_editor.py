@@ -57,7 +57,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - only hit on missing GUI
         "  F:\\430AutoAlias\\scripts\\autoalias_gui.cmd"
     ) from exc
 
-from autoalias.review.fit_reviewed import fit_reviewed_annotations
+from autoalias.review.fit_reviewed import ReviewedFitResult, fit_reviewed_annotations
 from autoalias.review.auto_segment import suggest_geometry_segments
 from autoalias.review.graph import ReviewGraphOptions
 from autoalias.review.server import ReviewSession
@@ -192,6 +192,37 @@ class SessionWorker(QObject):
             self.failed.emit(str(exc))
 
 
+class ExportWorker(QObject):
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        annotation_path: Path,
+        output_dir: Path,
+        degree: int | str,
+    ) -> None:
+        super().__init__()
+        self.annotation_path = annotation_path
+        self.output_dir = output_dir
+        self.degree = degree
+
+    def run(self) -> None:
+        try:
+            result = fit_reviewed_annotations(
+                [self.annotation_path],
+                self.output_dir,
+                degree=self.degree,
+                min_points=4,
+                max_fit_points=180,
+                diagnostic_preview=False,
+                fast_mode=True,
+            )
+            self.finished.emit(result)
+        except Exception as exc:  # pragma: no cover - GUI worker path.
+            self.failed.emit(str(exc))
+
+
 class CutPointItem(QGraphicsEllipseItem):
     def __init__(self, window: "DesktopEditor", index: int, point: QPointF) -> None:
         radius = 6.0
@@ -301,7 +332,8 @@ class DesktopEditor(QMainWindow):
         self.session: ReviewSession | None = None
         self.current_image: QImage | None = None
         self.image_item: QGraphicsPixmapItem | None = None
-        self.skeleton_item: QGraphicsPixmapItem | None = None
+        self.full_skeleton_item: QGraphicsPixmapItem | None = None
+        self.edge_skeleton_item: QGraphicsPixmapItem | None = None
         self.current_route_item: QGraphicsPathItem | None = None
         self.alt_route_items: list[QGraphicsPathItem] = []
         self.saved_route_items: list[QGraphicsPathItem] = []
@@ -316,6 +348,8 @@ class DesktopEditor(QMainWindow):
         self.selected_cut_index: int | None = None
         self._worker_thread: QThread | None = None
         self._worker: SessionWorker | None = None
+        self._export_thread: QThread | None = None
+        self._export_worker: ExportWorker | None = None
         self.last_export_dir: Path | None = None
         self.last_skeleton_edit_index: int | None = None
         self.skeleton_edits: list[dict[str, Any]] = []
@@ -341,10 +375,11 @@ class DesktopEditor(QMainWindow):
 
         self.auto_segment_mode = QComboBox()
         self.auto_segment_mode.addItem("主线模式", "main")
+        self.auto_segment_mode.addItem("连续覆盖模式", "coverage")
         self.auto_segment_mode.addItem("局部细节模式", "detail")
         self.auto_segment_mode.addItem("全量骨架模式", "full")
         self.auto_segment_mode.setToolTip(
-            "主线模式更保守；局部细节会提取更多短线；全量骨架会尽量把所有可追踪骨架都变成候选曲线。"
+            "主线模式更保守；连续覆盖会跨小断口追长线；局部细节会提取更多短线；全量骨架会尽量把所有可追踪骨架都变成候选曲线。"
         )
 
         self.snap_radius = QSpinBox()
@@ -355,9 +390,12 @@ class DesktopEditor(QMainWindow):
         self.show_image = QCheckBox("原图")
         self.show_image.setChecked(True)
         self.show_image.toggled.connect(self._update_visibility)
-        self.show_skeleton = QCheckBox("骨架")
-        self.show_skeleton.setChecked(True)
-        self.show_skeleton.toggled.connect(self._update_visibility)
+        self.show_full_skeleton = QCheckBox("完整骨架红点")
+        self.show_full_skeleton.setChecked(True)
+        self.show_full_skeleton.toggled.connect(self._update_visibility)
+        self.show_edge_skeleton = QCheckBox("切段骨架绿线")
+        self.show_edge_skeleton.setChecked(True)
+        self.show_edge_skeleton.toggled.connect(self._update_visibility)
         self.show_saved = QCheckBox("已保存蓝线")
         self.show_saved.setChecked(True)
         self.show_saved.toggled.connect(self._update_visibility)
@@ -409,7 +447,8 @@ class DesktopEditor(QMainWindow):
         side_layout.addWidget(QLabel("导出 Degree"))
         side_layout.addWidget(self.degree)
         side_layout.addWidget(self.show_image)
-        side_layout.addWidget(self.show_skeleton)
+        side_layout.addWidget(self.show_full_skeleton)
+        side_layout.addWidget(self.show_edge_skeleton)
         side_layout.addWidget(self.show_saved)
 
         skeleton_row = QHBoxLayout()
@@ -465,9 +504,9 @@ class DesktopEditor(QMainWindow):
         branch_row.addWidget(next_branch_btn)
         side_layout.addLayout(branch_row)
 
-        export_btn = QPushButton("导出 IGES")
-        export_btn.clicked.connect(self.export_iges)
-        side_layout.addWidget(export_btn)
+        self.export_btn = QPushButton("导出 IGES")
+        self.export_btn.clicked.connect(self.export_iges)
+        side_layout.addWidget(self.export_btn)
         open_export_btn = QPushButton("打开最近导出文件夹")
         open_export_btn.clicked.connect(self.open_last_export_dir)
         side_layout.addWidget(open_export_btn)
@@ -631,8 +670,14 @@ class DesktopEditor(QMainWindow):
         self.current_route_item = None
         self.image_item = self.scene.addPixmap(QPixmap.fromImage(loaded.image))
         self.image_item.setZValue(0)
-        self.skeleton_item = self.scene.addPixmap(self._make_skeleton_pixmap(loaded.image, loaded.session))
-        self.skeleton_item.setZValue(5)
+        self.full_skeleton_item = self.scene.addPixmap(
+            self._make_full_skeleton_pixmap(loaded.image, loaded.session)
+        )
+        self.full_skeleton_item.setZValue(5)
+        self.edge_skeleton_item = self.scene.addPixmap(
+            self._make_edge_skeleton_pixmap(loaded.image, loaded.session)
+        )
+        self.edge_skeleton_item.setZValue(6)
         self.scene.setSceneRect(0, 0, loaded.image.width(), loaded.image.height())
         self.view.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
         self._rebuild_saved_routes()
@@ -642,18 +687,29 @@ class DesktopEditor(QMainWindow):
             f"已加载：{loaded.session.image_path.name}，骨架点 {len(loaded.session.router.coords)}。"
         )
 
-    def _make_skeleton_pixmap(self, image_source: QImage, session: ReviewSession) -> QPixmap:
+    def _transparent_image_like(self, image_source: QImage) -> QImage:
         image = QImage(
             image_source.width(),
             image_source.height(),
             QImage.Format.Format_ARGB32_Premultiplied,
         )
         image.fill(Qt.GlobalColor.transparent)
+        return image
+
+    def _make_full_skeleton_pixmap(self, image_source: QImage, session: ReviewSession) -> QPixmap:
+        image = self._transparent_image_like(image_source)
         painter = QPainter(image)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         painter.setPen(QPen(QColor(220, 0, 0, 135), 1))
         for x, y in session.router.coords:
             painter.drawPoint(int(x), int(y))
+        painter.end()
+        return QPixmap.fromImage(image)
+
+    def _make_edge_skeleton_pixmap(self, image_source: QImage, session: ReviewSession) -> QPixmap:
+        image = self._transparent_image_like(image_source)
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         painter.setPen(QPen(QColor(0, 140, 115, 130), 1.2))
         for edge in session.graph.get("edges", []):
             points = edge.get("points") or []
@@ -666,12 +722,18 @@ class DesktopEditor(QMainWindow):
     def refresh_skeleton_layer(self) -> None:
         if self.session is None or self.current_image is None:
             return
-        pixmap = self._make_skeleton_pixmap(self.current_image, self.session)
-        if self.skeleton_item is None:
-            self.skeleton_item = self.scene.addPixmap(pixmap)
-            self.skeleton_item.setZValue(5)
+        full_pixmap = self._make_full_skeleton_pixmap(self.current_image, self.session)
+        edge_pixmap = self._make_edge_skeleton_pixmap(self.current_image, self.session)
+        if self.full_skeleton_item is None:
+            self.full_skeleton_item = self.scene.addPixmap(full_pixmap)
+            self.full_skeleton_item.setZValue(5)
         else:
-            self.skeleton_item.setPixmap(pixmap)
+            self.full_skeleton_item.setPixmap(full_pixmap)
+        if self.edge_skeleton_item is None:
+            self.edge_skeleton_item = self.scene.addPixmap(edge_pixmap)
+            self.edge_skeleton_item.setZValue(6)
+        else:
+            self.edge_skeleton_item.setPixmap(edge_pixmap)
         self._update_visibility()
 
     def break_skeleton_add_chain(self) -> None:
@@ -1123,11 +1185,27 @@ class DesktopEditor(QMainWindow):
                 mode,
                 "全量骨架模式",
                 {
-                    "max_curves": 320,
-                    "min_length": max(3.0, diag * 0.004),
+                    "max_curves": 420,
+                    "min_length": max(2.0, diag * 0.0025),
                     "max_turn_deg": 68.0,
                     "max_junction_turn_deg": 44.0,
-                    "max_chain_edges": 24,
+                    "max_chain_edges": 28,
+                    "max_gap": max(6.0, diag * 0.006),
+                    "max_gap_turn_deg": 58.0,
+                },
+            )
+        if mode == "coverage":
+            return (
+                mode,
+                "连续覆盖模式",
+                {
+                    "max_curves": 220,
+                    "min_length": max(4.0, diag * 0.005),
+                    "max_turn_deg": 54.0,
+                    "max_junction_turn_deg": 36.0,
+                    "max_chain_edges": 36,
+                    "max_gap": max(8.0, diag * 0.009),
+                    "max_gap_turn_deg": 50.0,
                 },
             )
         if mode == "detail":
@@ -1136,10 +1214,12 @@ class DesktopEditor(QMainWindow):
                 "局部细节模式",
                 {
                     "max_curves": 160,
-                    "min_length": max(8.0, diag * 0.009),
+                    "min_length": max(5.0, diag * 0.006),
                     "max_turn_deg": 46.0,
                     "max_junction_turn_deg": 32.0,
                     "max_chain_edges": 14,
+                    "max_gap": max(4.0, diag * 0.004),
+                    "max_gap_turn_deg": 42.0,
                 },
             )
         return (
@@ -1332,6 +1412,9 @@ class DesktopEditor(QMainWindow):
     def export_iges(self) -> None:
         if self.session is None:
             return
+        if self._export_thread is not None:
+            QMessageBox.information(self, "AutoAlias", "正在导出上一批 IGES，请稍等。")
+            return
         if len(self.cut_points) >= 2:
             self.save_current(start_next=False)
         if not self.design_curves:
@@ -1342,18 +1425,28 @@ class DesktopEditor(QMainWindow):
         out = self.output_dir / "alias_exports" / (
             self.session.image_path.stem + "_desktop_" + time.strftime("%Y%m%d_%H%M%S")
         )
-        try:
-            result = fit_reviewed_annotations(
-                [self.session.corrections_path],
-                out,
-                degree=degree,
-                min_points=4,
-            )
-        except Exception as exc:
-            QMessageBox.critical(self, "导出失败", str(exc))
-            return
+        worker = ExportWorker(self.session.corrections_path, out, degree)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._export_finished)
+        worker.failed.connect(self._export_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_export_worker)
+        self._export_worker = worker
+        self._export_thread = thread
+        self.export_btn.setEnabled(False)
+        self._set_status(f"正在后台导出 IGES：{out}")
+        thread.start()
+
+    def _export_finished(self, result: ReviewedFitResult) -> None:
         self.last_export_dir = result.out
         self.last_export_label.setText(f"最近导出：{result.out}")
+        self._set_status(f"IGES 导出完成：{result.out}")
         QMessageBox.information(
             self,
             "导出完成",
@@ -1362,6 +1455,15 @@ class DesktopEditor(QMainWindow):
             f"IGES：{result.out / 'reviewed_curves.igs'}\n"
             f"SVG：{result.out / 'reviewed_clean_preview.svg'}",
         )
+
+    def _export_failed(self, message: str) -> None:
+        QMessageBox.critical(self, "导出失败", message)
+        self._set_status("IGES 导出失败。")
+
+    def _clear_export_worker(self) -> None:
+        self._export_worker = None
+        self._export_thread = None
+        self.export_btn.setEnabled(True)
 
     def open_last_export_dir(self) -> None:
         if self.last_export_dir is None:
@@ -1372,8 +1474,10 @@ class DesktopEditor(QMainWindow):
     def _update_visibility(self) -> None:
         if self.image_item is not None:
             self.image_item.setVisible(self.show_image.isChecked())
-        if self.skeleton_item is not None:
-            self.skeleton_item.setVisible(self.show_skeleton.isChecked())
+        if self.full_skeleton_item is not None:
+            self.full_skeleton_item.setVisible(self.show_full_skeleton.isChecked())
+        if self.edge_skeleton_item is not None:
+            self.edge_skeleton_item.setVisible(self.show_edge_skeleton.isChecked())
         for item in self.saved_route_items:
             item.setVisible(self.show_saved.isChecked())
 

@@ -86,6 +86,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_fit_reviewed.add_argument("--out", type=Path, default=Path("out_reviewed"))
     p_fit_reviewed.add_argument("--degree", default="auto", help="auto, 3, 4, 5, 6 or 7")
     p_fit_reviewed.add_argument("--min-points", type=int, default=8)
+    p_fit_reviewed.add_argument("--fast", action="store_true", help="use the fast export path for large auto-segmented jobs")
+    p_fit_reviewed.add_argument("--max-fit-points", type=int, default=220)
+    p_fit_reviewed.add_argument("--diagnostic-preview", action="store_true", help="also write the heavy CV/comb diagnostic SVG")
 
     p_build = sub.add_parser(
         "build-training-set",
@@ -238,6 +241,9 @@ def _fit_reviewed(args: argparse.Namespace) -> int:
         args.out,
         degree=degree,
         min_points=args.min_points,
+        max_fit_points=args.max_fit_points,
+        diagnostic_preview=args.diagnostic_preview,
+        fast_mode=args.fast,
     )
     passed = sum(1 for report in result.reports if report.passed)
     print(f"AutoAlias fitted {len(result.curves)} manually reviewed curve(s) to {result.out}")

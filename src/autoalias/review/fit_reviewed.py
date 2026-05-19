@@ -47,6 +47,9 @@ def fit_reviewed_annotations(
     *,
     degree: int | str = "auto",
     min_points: int = 8,
+    max_fit_points: int | None = 220,
+    diagnostic_preview: bool = True,
+    fast_mode: bool = False,
 ) -> ReviewedFitResult:
     """Fit Alias-ready curves strictly from manually saved design-curve annotations.
 
@@ -85,6 +88,7 @@ def fit_reviewed_annotations(
                 try:
                     points = remove_duplicate_points(points, eps=0.5)
                     points = _ensure_minimum_fit_points(points)
+                    points = _limit_fit_points(points, max_fit_points)
                     if len(points) < min_points and segment["segment_count"] <= 1:
                         skipped += 1
                         continue
@@ -145,6 +149,7 @@ def fit_reviewed_annotations(
                 segments,
                 degree,
                 validator,
+                fast_mode=fast_mode,
             )
             for curve, candidate, report in fitted:
                 curves.append(curve)
@@ -154,16 +159,17 @@ def fit_reviewed_annotations(
     write_json_bundle(out_path / "reviewed_curves.json", curves, reports)
     if curves:
         write_iges(out_path / "reviewed_curves.igs", curves)
-        write_svg_preview(
-            out_path / "reviewed_preview.svg",
-            curves,
-            candidates=candidates,
-            background_image=background_image,
-            show_labels=True,
-            show_comb=True,
-            show_cvs=True,
-            show_candidates=True,
-        )
+        if diagnostic_preview:
+            write_svg_preview(
+                out_path / "reviewed_preview.svg",
+                curves,
+                candidates=candidates,
+                background_image=background_image,
+                show_labels=True,
+                show_comb=True,
+                show_cvs=True,
+                show_candidates=True,
+            )
         write_svg_preview(
             out_path / "reviewed_clean_preview.svg",
             curves,
@@ -353,6 +359,7 @@ def _fit_design_curve_chain(
     validator: ClassAValidator,
     *,
     allow_auto_merge: bool = False,
+    fast_mode: bool = False,
 ) -> list[tuple[NURBSCurve, CurveCandidate, QualityReport]]:
     """Fit one reviewed curve.
 
@@ -360,6 +367,15 @@ def _fit_design_curve_chain(
     exported IGES entities are still one-span Bezier/NURBS curves, but adjacent
     entities share the same endpoint, tangent and curvature vector at every split.
     """
+    if fast_mode:
+        return _fit_design_curve_chain_fast(
+            design_curve,
+            annotation_path,
+            design_index,
+            segments,
+            degree,
+            validator,
+        )
     if len(segments) <= 1:
         out: list[tuple[NURBSCurve, CurveCandidate, QualityReport]] = []
         for segment_index, segment in enumerate(segments, start=1):
@@ -517,6 +533,54 @@ def _fit_design_curve_chain(
             allow_auto_merge=False,
         )
     return out
+
+
+def _fit_design_curve_chain_fast(
+    design_curve: dict[str, Any],
+    annotation_path: Path,
+    design_index: int,
+    segments: list[dict[str, Any]],
+    degree: int | str,
+    validator: ClassAValidator,
+) -> list[tuple[NURBSCurve, CurveCandidate, QualityReport]]:
+    out: list[tuple[NURBSCurve, CurveCandidate, QualityReport]] = []
+    for segment_index, segment in enumerate(segments, start=1):
+        points = segment["points"]
+        label = _curve_label(
+            design_curve,
+            annotation_path,
+            design_index,
+            segment_index,
+            segment["segment_count"],
+        )
+        candidate = _make_candidate(label, points, annotation_path, design_curve)
+        selected_degree = int(degree) if isinstance(degree, int) else _fast_degree_for_points(points)
+        curve = SingleSpanFitter(FittingOptions(degree=selected_degree)).fit_candidate(candidate)
+        curve.source = "manual_review_fast_fit"
+        curve.metadata = _curve_metadata(
+            design_curve,
+            annotation_path,
+            segment,
+            points,
+            segment_index,
+            fit_policy="fast_single_pass_single_span_export",
+        )
+        curve.metadata["fast_mode"] = True
+        curve.metadata["fast_degree"] = selected_degree
+        out.append((curve, candidate, validator.validate(curve, points)))
+    return out
+
+
+def _fast_degree_for_points(points: np.ndarray) -> int:
+    simplicity = _target_curve_simplicity(points)
+    if bool(simplicity.get("simple")):
+        max_angle = float(simplicity.get("max_angle_deg", 0.0) or 0.0)
+        return 3 if max_angle < 9.0 else 4
+    sinuosity = float(simplicity.get("sinuosity", 1.0) or 1.0)
+    max_angle = float(simplicity.get("max_angle_deg", 0.0) or 0.0)
+    if sinuosity > 1.22 or max_angle > 95.0:
+        return 7
+    return 5
 
 
 def _make_candidate(
@@ -3744,6 +3808,18 @@ def _signed_three_point_curvature(a: np.ndarray, b: np.ndarray, c: np.ndarray) -
 def _curve_segments(curve: dict[str, Any]) -> list[dict[str, Any]]:
     manual = curve.get("manual_points") or curve.get("cut_points") or []
     route_segments = curve.get("route_segments") or []
+    source = str(curve.get("source") or "")
+    if source.startswith("geometry_auto_segment"):
+        points = _curve_points(curve)
+        if len(points) >= 2:
+            return [
+                {
+                    "points": points,
+                    "start_order": 0,
+                    "end_order": max(len(manual) - 1, 1),
+                    "segment_count": 1,
+                }
+            ]
     expected_count = max(0, len(manual) - 1)
     if curve.get("closed") and len(manual) >= 3:
         expected_count += 1
@@ -3822,6 +3898,19 @@ def _ensure_minimum_fit_points(points: np.ndarray) -> np.ndarray:
     if len(points) < 2:
         return points
     return _line_points((float(points[0, 0]), float(points[0, 1])), (float(points[-1, 0]), float(points[-1, 1])), count=8)
+
+
+def _limit_fit_points(points: np.ndarray, max_fit_points: int | None) -> np.ndarray:
+    if max_fit_points is None:
+        return points
+    limit = max(16, int(max_fit_points))
+    if len(points) <= limit:
+        return points
+    try:
+        return resample_polyline(points, limit)
+    except Exception:
+        idx = np.linspace(0, len(points) - 1, limit).round().astype(int)
+        return points[idx]
 
 
 def _line_points(a: tuple[float, float], b: tuple[float, float], count: int = 8) -> np.ndarray:

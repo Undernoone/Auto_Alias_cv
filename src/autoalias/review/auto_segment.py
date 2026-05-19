@@ -26,6 +26,8 @@ def suggest_geometry_segments(
     max_turn_deg: float = 28.0,
     max_junction_turn_deg: float = 18.0,
     max_chain_edges: int = 8,
+    max_gap: float = 0.0,
+    max_gap_turn_deg: float | None = None,
 ) -> list[dict[str, Any]]:
     """Suggest editable design curves directly from the skeleton graph.
 
@@ -47,6 +49,9 @@ def suggest_geometry_segments(
     max_curves = max(1, min(int(max_curves), 512))
     max_turn = math.radians(max(4.0, min(float(max_turn_deg), 70.0)))
     junction_turn = math.radians(max(3.0, min(float(max_junction_turn_deg), 45.0)))
+    gap_turn_deg = max_gap_turn_deg if max_gap_turn_deg is not None else max_turn_deg
+    gap_turn = math.radians(max(4.0, min(float(gap_turn_deg), 75.0)))
+    max_gap = max(0.0, float(max_gap))
 
     incident = _incident_edges(edges)
     sorted_edges = sorted(edges.values(), key=lambda e: e.length, reverse=True)
@@ -65,6 +70,8 @@ def suggest_geometry_segments(
             max_turn=max_turn,
             junction_turn=junction_turn,
             max_chain_edges=max_chain_edges,
+            max_gap=max_gap,
+            gap_turn=gap_turn,
         )
         combined = _combine_chain_points(chain)
         length = _curve_length(combined)
@@ -121,6 +128,8 @@ def _grow_chain(
     max_turn: float,
     junction_turn: float,
     max_chain_edges: int,
+    max_gap: float,
+    gap_turn: float,
 ) -> list[tuple[_GraphEdge, bool]]:
     chain: list[tuple[_GraphEdge, bool]] = [(seed, True)]
     local_used = {seed.id}
@@ -134,6 +143,8 @@ def _grow_chain(
         max_turn=max_turn,
         junction_turn=junction_turn,
         max_chain_edges=max_chain_edges,
+        max_gap=max_gap,
+        gap_turn=gap_turn,
     )
     chain = [(edge, not forward) for edge, forward in reversed(chain)]
     _extend_chain_end(
@@ -146,6 +157,8 @@ def _grow_chain(
         max_turn=max_turn,
         junction_turn=junction_turn,
         max_chain_edges=max_chain_edges,
+        max_gap=max_gap,
+        gap_turn=gap_turn,
     )
     return [(edge, not forward) for edge, forward in reversed(chain)]
 
@@ -161,6 +174,8 @@ def _extend_chain_end(
     max_turn: float,
     junction_turn: float,
     max_chain_edges: int,
+    max_gap: float,
+    gap_turn: float,
 ) -> None:
     while len(chain) < max_chain_edges:
         edge, forward = chain[-1]
@@ -170,28 +185,88 @@ def _extend_chain_end(
         current_tangent = _end_tangent(_oriented_points(edge, forward))
         node_degree = len(incident.get(node, []))
         turn_limit = junction_turn if node_degree >= 3 else max_turn
-        best: tuple[float, _GraphEdge, bool] | None = None
-        for candidate_id in incident.get(node, []):
-            if candidate_id in globally_used or candidate_id in local_used:
-                continue
-            candidate = edges.get(candidate_id)
-            if candidate is None or candidate.length < min_edge_length:
-                continue
-            candidate_forward = candidate.start_node == node
-            if not candidate_forward and candidate.end_node != node:
-                continue
-            candidate_points = _oriented_points(candidate, candidate_forward)
-            angle = _angle_between(current_tangent, _start_tangent(candidate_points))
-            if angle > turn_limit:
-                continue
-            score = angle + 0.002 * max(0.0, min_edge_length - candidate.length)
-            if best is None or score < best[0]:
-                best = (score, candidate, candidate_forward)
+        end_point = _oriented_points(edge, forward)[-1, :2]
+        best = _best_connected_continuation(
+            edges,
+            incident.get(node, []),
+            globally_used,
+            local_used,
+            current_tangent,
+            end_point,
+            min_edge_length=min_edge_length,
+            turn_limit=turn_limit,
+            max_gap=max_gap,
+            gap_turn=gap_turn,
+        )
         if best is None:
             return
         _score, next_edge, next_forward = best
         local_used.add(next_edge.id)
         chain.append((next_edge, next_forward))
+
+
+def _best_connected_continuation(
+    edges: dict[str, _GraphEdge],
+    incident_ids: list[str],
+    globally_used: set[str],
+    local_used: set[str],
+    current_tangent: np.ndarray,
+    end_point: np.ndarray,
+    *,
+    min_edge_length: float,
+    turn_limit: float,
+    max_gap: float,
+    gap_turn: float,
+) -> tuple[float, _GraphEdge, bool] | None:
+    best: tuple[float, _GraphEdge, bool] | None = None
+    for candidate_id in incident_ids:
+        if candidate_id in globally_used or candidate_id in local_used:
+            continue
+        candidate = edges.get(candidate_id)
+        if candidate is None or candidate.length < min_edge_length:
+            continue
+        # Infer the orientation from the endpoint nearest to the current chain end. This also
+        # works when endpoint clustering moved the node center a few pixels away.
+        start_gap = float(np.linalg.norm(candidate.points[0, :2] - end_point))
+        end_gap = float(np.linalg.norm(candidate.points[-1, :2] - end_point))
+        candidate_forward = start_gap <= end_gap
+        candidate_points = _oriented_points(candidate, candidate_forward)
+        angle = _angle_between(current_tangent, _start_tangent(candidate_points))
+        if angle > turn_limit:
+            continue
+        score = angle + 0.002 * max(0.0, min_edge_length - candidate.length)
+        if best is None or score < best[0]:
+            best = (score, candidate, candidate_forward)
+
+    if max_gap <= 0:
+        return best
+
+    for candidate in edges.values():
+        if candidate.id in globally_used or candidate.id in local_used:
+            continue
+        if candidate.length < min_edge_length:
+            continue
+        for candidate_forward in (True, False):
+            candidate_points = _oriented_points(candidate, candidate_forward)
+            candidate_start = candidate_points[0, :2]
+            gap = float(np.linalg.norm(candidate_start - end_point))
+            if gap <= 1e-6:
+                continue
+            if gap > max_gap:
+                continue
+            candidate_tangent = _start_tangent(candidate_points)
+            angle = _angle_between(current_tangent, candidate_tangent)
+            if angle > gap_turn:
+                continue
+            gap_vec = (candidate_start - end_point) / gap
+            if _angle_between(current_tangent, gap_vec) > gap_turn:
+                continue
+            if _angle_between(gap_vec, candidate_tangent) > gap_turn:
+                continue
+            score = angle + 0.65 * (gap / max(max_gap, 1.0))
+            if best is None or score < best[0]:
+                best = (score, candidate, candidate_forward)
+    return best
 
 
 def _make_design_curve(
