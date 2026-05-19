@@ -44,7 +44,7 @@ def suggest_geometry_segments(
         )
     )
     min_length = float(min_length if min_length is not None else max(24.0, diag * 0.032))
-    max_curves = max(1, min(int(max_curves), 96))
+    max_curves = max(1, min(int(max_curves), 512))
     max_turn = math.radians(max(4.0, min(float(max_turn_deg), 70.0)))
     junction_turn = math.radians(max(3.0, min(float(max_junction_turn_deg), 45.0)))
 
