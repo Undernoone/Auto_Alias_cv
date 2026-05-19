@@ -132,6 +132,12 @@ def _make_handler(
                     return
                 self._handle_snap(session)
                 return
+            if parsed.path == "/api/skeleton-edit":
+                session = self._require_session(parsed)
+                if session is None:
+                    return
+                self._handle_skeleton_edit(session)
+                return
             if parsed.path == "/api/ai-suggest-start":
                 session = self._require_session(parsed)
                 if session is None:
@@ -268,6 +274,14 @@ def _make_handler(
                         "distance": round(float(distance), 3),
                     }
                 )
+            except Exception as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+
+        def _handle_skeleton_edit(self, session: ReviewSession) -> None:
+            try:
+                payload = self._read_json()
+                result = _edit_session_skeleton(session, payload)
+                self._send_json(result)
             except Exception as exc:
                 self._send_json({"ok": False, "error": str(exc)}, status=400)
 
@@ -519,6 +533,149 @@ def _route_points_with_choices(
         "points": combined,
         "point_count": len(combined),
     }
+
+
+def _edit_session_skeleton(session: ReviewSession, payload: dict[str, Any]) -> dict[str, Any]:
+    action = str(payload.get("action") or "").strip().lower()
+    point = _coerce_xy(payload.get("point", payload))
+    if point is None:
+        raise ValueError("point must contain x and y")
+    if action == "add":
+        result = _add_skeleton_point(
+            session,
+            point,
+            connect_radius=float(payload.get("connect_radius", 24.0)),
+            link_index=payload.get("link_index", None),
+            link_radius=float(payload.get("link_radius", 96.0)),
+        )
+    elif action == "delete":
+        result = _delete_skeleton_point(
+            session,
+            point,
+            delete_radius=float(payload.get("delete_radius", 14.0)),
+        )
+    else:
+        raise ValueError("action must be add or delete")
+    _stamp_skeleton_edit_metadata(session)
+    result["full_skeleton_points"] = _downsample_xy(session.router.coords, 12000)
+    result["skeleton_pixels"] = int(len(session.router.coords))
+    return result
+
+
+def _add_skeleton_point(
+    session: ReviewSession,
+    point: tuple[float, float],
+    *,
+    connect_radius: float,
+    link_index: Any,
+    link_radius: float,
+) -> dict[str, Any]:
+    coords = np.asarray(session.router.coords, dtype=float)
+    adjacency = session.router.adjacency
+    p = np.asarray(point, dtype=float)
+    new_index = int(len(coords))
+    session.router.coords = np.vstack([coords, p]) if len(coords) else p.reshape(1, 2)
+    adjacency.append([])
+    connected: list[int] = []
+
+    def connect(a: int, b: int) -> None:
+        if a == b or a < 0 or b < 0 or a >= len(session.router.coords) or b >= len(session.router.coords):
+            return
+        dist = float(np.linalg.norm(session.router.coords[a] - session.router.coords[b]))
+        if all(other != b for other, _weight in adjacency[a]):
+            adjacency[a].append((b, dist))
+        if all(other != a for other, _weight in adjacency[b]):
+            adjacency[b].append((a, dist))
+        if b != new_index and b not in connected:
+            connected.append(b)
+        if a != new_index and a not in connected:
+            connected.append(a)
+
+    try:
+        link = int(link_index)
+    except Exception:
+        link = -1
+    if 0 <= link < new_index:
+        if float(np.linalg.norm(session.router.coords[link] - p)) <= max(link_radius, connect_radius):
+            connect(new_index, link)
+
+    if new_index > 0:
+        old = session.router.coords[:new_index]
+        distances = np.linalg.norm(old - p, axis=1)
+        order = np.argsort(distances)
+        for idx in order[:3]:
+            idx_i = int(idx)
+            if distances[idx_i] <= connect_radius and idx_i not in connected:
+                connect(new_index, idx_i)
+                break
+
+    return {
+        "ok": True,
+        "action": "add",
+        "index": new_index,
+        "x": round(float(p[0]), 3),
+        "y": round(float(p[1]), 3),
+        "connected": connected,
+        "connection_count": len(adjacency[new_index]),
+    }
+
+
+def _delete_skeleton_point(
+    session: ReviewSession,
+    point: tuple[float, float],
+    *,
+    delete_radius: float,
+) -> dict[str, Any]:
+    coords = np.asarray(session.router.coords, dtype=float)
+    if len(coords) == 0:
+        return {"ok": False, "action": "delete", "reason": "no skeleton pixels"}
+    p = np.asarray(point, dtype=float)
+    distances = np.linalg.norm(coords - p, axis=1)
+    index = int(np.argmin(distances))
+    distance = float(distances[index])
+    if distance > delete_radius:
+        return {
+            "ok": False,
+            "action": "delete",
+            "reason": "nearest skeleton point is outside delete radius",
+            "distance": round(distance, 3),
+            "delete_radius": round(float(delete_radius), 3),
+        }
+
+    keep = np.ones(len(coords), dtype=bool)
+    keep[index] = False
+    mapping = np.full(len(coords), -1, dtype=int)
+    mapping[np.where(keep)[0]] = np.arange(int(np.sum(keep)))
+    old_adjacency = session.router.adjacency
+    new_coords = coords[keep]
+    new_adjacency: list[list[tuple[int, float]]] = [[] for _ in range(len(new_coords))]
+    for old_i, neighbors in enumerate(old_adjacency):
+        new_i = int(mapping[old_i])
+        if new_i < 0:
+            continue
+        for old_j, weight in neighbors:
+            new_j = int(mapping[old_j]) if 0 <= old_j < len(mapping) else -1
+            if new_j < 0 or new_i == new_j:
+                continue
+            if all(other != new_j for other, _weight in new_adjacency[new_i]):
+                new_adjacency[new_i].append((new_j, float(weight)))
+    session.router.coords = new_coords
+    session.router.adjacency = new_adjacency
+    return {
+        "ok": True,
+        "action": "delete",
+        "deleted_index": index,
+        "distance": round(distance, 3),
+    }
+
+
+def _stamp_skeleton_edit_metadata(session: ReviewSession) -> None:
+    graph = session.graph
+    edits = int(graph.get("manual_skeleton_edit_count", 0) or 0) + 1
+    graph["manual_skeleton_edit_count"] = edits
+    coverage = dict(graph.get("coverage") or {})
+    coverage["skeleton_pixels"] = int(len(session.router.coords))
+    graph["coverage"] = coverage
 
 
 def _ai_suggest_curves(
@@ -1095,6 +1252,22 @@ a { color:#075fd7; }
       <div class="box" id="branchBox" style="margin-top:8px">暂无分支候选</div>
       <div class="box" id="qualityBox" style="margin-top:8px">暂无拟合质量</div>
 
+      <h2>骨架修补</h2>
+      <div class="grid2">
+        <button id="btnSkeletonEdit">骨架编辑 OFF</button>
+        <select id="skeletonEditTool">
+          <option value="add" selected>添加骨架点</option>
+          <option value="delete">删除骨架点</option>
+        </select>
+        <select id="skeletonEditRadius">
+          <option value="12">半径 12px</option>
+          <option value="24" selected>半径 24px</option>
+          <option value="48">半径 48px</option>
+          <option value="96">半径 96px</option>
+        </select>
+        <button id="btnSkeletonChainBreak">断开连续添加</button>
+      </div>
+
       <h2>AI 辅助分线</h2>
       <div class="stack">
         <button class="good" id="btnAutoSegment">几何自动分段</button>
@@ -1114,6 +1287,7 @@ a { color:#075fd7; }
         <button class="primary" id="btnFullSkeleton">隐藏完整骨架</button>
         <button class="primary" id="btnSkeleton">隐藏切段骨架</button>
         <button class="primary" id="btnCvPreview">隐藏CV预览</button>
+        <button class="good" id="btnPerformanceMode">性能模式 ON</button>
         <button id="btnG2Edit">G2 Edit OFF</button>
         <button id="btnReset">重置视图</button>
       </div>
@@ -1143,6 +1317,10 @@ a { color:#075fd7; }
 const canvas = document.getElementById("canvas");
 const ctx = canvas.getContext("2d");
 const img = new Image();
+const WORLD_CACHE_MAX_PIXELS = 22000000;
+let renderQueued = false;
+let staticLayers = { fullSkeleton: null, skeleton: null, designCurves: null };
+let savedAnchorCache = null;
 let sid = "";
 let state = null;
 let graph = null;
@@ -1160,9 +1338,14 @@ let closedCurve = false;
 let activeCurve = null;
 let showImage = true;
 let showSkeleton = true;
-let showFullSkeleton = true;
+let showFullSkeleton = false;
 let showAliasPreview = true;
-let showCvPreview = true;
+let showCvPreview = false;
+let performanceMode = true;
+let lightRenderUntil = 0;
+let fullRenderTimer = null;
+let skeletonEditMode = false;
+let lastSkeletonEditIndex = null;
 let g2EditMode = false;
 const G2_CONSTRAINTS_ENABLED = false;
 let selectedCv = null;
@@ -1229,6 +1412,7 @@ function loadState(data) {
   state = data;
   graph = state.graph;
   designCurves = state.design_curves || [];
+  invalidateStaticLayers();
   document.getElementById("uploadBox").classList.add("hidden");
   document.getElementById("workBox").classList.remove("hidden");
   document.getElementById("edgeCount").textContent = graph.edges.length;
@@ -1242,7 +1426,7 @@ function loadState(data) {
 
 function resize() {
   const rect = canvas.parentElement.getBoundingClientRect();
-  const ratio = window.devicePixelRatio || 1;
+  const ratio = performanceMode ? 1 : (window.devicePixelRatio || 1);
   canvas.width = Math.max(320, Math.floor(rect.width * ratio));
   canvas.height = Math.max(320, Math.floor(rect.height * ratio));
   canvas.style.width = rect.width + "px";
@@ -1262,6 +1446,114 @@ function resetView() {
 
 function worldToScreen(p) { return [p[0] * transform.scale + transform.x, p[1] * transform.scale + transform.y]; }
 function screenToWorld(x, y) { return [(x - transform.x) / transform.scale, (y - transform.y) / transform.scale]; }
+
+function requestRender() {
+  if (renderQueued) return;
+  renderQueued = true;
+  window.requestAnimationFrame(() => {
+    renderQueued = false;
+    render();
+  });
+}
+
+function isLightRender() {
+  if (!performanceMode) return false;
+  return pointDraggingIndex != null || cvDragging != null || dragging || Date.now() < lightRenderUntil;
+}
+
+function markLightInteraction(ms=180) {
+  if (!performanceMode) {
+    requestRender();
+    return;
+  }
+  lightRenderUntil = Math.max(lightRenderUntil, Date.now() + ms);
+  requestRender();
+  if (fullRenderTimer) clearTimeout(fullRenderTimer);
+  fullRenderTimer = setTimeout(() => {
+    lightRenderUntil = 0;
+    fullRenderTimer = null;
+    render();
+  }, ms + 45);
+}
+
+function invalidateStaticLayers() {
+  staticLayers = { fullSkeleton: null, skeleton: null, designCurves: null };
+  savedAnchorCache = null;
+}
+
+function invalidateDesignLayer() {
+  staticLayers.designCurves = null;
+  savedAnchorCache = null;
+}
+
+function canUseWorldCache() {
+  if (!img.width || !img.height) return false;
+  return img.width * img.height <= WORLD_CACHE_MAX_PIXELS;
+}
+
+function makeWorldLayer(drawFn) {
+  if (!canUseWorldCache()) return null;
+  const layer = document.createElement("canvas");
+  layer.width = Math.max(1, Math.floor(img.width));
+  layer.height = Math.max(1, Math.floor(img.height));
+  const layerCtx = layer.getContext("2d");
+  drawFn(layerCtx);
+  return layer;
+}
+
+function drawCachedFullSkeleton(layerCtx) {
+  const pts = graph && graph.full_skeleton_points ? graph.full_skeleton_points : [];
+  if (!pts.length) return;
+  layerCtx.save();
+  layerCtx.fillStyle = "rgba(220,0,0,.70)";
+  const r = 0.82;
+  for (const p of pts) layerCtx.fillRect(p[0] - r, p[1] - r, r * 2, r * 2);
+  layerCtx.restore();
+}
+
+function drawCachedSkeleton(layerCtx) {
+  if (!graph || !graph.edges) return;
+  layerCtx.save();
+  layerCtx.lineCap = "round";
+  layerCtx.lineJoin = "round";
+  layerCtx.strokeStyle = "rgba(0,140,115,.45)";
+  layerCtx.lineWidth = 1.15;
+  for (const edge of graph.edges) {
+    const pts = edge.points || [];
+    if (pts.length < 2) continue;
+    layerCtx.beginPath();
+    layerCtx.moveTo(pts[0][0], pts[0][1]);
+    for (let i = 1; i < pts.length; i++) layerCtx.lineTo(pts[i][0], pts[i][1]);
+    layerCtx.stroke();
+  }
+  layerCtx.restore();
+}
+
+function drawCachedDesignCurves(layerCtx) {
+  if (!designCurves || !designCurves.length) return;
+  layerCtx.save();
+  layerCtx.lineCap = "round";
+  layerCtx.lineJoin = "round";
+  layerCtx.strokeStyle = "rgba(11,109,255,.95)";
+  layerCtx.lineWidth = 2.15;
+  for (const curve of designCurves) {
+    const points = curve.routed_points || [];
+    if (!points || points.length < 2) continue;
+    layerCtx.beginPath();
+    layerCtx.moveTo(points[0][0], points[0][1]);
+    for (let i = 1; i < points.length; i++) layerCtx.lineTo(points[i][0], points[i][1]);
+    layerCtx.stroke();
+  }
+  layerCtx.restore();
+}
+
+function getStaticLayer(name) {
+  if (staticLayers[name]) return staticLayers[name];
+  if (name === "fullSkeleton") staticLayers[name] = makeWorldLayer(drawCachedFullSkeleton);
+  if (name === "skeleton") staticLayers[name] = makeWorldLayer(drawCachedSkeleton);
+  if (name === "designCurves") staticLayers[name] = makeWorldLayer(drawCachedDesignCurves);
+  return staticLayers[name];
+}
 
 function v2(p) { return [Number(p[0] || 0), Number(p[1] || 0), Number(p[2] || 0)]; }
 function vAdd(a, b) { return [a[0] + b[0], a[1] + b[1], (a[2] || 0) + (b[2] || 0)]; }
@@ -1327,6 +1619,7 @@ function refreshEditableSamples() {
 
 function render() {
   const rect = canvas.getBoundingClientRect();
+  const light = isLightRender();
   ctx.clearRect(0, 0, rect.width, rect.height);
   ctx.fillStyle = "#fff";
   ctx.fillRect(0, 0, rect.width, rect.height);
@@ -1334,15 +1627,27 @@ function render() {
   ctx.save();
   ctx.translate(transform.x, transform.y);
   ctx.scale(transform.scale, transform.scale);
-  if (showImage) ctx.drawImage(img, 0, 0);
-  if (showFullSkeleton) drawFullSkeleton();
-  if (showSkeleton) drawSkeleton();
-  drawBranchAlternatives();
-  for (const curve of designCurves) drawPolyline(curve.routed_points || [], "#0b6dff", 2.4, 0.95);
-  drawSavedAnchorPoints();
+  if (showImage && !light) ctx.drawImage(img, 0, 0);
+  if (showFullSkeleton && !light) {
+    const layer = getStaticLayer("fullSkeleton");
+    if (layer) ctx.drawImage(layer, 0, 0);
+    else drawFullSkeleton();
+  }
+  if (showSkeleton && !light) {
+    const layer = getStaticLayer("skeleton");
+    if (layer) ctx.drawImage(layer, 0, 0);
+    else drawSkeleton();
+  }
+  if (!light) drawBranchAlternatives();
+  if (!light) {
+    const designLayer = getStaticLayer("designCurves");
+    if (designLayer) ctx.drawImage(designLayer, 0, 0);
+    else for (const curve of designCurves) drawPolyline(curve.routed_points || [], "#0b6dff", 2.4, 0.95);
+  }
+  if (!light) drawSavedAnchorPoints();
   if (routePreview && routePreview.points) drawPolyline(routePreview.points, "#006dff", 3.2, 1);
-  if (showAliasPreview) drawFitPreview();
-  drawCutPoints();
+  if (showAliasPreview) drawFitPreview(light);
+  drawCutPoints(light);
   ctx.restore();
 }
 
@@ -1393,6 +1698,9 @@ function drawPolyline(points, color, width, alpha) {
 }
 
 function savedAnchorPoints() {
+  if (savedAnchorCache && savedAnchorCache.activeCurve === activeCurve) {
+    return savedAnchorCache.anchors;
+  }
   const anchors = [];
   for (const curve of designCurves) {
     if (!curve || curve.id === activeCurve) continue;
@@ -1412,6 +1720,7 @@ function savedAnchorPoints() {
       });
     }
   }
+  savedAnchorCache = { activeCurve, anchors };
   return anchors;
 }
 
@@ -1481,16 +1790,18 @@ function drawBranchAlternatives() {
   ctx.restore();
 }
 
-function drawFitPreview() {
+function drawFitPreview(light=false) {
   const preview = activeFitPreview();
   if (!preview || !preview.segments) return;
+  const liveDrag = light || pointDraggingIndex != null || cvDragging != null || dragging;
+  const sampleSteps = liveDrag ? 48 : 120;
   for (let segIndex = 0; segIndex < preview.segments.length; segIndex++) {
     const seg = preview.segments[segIndex];
     if (!seg || !seg.ok) continue;
-    const samples = editableFitPreview && seg.cvs ? sampleBezier(seg.cvs, 120) : seg.samples;
+    const samples = editableFitPreview && seg.cvs ? sampleBezier(seg.cvs, sampleSteps) : seg.samples;
     if (!samples || !samples.length) continue;
     drawPolyline(samples, seg.color || "#14a05a", 4.0, 0.95);
-    if (showCvPreview) drawCvPreview(seg, segIndex);
+    if (showCvPreview && !light) drawCvPreview(seg, segIndex);
   }
 }
 
@@ -1535,7 +1846,7 @@ function drawCvPreview(seg, segIndex) {
   ctx.restore();
 }
 
-function drawCutPoints() {
+function drawCutPoints(light=false) {
   ctx.save();
   for (let i = 0; i < cutPoints.length; i++) {
     const p = cutPoints[i];
@@ -1546,6 +1857,7 @@ function drawCutPoints() {
     ctx.arc(p.x, p.y, Math.max(7 / transform.scale, 3.5), 0, Math.PI * 2);
     ctx.fill();
     ctx.stroke();
+    if (light && i !== selectedCutIndex) continue;
     ctx.fillStyle = "#1f2423";
     ctx.font = `${Math.max(13 / transform.scale, 7)}px sans-serif`;
     ctx.fillText(String(i + 1), p.x + Math.max(9 / transform.scale, 5), p.y - Math.max(8 / transform.scale, 4));
@@ -1816,31 +2128,135 @@ async function snapPoint(wx, wy) {
   return result;
 }
 
-async function moveDraggedPoint(index, wx, wy) {
-  const requestId = ++snapRequestId;
-  let snapped;
+async function editSkeletonAt(wx, wy) {
+  const tool = document.getElementById("skeletonEditTool").value || "add";
+  const radius = parseFloat(document.getElementById("skeletonEditRadius").value || "24");
+  const payload = {
+    action: tool,
+    point: { x: wx, y: wy },
+    connect_radius: radius,
+    delete_radius: radius,
+    link_radius: Math.max(radius * 2, 96),
+    link_index: lastSkeletonEditIndex
+  };
   try {
-    snapped = await snapPoint(wx, wy);
-  } catch (_err) {
-    return;
+    const res = await fetch(api("/api/skeleton-edit"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    const result = await res.json();
+    if (!result.ok) {
+      setStatus(result.reason || result.error || "骨架编辑失败");
+      return;
+    }
+    graph.full_skeleton_points = result.full_skeleton_points || graph.full_skeleton_points || [];
+    graph.coverage = graph.coverage || {};
+    graph.coverage.skeleton_pixels = result.skeleton_pixels || graph.coverage.skeleton_pixels || 0;
+    invalidateStaticLayers();
+    if (tool === "add") {
+      lastSkeletonEditIndex = result.index;
+      setStatus(`已添加骨架点 ${result.index}，连接 ${result.connection_count || 0} 条`);
+    } else {
+      lastSkeletonEditIndex = null;
+      setStatus(`已删除骨架点 ${result.deleted_index}`);
+    }
+    if (cutPoints.length >= 2) await refreshRoutePreview();
+    updatePanel();
+    render();
+  } catch (err) {
+    setStatus("骨架编辑失败：" + (err && err.message ? err.message : String(err)));
   }
-  if (requestId !== snapRequestId || pointDraggingIndex !== index || !cutPoints[index]) return;
-  cutPoints[index].x = round3(snapped.x);
-  cutPoints[index].y = round3(snapped.y);
-  cutPoints[index].snap_distance = snapped.distance;
-  cutPoints[index].snap_source = snapped.source || "skeleton";
-  cutPoints[index].anchor_curve_id = snapped.anchor_curve_id || "";
-  cutPoints[index].anchor_point_order = snapped.anchor_point_order;
-  cutPoints[index].anchor_semantic = snapped.anchor_semantic || "";
+}
+
+function moveDraggedPoint(index, wx, wy) {
+  if (!cutPoints[index]) return;
+  cutPoints[index].x = round3(wx);
+  cutPoints[index].y = round3(wy);
+  cutPoints[index].snap_distance = null;
+  cutPoints[index].snap_source = "free_drag_pending";
+  cutPoints[index].anchor_curve_id = "";
+  cutPoints[index].anchor_point_order = null;
+  cutPoints[index].anchor_semantic = "";
   selectedCutIndex = index;
   pointDragMoved = true;
   aliasOverrideDirty = true;
   routePreview = null;
   fitPreview = null;
   clearEditableFitPreview();
-  routeStatus = "正在拖动分线点，松开后重新生成蓝线";
-  updatePanel();
-  render();
+  routeStatus = "正在自由拖动分段点，松开后会自动吸附到骨架";
+  markLightInteraction(120);
+}
+
+async function snapDraggedPointToSkeleton(index) {
+  if (!cutPoints[index]) return false;
+  const p = cutPoints[index];
+  const requestId = ++snapRequestId;
+  try {
+    const snapped = await snapPoint(p.x, p.y);
+    if (requestId !== snapRequestId || !cutPoints[index]) return false;
+    cutPoints[index].x = round3(snapped.x);
+    cutPoints[index].y = round3(snapped.y);
+    cutPoints[index].snap_distance = snapped.distance;
+    cutPoints[index].snap_source = snapped.source || "skeleton";
+    cutPoints[index].anchor_curve_id = snapped.anchor_curve_id || "";
+    cutPoints[index].anchor_point_order = snapped.anchor_point_order;
+    cutPoints[index].anchor_semantic = snapped.anchor_semantic || "";
+    selectedCutIndex = index;
+    setStatus(snapped.source === "saved_curve_anchor" ? "分段点已吸附到已保存曲线点" : "分段点已吸附到骨架");
+    return true;
+  } catch (_err) {
+    setStatus("附近没有可吸附骨架点，保留当前位置。可以调大吸附半径再拖动。");
+    return false;
+  }
+}
+
+function cutPointMergeRadius() {
+  return Math.max(14 / Math.max(transform.scale, 1e-6), 5);
+}
+
+function findMergeTarget(index) {
+  if (index == null || !cutPoints[index]) return null;
+  const p = cutPoints[index];
+  const threshold = cutPointMergeRadius();
+  let best = null;
+  for (let i = 0; i < cutPoints.length; i++) {
+    if (i === index) continue;
+    const q = cutPoints[i];
+    const d = Math.hypot(p.x - q.x, p.y - q.y);
+    if (d <= threshold && (!best || d < best.distance)) {
+      best = { index: i, distance: d };
+    }
+  }
+  return best;
+}
+
+function reindexCutPoints() {
+  for (let i = 0; i < cutPoints.length; i++) cutPoints[i].order = i;
+}
+
+function maybeMergeDraggedCutPoint(index) {
+  const target = findMergeTarget(index);
+  if (!target) return false;
+  const fromLabel = index + 1;
+  const targetLabel = target.index + 1;
+  const ok = window.confirm(
+    `分段点 ${fromLabel} 已靠近分段点 ${targetLabel}，是否合并？\n\n确认后会删除分段点 ${fromLabel}，后面的分段点会自动重新编号。`
+  );
+  if (!ok) return false;
+  cutPoints.splice(index, 1);
+  reindexCutPoints();
+  selectedCutIndex = index < target.index ? target.index - 1 : target.index;
+  if (selectedCutIndex >= cutPoints.length) selectedCutIndex = cutPoints.length - 1;
+  if (selectedCutIndex < 0) selectedCutIndex = null;
+  if (cutPoints.length < 3) closedCurve = false;
+  branchChoices = [];
+  aliasOverrideDirty = true;
+  routePreview = null;
+  fitPreview = null;
+  clearEditableFitPreview();
+  setStatus(`已合并分段点 ${fromLabel} 到 ${targetLabel}，分段点已重新编号。`);
+  return true;
 }
 
 async function refreshRoutePreview() {
@@ -1945,6 +2361,7 @@ async function runAutoSegment() {
     }
     const curves = result.curves || [];
     for (const curve of curves) designCurves.push(curve);
+    invalidateDesignLayer();
     await saveAll();
     box.textContent = `几何自动分段已生成 ${curves.length} 条候选曲线，已经加入曲线列表。你可以逐条点击检查、删除或再手动修正。`;
     activeCurve = null;
@@ -2028,6 +2445,7 @@ async function pollAiSuggestJob(jobId, requestId, startedAt) {
       return;
     }
     for (const curve of curves) designCurves.push(curve);
+    invalidateDesignLayer();
     await saveAll();
     setAiProgress(100, `AI 已生成 ${curves.length} 条候选曲线，已经加入下面的曲线列表。`, startedAt);
     const box = document.getElementById("aiBox");
@@ -2081,6 +2499,7 @@ async function saveCurrent(startNext=false) {
   const idx = designCurves.findIndex(c => c.id === item.id);
   if (idx >= 0) designCurves[idx] = item;
   else designCurves.push(item);
+  invalidateDesignLayer();
   activeCurve = item.id;
   await saveAll();
   aliasOverrideDirty = false;
@@ -2136,6 +2555,7 @@ function clearCurrent() {
   branchChoices = [];
   closedCurve = false;
   activeCurve = null;
+  savedAnchorCache = null;
   aliasOverrideDirty = false;
   updatePanel();
   render();
@@ -2192,6 +2612,7 @@ function renderCurveList() {
     item.append(head);
     item.onclick = () => {
       activeCurve = curve.id;
+      savedAnchorCache = null;
       cutPoints = (curve.manual_points || curve.cut_points || []).map(p => ({ ...p }));
       closedCurve = !!curve.closed;
       branchChoices = (curve.branch_choices || []).slice();
@@ -2221,6 +2642,7 @@ async function deleteSavedCurve(curveId) {
   const label = `${curve.semantic || "manual_design_curve"} / ${(curve.manual_points || []).length} 个分段点`;
   if (!confirm("删除这条已保存曲线？\n" + label)) return;
   designCurves = designCurves.filter(c => c.id !== curveId);
+  invalidateDesignLayer();
   if (activeCurve === curveId) clearCurrent();
   await saveAll();
   updatePanel();
@@ -2245,6 +2667,10 @@ function updatePanel() {
   document.getElementById("btnAliasPreview").textContent = showAliasPreview ? "隐藏拟合预览" : "显示拟合预览";
   document.getElementById("btnCvPreview").classList.toggle("primary", showCvPreview);
   document.getElementById("btnCvPreview").textContent = showCvPreview ? "隐藏CV预览" : "显示CV预览";
+  document.getElementById("btnPerformanceMode").classList.toggle("good", performanceMode);
+  document.getElementById("btnPerformanceMode").textContent = performanceMode ? "性能模式 ON" : "性能模式 OFF";
+  document.getElementById("btnSkeletonEdit").classList.toggle("primary", skeletonEditMode);
+  document.getElementById("btnSkeletonEdit").textContent = skeletonEditMode ? "骨架编辑 ON" : "骨架编辑 OFF";
   document.getElementById("btnG2Edit").classList.toggle("primary", G2_CONSTRAINTS_ENABLED && g2EditMode);
   document.getElementById("btnG2Edit").disabled = !G2_CONSTRAINTS_ENABLED;
   document.getElementById("btnG2Edit").textContent = G2_CONSTRAINTS_ENABLED ? (g2EditMode ? "G2 Edit ON" : "G2 Edit OFF") : "G2 Disabled";
@@ -2310,7 +2736,7 @@ function renderQualityPreview() {
 function makeId() { return "curve_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 7); }
 
 canvas.addEventListener("mousedown", e => {
-  if (graph && e.button === 0 && !e.altKey) {
+  if (graph && e.button === 0 && !e.altKey && !skeletonEditMode) {
     const rect = canvas.getBoundingClientRect();
     const [wx, wy] = screenToWorld(e.clientX - rect.left, e.clientY - rect.top);
     if (g2EditMode && ensureEditableFitPreview()) {
@@ -2354,7 +2780,7 @@ canvas.addEventListener("mousemove", e => {
       cvDragMoved = true;
       suppressNextClick = true;
       applyG2ConstraintFromCv(cvDragging.segIndex, cvDragging.cvIndex);
-      render();
+      markLightInteraction(120);
     }
     e.preventDefault();
     return;
@@ -2371,9 +2797,9 @@ canvas.addEventListener("mousemove", e => {
   transform.x += e.clientX - lastMouse[0];
   transform.y += e.clientY - lastMouse[1];
   lastMouse = [e.clientX, e.clientY];
-  render();
+  markLightInteraction(120);
 });
-window.addEventListener("mouseup", () => {
+window.addEventListener("mouseup", async () => {
   if (cvDragging != null) {
     if (cvDragMoved) {
       suppressNextClick = true;
@@ -2385,9 +2811,12 @@ window.addEventListener("mouseup", () => {
   }
   if (pointDraggingIndex != null) {
     const needsRoute = pointDragMoved;
+    const draggedIndex = pointDraggingIndex;
+    if (needsRoute) await snapDraggedPointToSkeleton(draggedIndex);
+    const merged = needsRoute ? maybeMergeDraggedCutPoint(draggedIndex) : false;
     pointDraggingIndex = null;
     pointDragMoved = false;
-    if (needsRoute) {
+    if (needsRoute || merged) {
       suppressNextClick = true;
       refreshRoutePreview();
     }
@@ -2403,6 +2832,10 @@ canvas.addEventListener("click", e => {
   if (!graph || e.altKey) return;
   const rect = canvas.getBoundingClientRect();
   const [wx, wy] = screenToWorld(e.clientX - rect.left, e.clientY - rect.top);
+  if (skeletonEditMode) {
+    editSkeletonAt(wx, wy);
+    return;
+  }
   if (g2EditMode && ensureEditableFitPreview()) {
     const cvHit = pickCv(wx, wy);
     if (cvHit) {
@@ -2429,7 +2862,7 @@ canvas.addEventListener("wheel", e => {
   transform.scale = Math.max(0.05, Math.min(30, transform.scale * (e.deltaY < 0 ? 1.12 : 0.89)));
   transform.x = sx - before[0] * transform.scale;
   transform.y = sy - before[1] * transform.scale;
-  render();
+  markLightInteraction(180);
 }, { passive:false });
 window.addEventListener("resize", () => { resize(); render(); });
 window.addEventListener("keydown", e => {
@@ -2449,6 +2882,30 @@ document.getElementById("btnSkeleton").onclick = () => { showSkeleton = !showSke
 document.getElementById("btnFullSkeleton").onclick = () => { showFullSkeleton = !showFullSkeleton; updatePanel(); render(); };
 document.getElementById("btnAliasPreview").onclick = () => { showAliasPreview = !showAliasPreview; updatePanel(); render(); };
 document.getElementById("btnCvPreview").onclick = () => { showCvPreview = !showCvPreview; updatePanel(); render(); };
+document.getElementById("btnPerformanceMode").onclick = () => {
+  performanceMode = !performanceMode;
+  lightRenderUntil = 0;
+  if (fullRenderTimer) {
+    clearTimeout(fullRenderTimer);
+    fullRenderTimer = null;
+  }
+  setStatus(performanceMode ? "性能模式 ON：拖动、平移、缩放时会临时隐藏重图层，松手后恢复。" : "性能模式 OFF：始终完整渲染所有可见图层。");
+  resize();
+  updatePanel();
+  render();
+};
+document.getElementById("btnSkeletonEdit").onclick = () => {
+  skeletonEditMode = !skeletonEditMode;
+  lastSkeletonEditIndex = null;
+  if (skeletonEditMode) setStatus("骨架编辑 ON：选择添加或删除，然后在画布上点击红色骨架区域。");
+  else setStatus("骨架编辑 OFF");
+  updatePanel();
+  render();
+};
+document.getElementById("btnSkeletonChainBreak").onclick = () => {
+  lastSkeletonEditIndex = null;
+  setStatus("已断开连续添加，下一次新增骨架点只会找最近骨架连接。");
+};
 document.getElementById("btnG2Edit").onclick = toggleG2Edit;
 document.getElementById("degree").onchange = () => { refreshFitPreview().then(() => { updatePanel(); render(); }); };
 document.getElementById("btnAutoSegment").onclick = runAutoSegment;

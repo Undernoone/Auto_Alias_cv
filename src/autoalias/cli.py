@@ -22,6 +22,8 @@ def main(argv: list[str] | None = None) -> int:
         return _review_image(args)
     if args.command == "skeleton-review":
         return _skeleton_review(args)
+    if args.command == "desktop-review":
+        return _desktop_review(args)
     if args.command == "fit-reviewed":
         return _fit_reviewed(args)
     if args.command == "build-training-set":
@@ -68,6 +70,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_skeleton_review.add_argument("--host", default="0.0.0.0")
     p_skeleton_review.add_argument("--port", type=int, default=8765)
     p_skeleton_review.add_argument("--no-browser", action="store_true")
+
+    p_desktop = sub.add_parser(
+        "desktop-review",
+        help="open the PySide6 desktop GUI for skeleton splitting and IGES export",
+    )
+    p_desktop.add_argument("image", nargs="?", type=Path)
+    p_desktop.add_argument("--out", type=Path, default=Path("lan_reviews"))
 
     p_fit_reviewed = sub.add_parser(
         "fit-reviewed",
@@ -208,6 +217,16 @@ def _skeleton_review(args: argparse.Namespace) -> int:
         open_browser=not args.no_browser,
     )
     return 0
+
+
+def _desktop_review(args: argparse.Namespace) -> int:
+    from autoalias.gui.desktop_editor import main as gui_main
+
+    argv: list[str] = []
+    if args.image:
+        argv.append(str(args.image))
+    argv.extend(["--out", str(args.out)])
+    return gui_main(argv)
 
 
 def _fit_reviewed(args: argparse.Namespace) -> int:

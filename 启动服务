@@ -1,0 +1,1 @@
+$env:AUTOALIAS_PYTHON="F:\ComfyUI\.venv\Scripts\python.exe"; F:\430AutoAlias\scripts\autoalias.cmd skeleton-review --out F:\430AutoAlias\lan_reviews --host 0.0.0.0 --port 8780 --no-browser
