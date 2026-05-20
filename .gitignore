@@ -1,3 +1,5 @@
 /out_cmd/
 out*
 /lan_reviews
+test*
+# 添加忽略png
