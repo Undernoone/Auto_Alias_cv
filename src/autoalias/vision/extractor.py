@@ -304,6 +304,58 @@ def _line_art_ink(image: np.ndarray) -> tuple[np.ndarray, np.ndarray, str]:
     return gray, ink, "black_on_white_line_art"
 
 
+def _pencil_weak_line_ink(gray: np.ndarray, weak_threshold: float = 32.0) -> np.ndarray:
+    """Recover low-contrast pencil strokes before skeletonization.
+
+    ``weak_threshold`` is expressed on a normalized 0-255 local stroke-strength image:
+    lower values keep lighter strokes, higher values reject more noise.
+    """
+    cv2 = _require_cv2()
+    threshold = float(np.clip(weak_threshold, 5.0, 95.0))
+    src = np.asarray(gray, dtype=np.uint8)
+    blurred = cv2.GaussianBlur(src, (3, 3), 0)
+    background = cv2.GaussianBlur(blurred.astype(np.float32), (0, 0), sigmaX=15.0)
+
+    # Auto polarity: bright paper with dark pencil, or dark ControlNet map with bright lines.
+    dark_on_light = float(np.median(src)) >= 128.0
+    if dark_on_light:
+        local = np.maximum(background - blurred.astype(np.float32), 0.0)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17))
+        ridge = cv2.morphologyEx(blurred, cv2.MORPH_BLACKHAT, kernel).astype(np.float32)
+    else:
+        local = np.maximum(blurred.astype(np.float32) - background, 0.0)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17))
+        ridge = cv2.morphologyEx(blurred, cv2.MORPH_TOPHAT, kernel).astype(np.float32)
+
+    strength = np.maximum(local, ridge)
+    scale = float(np.percentile(strength, 99.6))
+    if scale <= 1e-6:
+        scale = float(np.max(strength))
+    if scale <= 1e-6:
+        return np.zeros_like(src, dtype=np.uint8)
+    normalized = np.clip(strength * (255.0 / scale), 0.0, 255.0).astype(np.uint8)
+
+    weak = (normalized >= threshold).astype(np.uint8)
+    strong_threshold = min(145.0, max(threshold + 18.0, threshold * 1.55))
+    strong = (normalized >= strong_threshold).astype(np.uint8)
+
+    marker = strong.copy()
+    grow_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    for _ in range(28):
+        grown = cv2.dilate(marker, grow_kernel, iterations=1)
+        grown = cv2.bitwise_and(grown, weak)
+        if np.array_equal(grown, marker):
+            break
+        marker = grown
+    if int(np.count_nonzero(marker)) < max(12, int(np.count_nonzero(weak) * 0.08)):
+        marker = weak
+
+    close = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    mask = cv2.morphologyEx(marker * 255, cv2.MORPH_CLOSE, close, iterations=1)
+    mask = _remove_tiny_ink_components((mask > 0).astype(np.uint8), min_area=2, min_extent=2)
+    return mask * 255
+
+
 def _white_on_black_sketch_ink(gray: np.ndarray) -> np.ndarray:
     """Extract sparse bright sketch strokes without eroding one-pixel design lines."""
     cv2 = _require_cv2()

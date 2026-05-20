@@ -185,12 +185,14 @@ def _make_handler(
             try:
                 extraction_mode = self.headers.get("X-Extraction-Mode", "auto")
                 parallel_collapse = self.headers.get("X-Parallel-Collapse", "off")
+                weak_line_threshold = float(self.headers.get("X-Weak-Line-Threshold", "32") or 32)
                 session = ReviewSession.create(
                     target,
                     output_dir,
                     ReviewGraphOptions(
                         extraction_mode=_clean_extraction_mode(extraction_mode),
                         parallel_collapse=_clean_parallel_collapse(parallel_collapse),
+                        weak_line_threshold=weak_line_threshold,
                     ),
                 )
             except Exception as exc:
@@ -1095,6 +1097,7 @@ def _clean_extraction_mode(value: str) -> str:
         "auto",
         "white_on_black_sketch",
         "black_on_white_line_art",
+        "pencil_weak_line_art",
         "canny_edges",
     }
     return value if value in allowed else "auto"
@@ -1205,7 +1208,15 @@ a { color:#075fd7; }
         <option value="auto" selected>自动识别提取模式</option>
         <option value="white_on_black_sketch">黑底白线草图</option>
         <option value="black_on_white_line_art">白底黑线线稿</option>
+        <option value="pencil_weak_line_art">铅笔弱线增强</option>
         <option value="canny_edges">照片/渲染边缘</option>
+      </select>
+      <select id="weakLineThreshold">
+        <option value="18">弱线阈值 18（最敏感）</option>
+        <option value="24">弱线阈值 24</option>
+        <option value="32" selected>弱线阈值 32</option>
+        <option value="45">弱线阈值 45</option>
+        <option value="60">弱线阈值 60（更干净）</option>
       </select>
       <select id="parallelCollapse">
         <option value="off" selected>不合并平行光影线</option>
@@ -1379,6 +1390,7 @@ function extractionModeName(mode) {
   const names = {
     white_on_black_sketch: "黑底白线草图",
     black_on_white_line_art: "白底黑线线稿",
+    pencil_weak_line_art: "铅笔弱线增强",
     canny_edges: "照片/渲染边缘"
   };
   return names[mode] || "自动识别";
@@ -1399,6 +1411,7 @@ async function uploadImage() {
   if (!file) return;
   const mode = document.getElementById("extractionMode").value || "auto";
   const collapse = document.getElementById("parallelCollapse").value || "off";
+  const weakThreshold = document.getElementById("weakLineThreshold").value || "32";
   setStatus("正在上传并提取骨架...");
   const res = await fetch("/api/upload", {
     method: "POST",
@@ -1406,6 +1419,7 @@ async function uploadImage() {
       "Content-Type": "application/octet-stream",
       "X-Filename": encodeURIComponent(file.name),
       "X-Extraction-Mode": mode,
+      "X-Weak-Line-Threshold": weakThreshold,
       "X-Parallel-Collapse": collapse
     },
     body: file

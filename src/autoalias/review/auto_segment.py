@@ -88,7 +88,8 @@ def suggest_geometry_segments(
 
 def _read_edges(graph: dict[str, Any]) -> dict[str, _GraphEdge]:
     out: dict[str, _GraphEdge] = {}
-    for item in graph.get("edges", []) or []:
+    source_items = graph.get("design_strokes") or graph.get("edges", []) or []
+    for item in source_items:
         try:
             points = np.asarray(item.get("points") or [], dtype=float)
         except Exception:
@@ -96,7 +97,7 @@ def _read_edges(graph: dict[str, Any]) -> dict[str, _GraphEdge]:
         if points.ndim != 2 or points.shape[0] < 2 or points.shape[1] < 2:
             continue
         points = points[:, :2]
-        edge_id = str(item.get("id") or f"edge_{len(out):04d}")
+        edge_id = str(item.get("id") or f"stroke_{len(out):04d}")
         out[edge_id] = _GraphEdge(
             id=edge_id,
             label=str(item.get("label") or "detail_line"),

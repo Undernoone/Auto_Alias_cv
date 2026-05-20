@@ -20,6 +20,7 @@ from autoalias.vision.extractor import (
     _is_line_art,
     _is_white_on_black_sketch,
     _line_art_ink,
+    _pencil_weak_line_ink,
     _prune_skeleton_artifacts,
     _require_cv2,
     _semantic_guess,
@@ -28,7 +29,6 @@ from autoalias.vision.extractor import (
     _white_on_black_sketch_ink,
 )
 
-
 @dataclass(slots=True)
 class ReviewGraphOptions:
     min_edge_length: float = 3.0
@@ -36,6 +36,7 @@ class ReviewGraphOptions:
     max_points_per_edge: int = 320
     extraction_mode: str = "auto"
     parallel_collapse: str = "off"
+    weak_line_threshold: float = 32.0
 
 
 @dataclass(slots=True)
@@ -241,7 +242,9 @@ def build_review_graph_bundle(
     h, w = image.shape[:2]
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     extraction_mode = _resolve_extraction_mode(image, options.extraction_mode)
-    if extraction_mode == "white_on_black_sketch":
+    if extraction_mode == "pencil_weak_line_art":
+        ink = _pencil_weak_line_ink(gray, options.weak_line_threshold)
+    elif extraction_mode == "white_on_black_sketch":
         ink = _white_on_black_sketch_ink(gray)
     elif extraction_mode == "black_on_white_line_art":
         _gray, ink, extraction_mode = _line_art_ink(image)
@@ -260,12 +263,12 @@ def build_review_graph_bundle(
         ink = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, small, iterations=1)
 
     skeleton = _skeletonize_zhang_suen(ink > 0)
-    if extraction_mode == "white_on_black_sketch":
+    if extraction_mode in {"white_on_black_sketch", "pencil_weak_line_art"}:
         skeleton = _prune_skeleton_artifacts(
             skeleton,
-            max_spur_length=18.0,
-            min_component_pixels=4,
-            min_component_extent=4.0,
+            max_spur_length=10.0 if extraction_mode == "pencil_weak_line_art" else 18.0,
+            min_component_pixels=2 if extraction_mode == "pencil_weak_line_art" else 4,
+            min_component_extent=2.0 if extraction_mode == "pencil_weak_line_art" else 4.0,
         )
     parallel_collapse = _clean_parallel_collapse(options.parallel_collapse)
     if parallel_collapse != "off":
@@ -278,14 +281,13 @@ def build_review_graph_bundle(
     min_edge_length = options.min_edge_length
     if extraction_mode == "white_on_black_sketch":
         min_edge_length = max(min_edge_length, image_diag * 0.018)
+    promote_short_fragments = extraction_mode == "pencil_weak_line_art"
     for chain in chains:
         points = _as_points3(chain)
         length = _curve_length(points)
-        if length < min_edge_length or len(points) < 3:
-            coverage_fragments.append(_round_points(_downsample_points(points, 12)))
-            continue
         bbox = _bbox(points)
-        if max(bbox["width"], bbox["height"]) < 3:
+        is_fragment = length < min_edge_length or len(points) < 3 or max(bbox["width"], bbox["height"]) < 3
+        if is_fragment and not _promote_fragment_as_edge(points, length, extraction_mode=extraction_mode):
             coverage_fragments.append(_round_points(_downsample_points(points, 12)))
             continue
         raw_edges.append(
@@ -293,7 +295,8 @@ def build_review_graph_bundle(
                 "points": points,
                 "length": float(length),
                 "bbox": bbox,
-                "label": _semantic_guess(points),
+                "label": _semantic_guess(points) if not is_fragment else "detail_line_fragment",
+                "fragment_promoted": bool(is_fragment and promote_short_fragments),
             }
         )
 
@@ -313,6 +316,7 @@ def build_review_graph_bundle(
                 "end_node": end_node,
                 "length": round(float(edge["length"]), 3),
                 "bbox": edge["bbox"],
+                "fragment_promoted": bool(edge.get("fragment_promoted")),
             }
         )
 
@@ -329,6 +333,12 @@ def build_review_graph_bundle(
         )
     node_list.sort(key=lambda item: (-int(item["degree"]), item["id"]))
     coverage = _edge_coverage_metrics(skeleton, raw_edges, coverage_fragments)
+    design_strokes = _build_design_strokes(
+        edges,
+        router,
+        image_diag,
+        extraction_mode=extraction_mode,
+    )
 
     return {
         "version": 1,
@@ -336,12 +346,15 @@ def build_review_graph_bundle(
         "image_name": path.name,
         "extraction_mode": extraction_mode,
         "parallel_collapse": parallel_collapse,
+        "weak_line_threshold": round(float(options.weak_line_threshold), 3),
         "image_size": {"width": int(w), "height": int(h)},
         "edge_count": len(edges),
+        "design_stroke_count": len(design_strokes),
         "node_count": len(node_list),
         "coverage": coverage,
         "coverage_fragments": coverage_fragments,
         "edges": edges,
+        "design_strokes": design_strokes,
         "nodes": node_list,
     }, router
 
@@ -353,8 +366,10 @@ def graph_snapshot_for_training(graph: dict[str, Any]) -> dict[str, Any]:
         "image_name": graph.get("image_name"),
         "extraction_mode": graph.get("extraction_mode"),
         "parallel_collapse": graph.get("parallel_collapse"),
+        "weak_line_threshold": graph.get("weak_line_threshold"),
         "image_size": graph.get("image_size"),
         "edge_count": graph.get("edge_count", 0),
+        "design_stroke_count": graph.get("design_stroke_count", 0),
         "node_count": graph.get("node_count", 0),
         "edges": [
             {
@@ -367,6 +382,18 @@ def graph_snapshot_for_training(graph: dict[str, Any]) -> dict[str, Any]:
             }
             for edge in graph.get("edges", [])
         ],
+        "design_strokes": [
+            {
+                "id": stroke["id"],
+                "label": stroke.get("label", ""),
+                "start_node": stroke.get("start_node"),
+                "end_node": stroke.get("end_node"),
+                "length": stroke.get("length", 0.0),
+                "bbox": stroke.get("bbox", {}),
+                "source_edge_count": stroke.get("source_edge_count", 0),
+            }
+            for stroke in graph.get("design_strokes", [])
+        ],
         "nodes": graph.get("nodes", []),
     }
 
@@ -377,13 +404,17 @@ def _resolve_extraction_mode(image: np.ndarray, requested: str) -> str:
         "dark_sketch": "white_on_black_sketch",
         "white_on_black": "white_on_black_sketch",
         "bright_on_dark": "white_on_black_sketch",
+        "pencil": "pencil_weak_line_art",
+        "pencil_weak": "pencil_weak_line_art",
+        "weak_line": "pencil_weak_line_art",
+        "weak_pencil": "pencil_weak_line_art",
         "line_art": "black_on_white_line_art",
         "black_on_white": "black_on_white_line_art",
         "canny": "canny_edges",
         "edges": "canny_edges",
     }
     requested = aliases.get(requested, requested)
-    if requested in {"white_on_black_sketch", "black_on_white_line_art", "canny_edges"}:
+    if requested in {"white_on_black_sketch", "black_on_white_line_art", "canny_edges", "pencil_weak_line_art"}:
         return requested
     if _is_white_on_black_sketch(image):
         return "white_on_black_sketch"
@@ -431,16 +462,598 @@ def _bbox(points: np.ndarray) -> dict[str, float]:
     }
 
 
+def _promote_fragment_as_edge(
+    points: np.ndarray,
+    length: float,
+    *,
+    extraction_mode: str,
+) -> bool:
+    if extraction_mode != "pencil_weak_line_art":
+        return False
+    if len(points) < 2:
+        return False
+    return float(length) >= 0.75
+
+
+def _build_design_strokes(
+    edges: list[dict[str, Any]],
+    router: SkeletonRouter,
+    image_diag: float,
+    *,
+    extraction_mode: str,
+) -> list[dict[str, Any]]:
+    """Group raw skeleton edges into longer designer-readable strokes.
+
+    The primary path traces the complete skeleton graph directly, so a continuous red skeleton
+    remains continuous even when raw edge tracing introduced small splits. The raw-edge grouping
+    below remains as a fallback for unusual graphs.
+    """
+    router_strokes = _build_router_design_strokes(
+        router,
+        image_diag,
+        extraction_mode=extraction_mode,
+    )
+    if router_strokes:
+        return router_strokes
+
+    items = _design_edge_items(edges)
+    if not items:
+        return []
+
+    is_pencil = extraction_mode == "pencil_weak_line_art"
+    max_gap = max(5.0, float(image_diag) * (0.0075 if is_pencil else 0.005))
+    max_angle = float(np.deg2rad(58.0 if is_pencil else 48.0))
+    bridge_angle = float(np.deg2rad(76.0 if is_pencil else 66.0))
+    min_length = max(3.0, float(image_diag) * 0.002)
+    max_edges_per_stroke = 160 if is_pencil else 96
+    max_preview_points = 720 if is_pencil else 560
+
+    endpoint_grid = _make_design_endpoint_grid(items, max_gap)
+    ordered = sorted(range(len(items)), key=lambda idx: items[idx]["length"], reverse=True)
+    globally_used: set[int] = set()
+    strokes: list[dict[str, Any]] = []
+    for seed_idx in ordered:
+        if seed_idx in globally_used:
+            continue
+        chain: list[tuple[int, bool]] = [(seed_idx, True)]
+        local_used = {seed_idx}
+        _extend_design_stroke_end(
+            chain,
+            items,
+            endpoint_grid,
+            globally_used,
+            local_used,
+            max_gap=max_gap,
+            max_angle=max_angle,
+            bridge_angle=bridge_angle,
+            max_edges=max_edges_per_stroke,
+        )
+        chain = [(edge_idx, not forward) for edge_idx, forward in reversed(chain)]
+        _extend_design_stroke_end(
+            chain,
+            items,
+            endpoint_grid,
+            globally_used,
+            local_used,
+            max_gap=max_gap,
+            max_angle=max_angle,
+            bridge_angle=bridge_angle,
+            max_edges=max_edges_per_stroke,
+        )
+        chain = [(edge_idx, not forward) for edge_idx, forward in reversed(chain)]
+        globally_used.update(local_used)
+
+        combined = _combine_design_stroke_points(chain, items)
+        length = _curve_length(combined)
+        if len(combined) < 2 or length < min_length:
+            continue
+        strokes.append(
+            _make_design_stroke(
+                len(strokes),
+                chain,
+                items,
+                combined,
+                length,
+                max_preview_points=max_preview_points,
+            )
+        )
+    strokes.sort(key=lambda item: item["length"], reverse=True)
+    for idx, stroke in enumerate(strokes):
+        stroke["id"] = f"stroke_{idx:04d}"
+    return strokes
+
+
+def _build_router_design_strokes(
+    router: SkeletonRouter,
+    image_diag: float,
+    *,
+    extraction_mode: str,
+) -> list[dict[str, Any]]:
+    coords = np.asarray(router.coords, dtype=float)
+    adjacency = router.adjacency
+    if len(coords) == 0 or not adjacency:
+        return []
+
+    is_pencil = extraction_mode == "pencil_weak_line_art"
+    min_length = max(3.0, float(image_diag) * (0.002 if is_pencil else 0.0035))
+    max_preview_points = 760 if is_pencil else 620
+    junction_turn = float(np.deg2rad(78.0 if is_pencil else 68.0))
+    ambiguous_margin = float(np.deg2rad(10.0))
+    max_strokes = 4096
+
+    visited: set[tuple[int, int]] = set()
+    degrees = [len(neighbors) for neighbors in adjacency]
+    strokes: list[dict[str, Any]] = []
+
+    endpoints = [idx for idx, degree in enumerate(degrees) if degree <= 1]
+    for start_idx in sorted(endpoints, key=lambda idx: (coords[idx, 1], coords[idx, 0])):
+        for next_idx, _weight in _ordered_router_neighbors(start_idx, adjacency, coords):
+            if _router_edge_key(start_idx, next_idx) in visited:
+                continue
+            path = _trace_router_stroke(
+                start_idx,
+                next_idx,
+                coords,
+                adjacency,
+                degrees,
+                visited,
+                junction_turn=junction_turn,
+                ambiguous_margin=ambiguous_margin,
+            )
+            _append_router_stroke(
+                strokes,
+                path,
+                coords,
+                min_length=min_length,
+                max_preview_points=max_preview_points,
+                closed=False,
+            )
+            if len(strokes) >= max_strokes:
+                return _finalize_router_strokes(strokes)
+
+    junctions = [idx for idx, degree in enumerate(degrees) if degree >= 3]
+    for start_idx in sorted(junctions, key=lambda idx: (coords[idx, 1], coords[idx, 0])):
+        for next_idx, _weight in _ordered_router_neighbors(start_idx, adjacency, coords):
+            if _router_edge_key(start_idx, next_idx) in visited:
+                continue
+            path = _trace_router_stroke(
+                start_idx,
+                next_idx,
+                coords,
+                adjacency,
+                degrees,
+                visited,
+                junction_turn=junction_turn,
+                ambiguous_margin=ambiguous_margin,
+            )
+            _append_router_stroke(
+                strokes,
+                path,
+                coords,
+                min_length=min_length,
+                max_preview_points=max_preview_points,
+                closed=False,
+            )
+            if len(strokes) >= max_strokes:
+                return _finalize_router_strokes(strokes)
+
+    for start_idx, neighbors in enumerate(adjacency):
+        for next_idx, _weight in neighbors:
+            if _router_edge_key(start_idx, next_idx) in visited:
+                continue
+            path = _trace_router_stroke(
+                start_idx,
+                next_idx,
+                coords,
+                adjacency,
+                degrees,
+                visited,
+                junction_turn=junction_turn,
+                ambiguous_margin=ambiguous_margin,
+            )
+            closed = bool(len(path) > 3 and path[0] == path[-1])
+            _append_router_stroke(
+                strokes,
+                path,
+                coords,
+                min_length=min_length,
+                max_preview_points=max_preview_points,
+                closed=closed,
+            )
+            if len(strokes) >= max_strokes:
+                return _finalize_router_strokes(strokes)
+
+    return _finalize_router_strokes(strokes)
+
+
+def _trace_router_stroke(
+    start_idx: int,
+    next_idx: int,
+    coords: np.ndarray,
+    adjacency: list[list[tuple[int, float]]],
+    degrees: list[int],
+    visited: set[tuple[int, int]],
+    *,
+    junction_turn: float,
+    ambiguous_margin: float,
+) -> list[int]:
+    path = [start_idx]
+    previous = start_idx
+    current = next_idx
+    max_steps = max(16, len(coords) * 2)
+    while len(path) < max_steps:
+        visited.add(_router_edge_key(previous, current))
+        path.append(current)
+        candidates = [
+            neighbor
+            for neighbor, _weight in adjacency[current]
+            if neighbor != previous and _router_edge_key(current, neighbor) not in visited
+        ]
+        if not candidates:
+            break
+        if current == start_idx and len(path) > 6:
+            break
+        choice = _choose_router_continuation(
+            path,
+            current,
+            candidates,
+            coords,
+            degrees,
+            junction_turn=junction_turn,
+            ambiguous_margin=ambiguous_margin,
+        )
+        if choice is None:
+            break
+        previous, current = current, choice
+    return path
+
+
+def _choose_router_continuation(
+    path: list[int],
+    current: int,
+    candidates: list[int],
+    coords: np.ndarray,
+    degrees: list[int],
+    *,
+    junction_turn: float,
+    ambiguous_margin: float,
+) -> int | None:
+    if len(candidates) == 1 and degrees[current] <= 2:
+        return candidates[0]
+    tangent = _router_path_tangent(path, coords)
+    scored: list[tuple[float, int]] = []
+    current_point = coords[current, :2]
+    for candidate in candidates:
+        vec = coords[candidate, :2] - current_point
+        angle = _angle_between_vectors(tangent, vec)
+        scored.append((angle, candidate))
+    scored.sort(key=lambda item: item[0])
+    best_angle, best_candidate = scored[0]
+
+    if degrees[current] >= 3:
+        if best_angle > junction_turn:
+            return None
+        if len(scored) > 1:
+            second_angle = scored[1][0]
+            if best_angle > np.deg2rad(30.0) and second_angle - best_angle < ambiguous_margin:
+                return None
+    return best_candidate
+
+
+def _append_router_stroke(
+    strokes: list[dict[str, Any]],
+    path: list[int],
+    coords: np.ndarray,
+    *,
+    min_length: float,
+    max_preview_points: int,
+    closed: bool,
+) -> None:
+    if len(path) < 2:
+        return
+    points = coords[np.asarray(path, dtype=int), :2]
+    points = _remove_near_duplicate_points(points, eps=0.25)
+    if len(points) < 2:
+        return
+    length = _curve_length(points)
+    if length < min_length:
+        return
+    smoothed = _smooth_route_points(points, passes=1)
+    preview = _as_points3(_downsample_points(smoothed, max_preview_points))
+    strokes.append(
+        {
+            "id": f"stroke_{len(strokes):04d}",
+            "label": _semantic_guess(preview),
+            "points": _round_points(preview),
+            "start_node": _router_coord_node_id(points[0]),
+            "end_node": _router_coord_node_id(points[-1]),
+            "length": round(float(length), 3),
+            "bbox": _bbox(points),
+            "source": "skeleton_graph_tracing",
+            "source_edge_count": max(1, len(path) - 1),
+            "closed": bool(closed),
+        }
+    )
+
+
+def _finalize_router_strokes(strokes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    strokes.sort(key=lambda item: item["length"], reverse=True)
+    for idx, stroke in enumerate(strokes):
+        stroke["id"] = f"stroke_{idx:04d}"
+    return strokes
+
+
+def _ordered_router_neighbors(
+    node_idx: int,
+    adjacency: list[list[tuple[int, float]]],
+    coords: np.ndarray,
+) -> list[tuple[int, float]]:
+    point = coords[node_idx, :2]
+    return sorted(adjacency[node_idx], key=lambda item: (coords[item[0], 1] - point[1], coords[item[0], 0] - point[0]))
+
+
+def _router_path_tangent(path: list[int], coords: np.ndarray) -> np.ndarray:
+    if len(path) < 2:
+        return np.array([1.0, 0.0])
+    current = coords[path[-1], :2]
+    back_index = path[max(0, len(path) - 8)]
+    vec = current - coords[back_index, :2]
+    if np.linalg.norm(vec) <= 1e-9:
+        vec = coords[path[-1], :2] - coords[path[-2], :2]
+    return _normalize_vec(vec)
+
+
+def _router_edge_key(a: int, b: int) -> tuple[int, int]:
+    return (a, b) if a < b else (b, a)
+
+
+def _router_coord_node_id(point: np.ndarray) -> str:
+    return f"router_node_{int(round(float(point[0])))}_{int(round(float(point[1])))}"
+
+
+def _design_edge_items(edges: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for edge in edges:
+        try:
+            points = np.asarray(edge.get("points") or [], dtype=float)
+        except Exception:
+            continue
+        if points.ndim != 2 or points.shape[0] < 2 or points.shape[1] < 2:
+            continue
+        points = points[:, :2]
+        items.append(
+            {
+                "id": str(edge.get("id") or f"edge_{len(items):04d}"),
+                "label": str(edge.get("label") or "detail_line"),
+                "points": points,
+                "length": float(edge.get("length") or _curve_length(points)),
+                "start_node": str(edge.get("start_node") or ""),
+                "end_node": str(edge.get("end_node") or ""),
+                "fragment_promoted": bool(edge.get("fragment_promoted")),
+            }
+        )
+    return items
+
+
+def _make_design_endpoint_grid(
+    items: list[dict[str, Any]],
+    radius: float,
+) -> dict[str, Any]:
+    cell_size = max(float(radius) / 3.0, 3.0)
+    grid: dict[tuple[int, int], list[tuple[int, bool, np.ndarray]]] = {}
+    for edge_idx, item in enumerate(items):
+        for forward, point in ((True, item["points"][0]), (False, item["points"][-1])):
+            cell = _grid_cell(point, cell_size)
+            grid.setdefault(cell, []).append((edge_idx, forward, point.astype(float, copy=False)))
+    return {"cell_size": cell_size, "grid": grid}
+
+
+def _extend_design_stroke_end(
+    chain: list[tuple[int, bool]],
+    items: list[dict[str, Any]],
+    endpoint_grid: dict[str, Any],
+    globally_used: set[int],
+    local_used: set[int],
+    *,
+    max_gap: float,
+    max_angle: float,
+    bridge_angle: float,
+    max_edges: int,
+) -> None:
+    while len(chain) < max_edges:
+        edge_idx, forward = chain[-1]
+        current_points = _oriented_design_points(items[edge_idx]["points"], forward)
+        end_point = current_points[-1]
+        current_tangent = _design_end_tangent(current_points)
+        best = _best_design_continuation(
+            items,
+            endpoint_grid,
+            end_point,
+            current_tangent,
+            globally_used,
+            local_used,
+            max_gap=max_gap,
+            max_angle=max_angle,
+            bridge_angle=bridge_angle,
+        )
+        if best is None:
+            return
+        _score, next_idx, next_forward = best
+        local_used.add(next_idx)
+        chain.append((next_idx, next_forward))
+
+
+def _best_design_continuation(
+    items: list[dict[str, Any]],
+    endpoint_grid: dict[str, Any],
+    end_point: np.ndarray,
+    current_tangent: np.ndarray,
+    globally_used: set[int],
+    local_used: set[int],
+    *,
+    max_gap: float,
+    max_angle: float,
+    bridge_angle: float,
+) -> tuple[float, int, bool] | None:
+    best: tuple[float, int, bool] | None = None
+    cell_size = float(endpoint_grid["cell_size"])
+    grid = endpoint_grid["grid"]
+    search_radius = int(np.ceil(max_gap / max(cell_size, 1e-6)))
+    center = _grid_cell(end_point, cell_size)
+    max_gap2 = max_gap * max_gap
+    nearby: list[tuple[float, int, bool, np.ndarray]] = []
+    for gy in range(center[1] - search_radius, center[1] + search_radius + 1):
+        for gx in range(center[0] - search_radius, center[0] + search_radius + 1):
+            for candidate_idx, candidate_forward, candidate_start in grid.get((gx, gy), []):
+                if candidate_idx in globally_used or candidate_idx in local_used:
+                    continue
+                gap_vec = candidate_start - end_point
+                gap2 = float(np.dot(gap_vec, gap_vec))
+                if gap2 > max_gap2:
+                    continue
+                nearby.append((gap2, candidate_idx, candidate_forward, candidate_start))
+    if len(nearby) > 40:
+        nearby = sorted(nearby, key=lambda item: item[0])[:40]
+    for gap2, candidate_idx, candidate_forward, candidate_start in nearby:
+        candidate_points = _oriented_design_points(
+            items[candidate_idx]["points"], candidate_forward
+        )
+        if len(candidate_points) < 2:
+            continue
+        gap_vec = candidate_start - end_point
+        gap = float(gap2**0.5)
+        candidate_tangent = _design_start_tangent(candidate_points)
+        tangent_angle = _angle_between_vectors(current_tangent, candidate_tangent)
+        if tangent_angle > max_angle:
+            continue
+        bridge_penalty = 0.0
+        if gap > 1.25:
+            bridge = gap_vec / max(gap, 1e-9)
+            bridge_in = _angle_between_vectors(current_tangent, bridge)
+            bridge_out = _angle_between_vectors(bridge, candidate_tangent)
+            if bridge_in > bridge_angle or bridge_out > bridge_angle:
+                continue
+            bridge_penalty = 0.35 * (bridge_in + bridge_out)
+        score = 1.8 * tangent_angle + bridge_penalty + 0.75 * gap / max(max_gap, 1.0)
+        if items[candidate_idx].get("label") == "detail_line_fragment":
+            score += 0.02
+        if best is None or score < best[0]:
+            best = (score, candidate_idx, candidate_forward)
+    return best
+
+
+def _make_design_stroke(
+    index: int,
+    chain: list[tuple[int, bool]],
+    items: list[dict[str, Any]],
+    points: np.ndarray,
+    length: float,
+    *,
+    max_preview_points: int,
+) -> dict[str, Any]:
+    first_idx, first_forward = chain[0]
+    last_idx, last_forward = chain[-1]
+    labels = [items[edge_idx]["label"] for edge_idx, _forward in chain]
+    label = _majority_text(labels)
+    if label == "detail_line_fragment":
+        label = _semantic_guess(points)
+    preview = _as_points3(_downsample_points(points, max_preview_points))
+    source_ids = [items[edge_idx]["id"] for edge_idx, _forward in chain]
+    return {
+        "id": f"stroke_{index:04d}",
+        "label": label,
+        "points": _round_points(preview),
+        "start_node": _oriented_design_node(items[first_idx], first_forward, start=True),
+        "end_node": _oriented_design_node(items[last_idx], last_forward, start=False),
+        "length": round(float(length), 3),
+        "bbox": _bbox(points),
+        "source": "design_stroke_grouping",
+        "source_edge_count": len(source_ids),
+        "source_edge_ids": source_ids[:128],
+        "source_edge_ids_truncated": len(source_ids) > 128,
+    }
+
+
+def _combine_design_stroke_points(
+    chain: list[tuple[int, bool]],
+    items: list[dict[str, Any]],
+) -> np.ndarray:
+    parts: list[np.ndarray] = []
+    for edge_idx, forward in chain:
+        pts = _oriented_design_points(items[edge_idx]["points"], forward)
+        pts = _remove_near_duplicate_points(pts, eps=0.35)
+        if len(pts) < 2:
+            continue
+        parts.append(pts)
+    if not parts:
+        return np.zeros((0, 2), dtype=float)
+    return _remove_near_duplicate_points(np.vstack(parts), eps=0.35)
+
+
+def _oriented_design_points(points: np.ndarray, forward: bool) -> np.ndarray:
+    return points if forward else points[::-1]
+
+
+def _oriented_design_node(item: dict[str, Any], forward: bool, *, start: bool) -> str:
+    if start:
+        value = item.get("start_node") if forward else item.get("end_node")
+    else:
+        value = item.get("end_node") if forward else item.get("start_node")
+    return str(value or "")
+
+
+def _design_start_tangent(points: np.ndarray) -> np.ndarray:
+    if len(points) < 2:
+        return np.array([1.0, 0.0])
+    k = min(10, len(points) - 1)
+    return _normalize_vec(points[k, :2] - points[0, :2])
+
+
+def _design_end_tangent(points: np.ndarray) -> np.ndarray:
+    if len(points) < 2:
+        return np.array([1.0, 0.0])
+    k = min(10, len(points) - 1)
+    return _normalize_vec(points[-1, :2] - points[-1 - k, :2])
+
+
+def _angle_between_vectors(a: np.ndarray, b: np.ndarray) -> float:
+    a_n = _normalize_vec(a)
+    b_n = _normalize_vec(b)
+    return float(np.arccos(float(np.clip(np.dot(a_n, b_n), -1.0, 1.0))))
+
+
+def _normalize_vec(vec: np.ndarray) -> np.ndarray:
+    norm = float(np.linalg.norm(vec))
+    if norm <= 1e-9:
+        return np.array([1.0, 0.0])
+    return vec / norm
+
+
+def _grid_cell(point: np.ndarray, cell_size: float) -> tuple[int, int]:
+    return (int(np.floor(float(point[0]) / cell_size)), int(np.floor(float(point[1]) / cell_size)))
+
+
+def _majority_text(values: list[str]) -> str:
+    if not values:
+        return "detail_line"
+    counts: dict[str, int] = {}
+    for value in values:
+        counts[value] = counts.get(value, 0) + 1
+    return max(counts.items(), key=lambda item: item[1])[0]
+
+
 def _cluster_endpoints(
     raw_edges: list[dict[str, Any]],
     radius: float,
 ) -> list[tuple[str, str]]:
     clusters: list[dict[str, Any]] = []
+    grid: dict[tuple[int, int], list[int]] = {}
+    cell_size = max(float(radius), 1.0)
     assignments: list[list[str]] = []
     for edge_idx, edge in enumerate(raw_edges):
         edge_assignments = []
         for side, point in (("start", edge["points"][0]), ("end", edge["points"][-1])):
-            cluster_id = _assign_endpoint_cluster(clusters, point[:2], radius)
+            cluster_id = _assign_endpoint_cluster(clusters, grid, point[:2], radius, cell_size)
             clusters[cluster_id]["members"].append((edge_idx, side))
             edge_assignments.append(f"node_{cluster_id:04d}")
         assignments.append(edge_assignments)
@@ -448,6 +1061,44 @@ def _cluster_endpoints(
 
 
 def _assign_endpoint_cluster(
+    clusters: list[dict[str, Any]],
+    grid: dict[tuple[int, int], list[int]],
+    point: np.ndarray,
+    radius: float,
+    cell_size: float,
+) -> int:
+    cell = (int(np.floor(float(point[0]) / cell_size)), int(np.floor(float(point[1]) / cell_size)))
+    best: tuple[float, int] | None = None
+    seen: set[int] = set()
+    for gy in range(cell[1] - 1, cell[1] + 2):
+        for gx in range(cell[0] - 1, cell[0] + 2):
+            for idx in grid.get((gx, gy), []):
+                if idx in seen:
+                    continue
+                seen.add(idx)
+                cluster = clusters[idx]
+                dist = float(np.linalg.norm(point - cluster["point"]))
+                if dist <= radius and (best is None or dist < best[0]):
+                    best = (dist, idx)
+    if best is None:
+        clusters.append({"point": point.astype(float).copy(), "members": []})
+        idx = len(clusters) - 1
+        grid.setdefault(cell, []).append(idx)
+        return idx
+    idx = best[1]
+    cluster = clusters[idx]
+    count = len(cluster["members"])
+    cluster["point"] = (cluster["point"] * count + point) / max(count + 1, 1)
+    new_cell = (
+        int(np.floor(float(cluster["point"][0]) / cell_size)),
+        int(np.floor(float(cluster["point"][1]) / cell_size)),
+    )
+    if idx not in grid.setdefault(new_cell, []):
+        grid[new_cell].append(idx)
+    return idx
+
+
+def _assign_endpoint_cluster_linear(
     clusters: list[dict[str, Any]],
     point: np.ndarray,
     radius: float,
@@ -494,6 +1145,16 @@ def _downsample_points(points: np.ndarray, max_count: int) -> np.ndarray:
 
 def _round_points(points: np.ndarray) -> list[list[float]]:
     return [[round(float(x), 3), round(float(y), 3)] for x, y in points[:, :2]]
+
+
+def _remove_near_duplicate_points(points: np.ndarray, eps: float = 0.5) -> np.ndarray:
+    if len(points) <= 1:
+        return points
+    kept = [points[0]]
+    for point in points[1:]:
+        if np.linalg.norm(point[:2] - kept[-1][:2]) > eps:
+            kept.append(point)
+    return np.asarray(kept, dtype=float)
 
 
 def _smooth_route_points(points: np.ndarray, passes: int = 2) -> np.ndarray:

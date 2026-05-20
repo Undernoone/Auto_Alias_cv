@@ -165,18 +165,21 @@ class SessionWorker(QObject):
         output_dir: Path,
         extraction_mode: str,
         parallel_collapse: str,
+        weak_line_threshold: float,
     ) -> None:
         super().__init__()
         self.image_path = image_path
         self.output_dir = output_dir
         self.extraction_mode = extraction_mode
         self.parallel_collapse = parallel_collapse
+        self.weak_line_threshold = weak_line_threshold
 
     def run(self) -> None:
         try:
             options = ReviewGraphOptions(
                 extraction_mode=self.extraction_mode,
                 parallel_collapse=self.parallel_collapse,
+                weak_line_threshold=self.weak_line_threshold,
                 max_points_per_edge=480,
             )
             session = ReviewSession.create(self.image_path, self.output_dir, options)
@@ -334,6 +337,7 @@ class DesktopEditor(QMainWindow):
         self.image_item: QGraphicsPixmapItem | None = None
         self.full_skeleton_item: QGraphicsPixmapItem | None = None
         self.edge_skeleton_item: QGraphicsPixmapItem | None = None
+        self.design_stroke_item: QGraphicsPixmapItem | None = None
         self.current_route_item: QGraphicsPathItem | None = None
         self.alt_route_items: list[QGraphicsPathItem] = []
         self.saved_route_items: list[QGraphicsPathItem] = []
@@ -366,9 +370,17 @@ class DesktopEditor(QMainWindow):
         self.degree.addItems(["auto", "3", "5", "7"])
 
         self.extraction_mode = QComboBox()
-        self.extraction_mode.addItems(
-            ["auto", "white_on_black_sketch", "black_on_white_line_art", "canny_edges"]
-        )
+        self.extraction_mode.addItem("自动识别", "auto")
+        self.extraction_mode.addItem("铅笔弱线增强", "pencil_weak_line_art")
+        self.extraction_mode.addItem("黑底白线草图", "white_on_black_sketch")
+        self.extraction_mode.addItem("白底黑线线稿", "black_on_white_line_art")
+        self.extraction_mode.addItem("照片/渲染边缘", "canny_edges")
+
+        self.weak_line_threshold = QSpinBox()
+        self.weak_line_threshold.setRange(5, 95)
+        self.weak_line_threshold.setValue(32)
+        self.weak_line_threshold.setSuffix(" 阈值")
+        self.weak_line_threshold.setToolTip("铅笔弱线增强阈值：数值越低越容易保留淡线，数值越高越抑制噪点。")
 
         self.parallel_collapse = QComboBox()
         self.parallel_collapse.addItems(["off", "soft", "medium", "strong"])
@@ -396,6 +408,9 @@ class DesktopEditor(QMainWindow):
         self.show_edge_skeleton = QCheckBox("切段骨架绿线")
         self.show_edge_skeleton.setChecked(True)
         self.show_edge_skeleton.toggled.connect(self._update_visibility)
+        self.show_design_strokes = QCheckBox("设计笔画绿线")
+        self.show_design_strokes.setChecked(True)
+        self.show_design_strokes.toggled.connect(self._update_visibility)
         self.show_saved = QCheckBox("已保存蓝线")
         self.show_saved.setChecked(True)
         self.show_saved.toggled.connect(self._update_visibility)
@@ -415,6 +430,9 @@ class DesktopEditor(QMainWindow):
         self._build_ui()
         self._install_shortcuts()
         self._set_status("打开一张图片开始。左键添加分段点，拖动点后松手自动吸附骨架。")
+
+    def _current_extraction_mode(self) -> str:
+        return str(self.extraction_mode.currentData() or self.extraction_mode.currentText())
 
     def _build_ui(self) -> None:
         toolbar = QToolBar("AutoAlias")
@@ -436,6 +454,8 @@ class DesktopEditor(QMainWindow):
         toolbar.addSeparator()
         toolbar.addWidget(QLabel("提取 "))
         toolbar.addWidget(self.extraction_mode)
+        toolbar.addWidget(QLabel(" 弱线 "))
+        toolbar.addWidget(self.weak_line_threshold)
         toolbar.addWidget(QLabel(" 并线 "))
         toolbar.addWidget(self.parallel_collapse)
         toolbar.addSeparator()
@@ -449,6 +469,7 @@ class DesktopEditor(QMainWindow):
         side_layout.addWidget(self.show_image)
         side_layout.addWidget(self.show_full_skeleton)
         side_layout.addWidget(self.show_edge_skeleton)
+        side_layout.addWidget(self.show_design_strokes)
         side_layout.addWidget(self.show_saved)
 
         skeleton_row = QHBoxLayout()
@@ -570,8 +591,9 @@ class DesktopEditor(QMainWindow):
                 image_path,
                 project_path.parent,
                 ReviewGraphOptions(
-                    extraction_mode=self.extraction_mode.currentText(),
+                    extraction_mode=self._current_extraction_mode(),
                     parallel_collapse=self.parallel_collapse.currentText(),
+                    weak_line_threshold=float(self.weak_line_threshold.value()),
                     max_points_per_edge=480,
                 ),
             )
@@ -624,8 +646,9 @@ class DesktopEditor(QMainWindow):
         worker = SessionWorker(
             image_path=image_path,
             output_dir=self.output_dir,
-            extraction_mode=self.extraction_mode.currentText(),
+            extraction_mode=self._current_extraction_mode(),
             parallel_collapse=self.parallel_collapse.currentText(),
+            weak_line_threshold=float(self.weak_line_threshold.value()),
         )
         thread = QThread(self)
         worker.moveToThread(thread)
@@ -678,6 +701,10 @@ class DesktopEditor(QMainWindow):
             self._make_edge_skeleton_pixmap(loaded.image, loaded.session)
         )
         self.edge_skeleton_item.setZValue(6)
+        self.design_stroke_item = self.scene.addPixmap(
+            self._make_design_stroke_pixmap(loaded.image, loaded.session)
+        )
+        self.design_stroke_item.setZValue(7)
         self.scene.setSceneRect(0, 0, loaded.image.width(), loaded.image.height())
         self.view.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
         self._rebuild_saved_routes()
@@ -719,11 +746,26 @@ class DesktopEditor(QMainWindow):
         painter.end()
         return QPixmap.fromImage(image)
 
+    def _make_design_stroke_pixmap(self, image_source: QImage, session: ReviewSession) -> QPixmap:
+        image = self._transparent_image_like(image_source)
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(QPen(QColor(0, 95, 55, 210), 1.8))
+        strokes = session.graph.get("design_strokes") or session.graph.get("edges", [])
+        for stroke in strokes:
+            points = stroke.get("points") or []
+            if len(points) < 2:
+                continue
+            painter.drawPath(_path_from_points(points))
+        painter.end()
+        return QPixmap.fromImage(image)
+
     def refresh_skeleton_layer(self) -> None:
         if self.session is None or self.current_image is None:
             return
         full_pixmap = self._make_full_skeleton_pixmap(self.current_image, self.session)
         edge_pixmap = self._make_edge_skeleton_pixmap(self.current_image, self.session)
+        design_pixmap = self._make_design_stroke_pixmap(self.current_image, self.session)
         if self.full_skeleton_item is None:
             self.full_skeleton_item = self.scene.addPixmap(full_pixmap)
             self.full_skeleton_item.setZValue(5)
@@ -734,6 +776,11 @@ class DesktopEditor(QMainWindow):
             self.edge_skeleton_item.setZValue(6)
         else:
             self.edge_skeleton_item.setPixmap(edge_pixmap)
+        if self.design_stroke_item is None:
+            self.design_stroke_item = self.scene.addPixmap(design_pixmap)
+            self.design_stroke_item.setZValue(7)
+        else:
+            self.design_stroke_item.setPixmap(design_pixmap)
         self._update_visibility()
 
     def break_skeleton_add_chain(self) -> None:
@@ -1478,6 +1525,8 @@ class DesktopEditor(QMainWindow):
             self.full_skeleton_item.setVisible(self.show_full_skeleton.isChecked())
         if self.edge_skeleton_item is not None:
             self.edge_skeleton_item.setVisible(self.show_edge_skeleton.isChecked())
+        if self.design_stroke_item is not None:
+            self.design_stroke_item.setVisible(self.show_design_strokes.isChecked())
         for item in self.saved_route_items:
             item.setVisible(self.show_saved.isChecked())
 
