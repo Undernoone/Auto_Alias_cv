@@ -371,7 +371,7 @@ def _detect_corner_blend_regions(
     length = float(edge.length)
     if length <= 1e-6:
         return []
-    sample_count = int(max(56, min(220, length / 2.6)))
+    sample_count = int(max(72, min(260, length / 2.2)))
     cumulative = _cumulative_lengths(edge.points)
     s_values = np.linspace(0.0, length, sample_count)
     sampled = np.vstack([_interpolate_polyline(edge.points, cumulative, s) for s in s_values])
@@ -379,89 +379,466 @@ def _detect_corner_blend_regions(
 
     vec = np.diff(sampled[:, :2], axis=0)
     seg_len = np.linalg.norm(vec, axis=1)
-    valid = seg_len > 1e-6
-    if np.count_nonzero(valid) < 8:
+    if np.count_nonzero(seg_len > 1e-6) < 8:
         return []
     theta = np.unwrap(np.arctan2(vec[:, 1], vec[:, 0]))
     dtheta = np.diff(theta)
-    ds = np.diff(s_values[:-1])
-    if len(ds) != len(dtheta):
-        ds = np.full(len(dtheta), length / max(len(dtheta), 1), dtype=float)
-    signed_density = dtheta / np.maximum(ds, 1e-6)
-    signed_density = _smooth_1d(signed_density, window=7)
+    local_ds = (s_values[2:] - s_values[:-2]) * 0.5
+    if len(local_ds) != len(dtheta):
+        local_ds = np.full(len(dtheta), length / max(len(dtheta), 1), dtype=float)
+    turn_s = s_values[1:-1]
+    signed_density = dtheta / np.maximum(local_ds, 1e-6)
+    signed_density = _smooth_1d(signed_density, window=9 if len(signed_density) >= 48 else 7)
 
-    positive_turn = float(np.sum(np.clip(signed_density, 0.0, None) * ds))
-    negative_turn = float(np.sum(np.clip(-signed_density, 0.0, None) * ds))
-    dominant_sign = 1 if positive_turn >= negative_turn else -1
-    dominant_turn = max(positive_turn, negative_turn)
-    opposite_turn = min(positive_turn, negative_turn)
-    if dominant_turn < math.radians(22.0):
-        return []
-    if opposite_turn > dominant_turn * 0.34:
-        return []
-
-    signal = np.clip(dominant_sign * signed_density, 0.0, None)
-    finite = signal[np.isfinite(signal)]
-    if len(finite) < 8 or float(np.max(finite)) <= 1e-9:
-        return []
-    nonzero = finite[finite > float(np.max(finite)) * 0.02]
-    if len(nonzero) < 4:
-        return []
-    peak = float(np.max(nonzero))
-    median = float(np.median(nonzero))
-    if peak < max(median * 1.45, 1.0 / max(length * 3.0, 1.0)):
-        return []
-
-    threshold = max(peak * 0.23, float(np.percentile(nonzero, 62)) * 0.75)
-    active = signal >= threshold
-    active = _close_boolean_gaps(active, max_gap=2)
-    components = _boolean_components(active)
-    if not components:
-        return []
-
-    min_region_len = max(12.0, radius * 4.0, length * 0.035)
-    max_region_len = max(45.0, length * 0.48)
+    min_region_len = max(12.0, radius * 4.0, length * 0.030)
+    max_region_len = max(42.0, length * 0.42)
     endpoint_margin = max(10.0, radius * 4.0, length * 0.035)
     existing_s = [float(cut.s) for cut in existing_cuts]
-    out: list[tuple[float, float]] = []
-    for start_idx, end_idx in components:
-        peak_idx = int(start_idx + np.argmax(signal[start_idx : end_idx + 1]))
-        left = peak_idx
-        right = peak_idx
-        low = max(peak * 0.12, threshold * 0.45)
-        while left > 0 and signal[left - 1] >= low:
-            left -= 1
-        while right < len(signal) - 1 and signal[right + 1] >= low:
-            right += 1
 
-        start_s = float(s_values[max(0, left)])
-        end_s = float(s_values[min(len(s_values) - 1, right + 1)])
-        region_len = end_s - start_s
-        if region_len < min_region_len or region_len > max_region_len:
+    candidates: list[tuple[float, float, float]] = []
+    for sign in (1, -1):
+        signal = np.clip(float(sign) * signed_density, 0.0, None)
+        opposite = np.clip(-float(sign) * signed_density, 0.0, None)
+        finite = signal[np.isfinite(signal)]
+        if len(finite) < 8 or float(np.max(finite)) <= 1e-9:
             continue
-        if start_s < endpoint_margin and length - end_s < endpoint_margin:
+        positive = finite[finite > float(np.max(finite)) * 0.025]
+        if len(positive) < 5:
             continue
-        if start_s < endpoint_margin:
-            start_s = 0.0
-        if length - end_s < endpoint_margin:
-            end_s = length
-        if end_s - start_s < min_region_len:
-            continue
-        region_turn = float(np.sum(signal[max(0, left) : min(len(signal), right + 1)] * ds[max(0, left) : min(len(ds), right + 1)]))
-        if region_turn < math.radians(16.0):
-            continue
-        if _near_existing_cut(start_s, existing_s, endpoint_margin * 0.55) and _near_existing_cut(
-            end_s,
-            existing_s,
-            endpoint_margin * 0.55,
-        ):
-            continue
+        peak_floor = max(float(np.percentile(positive, 78)), float(np.median(positive)) * 1.55)
+        peak_floor = max(peak_floor, 1.0 / max(length * 2.7, 1.0))
+        peaks = _corner_peak_indices(signal, peak_floor)
+        for peak_idx in peaks:
+            scored_items: list[tuple[float, float, float]] = []
+            designer_scored = _score_designer_corner_peak(
+                signal,
+                opposite,
+                local_ds,
+                turn_s,
+                peak_idx,
+                length=length,
+                radius=radius,
+                min_region_len=min_region_len,
+                max_region_len=max_region_len,
+            )
+            if designer_scored is not None:
+                scored_items.append(designer_scored)
+            support_scored = _score_corner_peak(
+                signal,
+                opposite,
+                local_ds,
+                turn_s,
+                peak_idx,
+                length=length,
+                radius=radius,
+                min_region_len=min_region_len,
+                max_region_len=max_region_len,
+            )
+            if support_scored is not None:
+                scored_items.append(support_scored)
+            if not scored_items:
+                continue
+            scored_items.sort(key=lambda item: item[0])
+            score, start_s, end_s = scored_items[0]
+            if start_s < endpoint_margin and length - end_s < endpoint_margin:
+                continue
+            if start_s < endpoint_margin:
+                start_s = 0.0
+            if length - end_s < endpoint_margin:
+                end_s = length
+            if end_s - start_s < min_region_len:
+                continue
+            if _near_existing_cut(start_s, existing_s, endpoint_margin * 0.50) and _near_existing_cut(
+                end_s,
+                existing_s,
+                endpoint_margin * 0.50,
+            ):
+                continue
+            candidates.append((score, start_s, end_s))
+
+    candidates.sort(key=lambda item: item[0])
+    out: list[tuple[float, float]] = []
+    for _score, start_s, end_s in candidates:
         if _overlaps_existing_region(start_s, end_s, out, min_gap=max(8.0, radius * 3.0)):
             continue
         out.append((start_s, end_s))
         if len(out) >= 3:
             break
     return out
+
+
+def _corner_peak_indices(signal: np.ndarray, peak_floor: float) -> list[int]:
+    if len(signal) < 5:
+        return []
+    peaks: list[int] = []
+    for idx in range(1, len(signal) - 1):
+        value = float(signal[idx])
+        if value < peak_floor:
+            continue
+        if value >= float(signal[idx - 1]) and value > float(signal[idx + 1]):
+            peaks.append(idx)
+    if not peaks:
+        best = int(np.nanargmax(signal))
+        if float(signal[best]) >= peak_floor:
+            peaks.append(best)
+    peaks.sort(key=lambda item: float(signal[item]), reverse=True)
+    return peaks[:8]
+
+
+def _score_designer_corner_peak(
+    signal: np.ndarray,
+    opposite: np.ndarray,
+    ds: np.ndarray,
+    turn_s: np.ndarray,
+    peak_idx: int,
+    *,
+    length: float,
+    radius: float,
+    min_region_len: float,
+    max_region_len: float,
+) -> tuple[float, float, float] | None:
+    """Find Alias-style support points around one localized curvature transition.
+
+    A designer does not cut exactly at the maximum-curvature sample. They mark the
+    beginning and end of the blend where curvature starts rising from the support span and
+    where it returns to the next support span. This routine scores those two boundaries.
+    """
+    peak = float(signal[peak_idx])
+    if peak <= 1e-9:
+        return None
+
+    total_positive_turn = _turn_integral(signal, ds)
+    min_turn = max(math.radians(10.0), min(math.radians(24.0), total_positive_turn * 0.11))
+    max_turn = min(math.radians(122.0), max(math.radians(34.0), total_positive_turn * 0.72))
+    best: tuple[float, float, float] | None = None
+    for drop_ratio in (0.18, 0.22, 0.26, 0.32, 0.40, 0.48):
+        threshold = peak * drop_ratio
+        coarse_left, coarse_right = _corner_boundaries_for_peak(signal, peak_idx, threshold)
+        left_candidates = _designer_boundary_candidates(signal, coarse_left, peak_idx, side=-1)
+        right_candidates = _designer_boundary_candidates(signal, coarse_right, peak_idx, side=1)
+        for left in left_candidates:
+            for right in right_candidates:
+                if right <= left + 2:
+                    continue
+                start_s = float(turn_s[max(0, left)])
+                end_s = float(turn_s[min(len(turn_s) - 1, right)])
+                region_len = end_s - start_s
+                if region_len < min_region_len or region_len > max_region_len:
+                    continue
+                if left == 0 and right >= len(signal) - 1:
+                    continue
+
+                region_signal = signal[left : right + 1]
+                region_opposite = opposite[left : right + 1]
+                region_ds = ds[left : right + 1]
+                region_turn = _turn_integral(region_signal, region_ds)
+                if region_turn < min_turn or region_turn > max_turn:
+                    continue
+                opposite_turn = _turn_integral(region_opposite, region_ds)
+                if opposite_turn > region_turn * 0.13:
+                    continue
+
+                peak_shape = _single_peak_violation(region_signal)
+                if peak_shape > 0.36:
+                    continue
+                support_score = _designer_support_score(
+                    signal,
+                    opposite,
+                    ds,
+                    turn_s,
+                    left,
+                    right,
+                    peak,
+                    radius=radius,
+                    length=length,
+                )
+                if support_score is None:
+                    continue
+
+                symmetry = _corner_symmetry_score(signal, ds, turn_s, left, right, peak_idx)
+                boundary_drop = (float(signal[left]) + float(signal[right])) / max(2.0 * peak, 1e-9)
+                region_ratio = region_len / max(length, 1e-9)
+                length_penalty = max(0.0, region_ratio - 0.24) * 115.0
+                length_penalty += max(0.0, 0.045 - region_ratio) * 80.0
+                edge_bias = 0.0
+                if start_s <= max(6.0, radius * 2.0):
+                    edge_bias += 10.0
+                if length - end_s <= max(6.0, radius * 2.0):
+                    edge_bias += 10.0
+                score = (
+                    support_score
+                    + symmetry
+                    + peak_shape * 70.0
+                    + boundary_drop * 26.0
+                    + length_penalty
+                    + edge_bias
+                    + abs(region_turn - math.radians(48.0)) * 2.5
+                )
+                if best is None or score < best[0]:
+                    best = (score, start_s, end_s)
+    return best
+
+
+def _designer_boundary_candidates(
+    signal: np.ndarray,
+    coarse: int,
+    peak_idx: int,
+    *,
+    side: int,
+) -> list[int]:
+    if len(signal) == 0:
+        return []
+    peak_idx = max(0, min(int(peak_idx), len(signal) - 1))
+    coarse = max(0, min(int(coarse), len(signal) - 1))
+    radius = max(2, min(12, int(round(len(signal) * 0.045))))
+    candidates = {coarse}
+    if side < 0:
+        lo = max(0, coarse - radius)
+        hi = min(peak_idx - 1, coarse + radius)
+    else:
+        lo = max(peak_idx + 1, coarse - radius)
+        hi = min(len(signal) - 1, coarse + radius)
+    if hi >= lo:
+        window = signal[lo : hi + 1]
+        local_min = lo + int(np.nanargmin(window))
+        candidates.add(local_min)
+        for idx in range(lo + 1, hi):
+            if float(signal[idx]) <= float(signal[idx - 1]) and float(signal[idx]) <= float(signal[idx + 1]):
+                candidates.add(idx)
+    return sorted(candidates)
+
+
+def _designer_support_score(
+    signal: np.ndarray,
+    opposite: np.ndarray,
+    ds: np.ndarray,
+    turn_s: np.ndarray,
+    left: int,
+    right: int,
+    peak: float,
+    *,
+    radius: float,
+    length: float,
+) -> float | None:
+    start_s = float(turn_s[left])
+    end_s = float(turn_s[right])
+    support_len = max(10.0, radius * 3.5, min(length * 0.075, max((end_s - start_s) * 0.62, 14.0)))
+    guard = max(2.0, radius * 0.9)
+    left_mask = (turn_s >= start_s - support_len) & (turn_s <= start_s - guard)
+    right_mask = (turn_s >= end_s + guard) & (turn_s <= end_s + support_len)
+    left_score = _designer_one_side_support_score(signal, opposite, ds, left_mask, peak)
+    right_score = _designer_one_side_support_score(signal, opposite, ds, right_mask, peak)
+
+    missing = 0
+    if left_score is None:
+        missing += 1
+        left_score = 8.0
+    if right_score is None:
+        missing += 1
+        right_score = 8.0
+    if missing >= 2:
+        return None
+
+    boundary_level = max(float(signal[left]), float(signal[right])) / max(peak, 1e-9)
+    if boundary_level > 0.72:
+        return None
+    return float(left_score + right_score + max(0.0, boundary_level - 0.36) * 22.0)
+
+
+def _designer_one_side_support_score(
+    signal: np.ndarray,
+    opposite: np.ndarray,
+    ds: np.ndarray,
+    mask: np.ndarray,
+    peak: float,
+) -> float | None:
+    count = min(len(mask), len(signal), len(ds))
+    if count <= 1:
+        return None
+    mask = mask[:count]
+    if not np.any(mask):
+        return None
+    values = signal[:count][mask]
+    opposite_values = opposite[:count][mask]
+    local_ds = ds[:count][mask]
+    if len(values) < 2 or float(np.sum(local_ds)) <= 1e-6:
+        return None
+    mean_density = _turn_integral(values, local_ds) / max(float(np.sum(local_ds)), 1e-6)
+    p85_density = float(np.percentile(values, 85)) if len(values) else 0.0
+    opposite_density = _turn_integral(opposite_values, local_ds) / max(float(np.sum(local_ds)), 1e-6)
+    if mean_density > peak * 0.58 or p85_density > peak * 0.78:
+        return None
+    if opposite_density > peak * 0.13:
+        return None
+    return float((mean_density / max(peak, 1e-9)) * 16.0 + (p85_density / max(peak, 1e-9)) * 10.0)
+
+
+def _score_corner_peak(
+    signal: np.ndarray,
+    opposite: np.ndarray,
+    ds: np.ndarray,
+    turn_s: np.ndarray,
+    peak_idx: int,
+    *,
+    length: float,
+    radius: float,
+    min_region_len: float,
+    max_region_len: float,
+) -> tuple[float, float, float] | None:
+    peak = float(signal[peak_idx])
+    if peak <= 1e-9:
+        return None
+    best: tuple[float, float, float] | None = None
+    for drop_ratio in (0.16, 0.20, 0.24, 0.28):
+        left, right = _corner_boundaries_for_peak(signal, peak_idx, peak * drop_ratio)
+        start_s = float(turn_s[max(0, left)])
+        end_s = float(turn_s[min(len(turn_s) - 1, right)])
+        region_len = end_s - start_s
+        if region_len < min_region_len or region_len > max_region_len:
+            continue
+
+        region_signal = signal[left : right + 1]
+        region_ds = ds[left : right + 1]
+        region_opposite = opposite[left : right + 1]
+        region_turn = _turn_integral(region_signal, region_ds)
+        if region_turn < math.radians(15.0):
+            continue
+        if _single_peak_violation(region_signal) > 0.42:
+            continue
+        if _turn_integral(region_opposite, region_ds) > region_turn * 0.16:
+            continue
+
+        support = _corner_support_score(
+            signal,
+            opposite,
+            ds,
+            turn_s,
+            start_s,
+            end_s,
+            peak,
+            radius=radius,
+            length=length,
+        )
+        if support is None:
+            continue
+        peak_s = float(turn_s[peak_idx])
+        symmetry = _corner_symmetry_score(signal, ds, turn_s, left, right, peak_idx)
+        score = support + symmetry + _single_peak_violation(region_signal) * 55.0
+        if best is None or score < best[0]:
+            best = (score, start_s, end_s)
+    return best
+
+
+def _corner_boundaries_for_peak(signal: np.ndarray, peak_idx: int, threshold: float) -> tuple[int, int]:
+    left = int(peak_idx)
+    right = int(peak_idx)
+    while left > 0 and float(signal[left - 1]) >= threshold:
+        left -= 1
+    while right < len(signal) - 1 and float(signal[right + 1]) >= threshold:
+        right += 1
+    return left, right
+
+
+def _corner_support_score(
+    signal: np.ndarray,
+    opposite: np.ndarray,
+    ds: np.ndarray,
+    turn_s: np.ndarray,
+    start_s: float,
+    end_s: float,
+    peak: float,
+    *,
+    radius: float,
+    length: float,
+) -> float | None:
+    guard = max(radius * 1.4, 3.0)
+    support_len = max(14.0, radius * 5.0, min(length * 0.10, max((end_s - start_s) * 0.85, 18.0)))
+    left_mask = (turn_s >= start_s - support_len) & (turn_s <= start_s - guard)
+    right_mask = (turn_s >= end_s + guard) & (turn_s <= end_s + support_len)
+    if _mask_length(ds, left_mask) < support_len * 0.34 or _mask_length(ds, right_mask) < support_len * 0.34:
+        return None
+
+    left_score = _low_curvature_support_score(signal, opposite, ds, left_mask, peak)
+    right_score = _low_curvature_support_score(signal, opposite, ds, right_mask, peak)
+    if left_score is None or right_score is None:
+        return None
+    return float(left_score + right_score)
+
+
+def _low_curvature_support_score(
+    signal: np.ndarray,
+    opposite: np.ndarray,
+    ds: np.ndarray,
+    mask: np.ndarray,
+    peak: float,
+) -> float | None:
+    support_signal = signal[mask]
+    support_opposite = opposite[mask]
+    support_ds = ds[mask]
+    if len(support_signal) < 2:
+        return None
+    support_len = max(float(np.sum(support_ds)), 1e-6)
+    mean_density = _turn_integral(support_signal, support_ds) / support_len
+    opposite_density = _turn_integral(support_opposite, support_ds) / support_len
+    max_density = float(np.max(support_signal)) if len(support_signal) else 0.0
+    if mean_density > peak * 0.34 or max_density > peak * 0.68:
+        return None
+    if opposite_density > peak * 0.18:
+        return None
+    smoothness = float(np.std(support_signal) / max(peak, 1e-9))
+    return float((mean_density / max(peak, 1e-9)) * 18.0 + (max_density / max(peak, 1e-9)) * 10.0 + smoothness * 8.0)
+
+
+def _corner_symmetry_score(
+    signal: np.ndarray,
+    ds: np.ndarray,
+    turn_s: np.ndarray,
+    left: int,
+    right: int,
+    peak_idx: int,
+) -> float:
+    peak_s = float(turn_s[peak_idx])
+    start_s = float(turn_s[left])
+    end_s = float(turn_s[right])
+    left_len = max(peak_s - start_s, 1e-6)
+    right_len = max(end_s - peak_s, 1e-6)
+    len_ratio = max(left_len, right_len) / max(min(left_len, right_len), 1e-6)
+    left_turn = _turn_integral(signal[left : peak_idx + 1], ds[left : peak_idx + 1])
+    right_turn = _turn_integral(signal[peak_idx : right + 1], ds[peak_idx : right + 1])
+    turn_ratio = max(left_turn, right_turn) / max(min(left_turn, right_turn), math.radians(0.6))
+    return float(max(0.0, len_ratio - 1.65) * 28.0 + max(0.0, turn_ratio - 1.85) * 24.0)
+
+
+def _single_peak_violation(values: np.ndarray) -> float:
+    if len(values) < 5:
+        return 0.0
+    smooth = _smooth_1d(values, window=5)
+    peak_idx = int(np.nanargmax(smooth))
+    left = np.diff(smooth[: peak_idx + 1])
+    right = np.diff(smooth[peak_idx:])
+    scale = max(float(np.nanmax(smooth)), 1e-9)
+    wrong_left = np.clip(-left, 0.0, None)
+    wrong_right = np.clip(right, 0.0, None)
+    penalty = 0.0
+    if len(wrong_left):
+        penalty += float(np.mean((wrong_left / scale) ** 2))
+    if len(wrong_right):
+        penalty += float(np.mean((wrong_right / scale) ** 2))
+    return penalty
+
+
+def _turn_integral(values: np.ndarray, ds: np.ndarray) -> float:
+    if len(values) == 0 or len(ds) == 0:
+        return 0.0
+    count = min(len(values), len(ds))
+    return float(np.sum(np.asarray(values[:count], dtype=float) * np.asarray(ds[:count], dtype=float)))
+
+
+def _mask_length(ds: np.ndarray, mask: np.ndarray) -> float:
+    if len(ds) == 0 or len(mask) == 0:
+        return 0.0
+    count = min(len(ds), len(mask))
+    return float(np.sum(ds[:count][mask[:count]]))
 
 
 def _smooth_xy(points: np.ndarray, window: int) -> np.ndarray:

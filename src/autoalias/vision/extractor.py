@@ -293,7 +293,8 @@ def _line_art_ink(image: np.ndarray) -> tuple[np.ndarray, np.ndarray, str]:
     cv2 = _require_cv2()
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     if _is_white_on_black_sketch(image):
-        return gray, _white_on_black_sketch_ink(gray), "white_on_black_sketch"
+        stroke = _black_background_stroke_strength(image)
+        return stroke, _white_on_black_sketch_ink(stroke), "white_on_black_sketch"
 
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
     _, ink = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
@@ -354,6 +355,18 @@ def _pencil_weak_line_ink(gray: np.ndarray, weak_threshold: float = 32.0) -> np.
     mask = cv2.morphologyEx(marker * 255, cv2.MORPH_CLOSE, close, iterations=1)
     mask = _remove_tiny_ink_components((mask > 0).astype(np.uint8), min_area=2, min_extent=2)
     return mask * 255
+
+
+def _black_background_stroke_strength(image: np.ndarray) -> np.ndarray:
+    """Brightness signal for black-background sketches with colored or white strokes."""
+    cv2 = _require_cv2()
+    arr = np.asarray(image, dtype=np.uint8)
+    if arr.ndim == 2:
+        return arr
+    gray = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
+    value = np.max(arr, axis=2).astype(np.uint8)
+    # Colored strokes such as dark green can have low luminance but useful channel value.
+    return np.maximum(gray, value)
 
 
 def _white_on_black_sketch_ink(gray: np.ndarray) -> np.ndarray:

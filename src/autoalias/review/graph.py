@@ -20,6 +20,7 @@ from autoalias.vision.extractor import (
     _is_line_art,
     _is_white_on_black_sketch,
     _line_art_ink,
+    _black_background_stroke_strength,
     _pencil_weak_line_ink,
     _prune_skeleton_artifacts,
     _require_cv2,
@@ -235,7 +236,7 @@ def build_review_graph_bundle(
     options = options or ReviewGraphOptions()
     cv2 = _require_cv2()
     path = Path(image_path)
-    image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    image = _read_image_color(path)
     if image is None:
         raise FileNotFoundError(f"cannot read image: {path}")
 
@@ -245,7 +246,7 @@ def build_review_graph_bundle(
     if extraction_mode == "pencil_weak_line_art":
         ink = _pencil_weak_line_ink(gray, options.weak_line_threshold)
     elif extraction_mode == "white_on_black_sketch":
-        ink = _white_on_black_sketch_ink(gray)
+        ink = _white_on_black_sketch_ink(_black_background_stroke_strength(image))
     elif extraction_mode == "black_on_white_line_art":
         _gray, ink, extraction_mode = _line_art_ink(image)
         if options.extraction_mode == "black_on_white_line_art" and extraction_mode != "black_on_white_line_art":
@@ -360,6 +361,19 @@ def build_review_graph_bundle(
         "junction_points": junction_points,
         "nodes": node_list,
     }, router
+
+
+def _read_image_color(path: Path) -> np.ndarray | None:
+    cv2 = _require_cv2()
+    try:
+        data = np.fromfile(str(path), dtype=np.uint8)
+    except Exception:
+        data = np.asarray([], dtype=np.uint8)
+    if data.size:
+        image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+        if image is not None:
+            return image
+    return cv2.imread(str(path), cv2.IMREAD_COLOR)
 
 
 def graph_snapshot_for_training(graph: dict[str, Any]) -> dict[str, Any]:
