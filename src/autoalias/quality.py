@@ -14,11 +14,17 @@ class ClassAValidator:
         max_chamfer_px: float = 6.0,
         max_cv_spacing_ratio: float = 6.0,
         max_curvature_peaks: int = 4,
+        max_inflections: int = 1,
+        max_cv_spacing_rhythm: float = 12.0,
+        max_cv_curve_distance_rhythm: float = 14.0,
     ):
         self.samples = samples
         self.max_chamfer_px = max_chamfer_px
         self.max_cv_spacing_ratio = max_cv_spacing_ratio
         self.max_curvature_peaks = max_curvature_peaks
+        self.max_inflections = max_inflections
+        self.max_cv_spacing_rhythm = max_cv_spacing_rhythm
+        self.max_cv_curve_distance_rhythm = max_cv_curve_distance_rhythm
 
     def validate(self, curve: NURBSCurve, target_points: np.ndarray | None = None) -> QualityReport:
         warnings: list[str] = []
@@ -39,6 +45,10 @@ class ClassAValidator:
         metrics.update(cv_metrics)
         if cv_metrics["cv_spacing_ratio"] > self.max_cv_spacing_ratio:
             warnings.append("CV spacing ratio is too high")
+        if cv_metrics["cv_spacing_rhythm_penalty"] > self.max_cv_spacing_rhythm:
+            warnings.append("CV spacing rhythm is not monotone/constant")
+        if cv_metrics["cv_curve_distance_rhythm_penalty"] > self.max_cv_curve_distance_rhythm:
+            warnings.append("CV-to-curve distance rhythm is not gradual")
         if cv_metrics["control_polygon_turnback"]:
             warnings.append("control polygon has turnback/self-crossing risk")
 
@@ -48,6 +58,8 @@ class ClassAValidator:
             warnings.append("curvature comb has too many peaks")
         if curv_metrics["curvature_oscillation"] > 0.65:
             warnings.append("curvature oscillation is high")
+        if curv_metrics["inflection_count"] > self.max_inflections:
+            warnings.append("curve has more than one inflection")
 
         if target_points is not None and len(target_points) >= 2:
             err = self._geometric_error(curve, target_points)
@@ -82,10 +94,18 @@ class ClassAValidator:
             ratio = float("inf")
         else:
             ratio = float(np.max(positive) / max(np.min(positive), 1e-9))
+        spacing_rhythm = _sequence_rhythm_metrics(positive, allow_unimodal=False)
+        cv_distance_rhythm = _cv_curve_distance_rhythm(curve)
         return {
             "cv_spacing_ratio": ratio,
             "cv_min_spacing": float(np.min(positive)) if len(positive) else 0.0,
             "cv_max_spacing": float(np.max(positive)) if len(positive) else 0.0,
+            "cv_spacing_rhythm_penalty": float(spacing_rhythm["penalty"]),
+            "cv_spacing_rhythm_shape": str(spacing_rhythm["shape"]),
+            "cv_curve_distance_rhythm_penalty": float(cv_distance_rhythm["penalty"]),
+            "cv_curve_distance_rhythm_shape": str(cv_distance_rhythm["shape"]),
+            "cv_curve_distance_min": float(cv_distance_rhythm["min"]),
+            "cv_curve_distance_max": float(cv_distance_rhythm["max"]),
             "control_polygon_turnback": bool(_has_turnback(curve.cvs[:, :2])),
         }
 
@@ -134,6 +154,84 @@ def _inflection_locations(u: np.ndarray, k: np.ndarray) -> list[float]:
         last_sign = sign
         last_idx = i
     return out
+
+
+def _cv_curve_distance_rhythm(curve: NURBSCurve) -> dict[str, float | str]:
+    cvs = np.asarray(curve.cvs[:, :2], dtype=float)
+    if len(cvs) <= 3:
+        return {"penalty": 0.0, "shape": "short", "min": 0.0, "max": 0.0}
+    u = np.linspace(0.0, 1.0, 220)
+    samples = evaluate_bezier(curve.cvs, u, curve.weights)[:, :2]
+    values: list[float] = []
+    for cv in cvs[1:-1]:
+        distances = np.linalg.norm(samples - cv, axis=1)
+        values.append(float(np.min(distances)))
+    if not values:
+        return {"penalty": 0.0, "shape": "short", "min": 0.0, "max": 0.0}
+    distances_arr = np.asarray(values, dtype=float)
+    rhythm = _sequence_rhythm_metrics(distances_arr, allow_unimodal=True)
+    return {
+        "penalty": float(rhythm["penalty"]),
+        "shape": str(rhythm["shape"]),
+        "min": float(np.min(distances_arr)),
+        "max": float(np.max(distances_arr)),
+    }
+
+
+def _sequence_rhythm_metrics(values: np.ndarray, *, allow_unimodal: bool) -> dict[str, float | str]:
+    v = np.asarray(values, dtype=float)
+    v = v[np.isfinite(v)]
+    if len(v) < 3:
+        return {"penalty": 0.0, "shape": "short"}
+    scale = max(float(np.mean(np.abs(v))), float(np.ptp(v)), 1e-9)
+    delta = np.diff(v)
+    const_penalty = float(np.mean((delta / scale) ** 2) * 100.0)
+    increasing_penalty = _monotone_violation(delta, scale, increasing=True)
+    decreasing_penalty = _monotone_violation(delta, scale, increasing=False)
+    candidates: list[tuple[float, str]] = [
+        (const_penalty, "constant"),
+        (increasing_penalty, "increasing"),
+        (decreasing_penalty, "decreasing"),
+    ]
+    if allow_unimodal:
+        candidates.append((_single_lobe_penalty(v, scale, peak=True), "single_peak"))
+        candidates.append((_single_lobe_penalty(v, scale, peak=False), "single_valley"))
+    penalty, shape = min(candidates, key=lambda item: item[0])
+    return {"penalty": float(penalty), "shape": shape}
+
+
+def _monotone_violation(delta: np.ndarray, scale: float, *, increasing: bool) -> float:
+    if len(delta) == 0:
+        return 0.0
+    eps = scale * 0.035
+    if increasing:
+        bad = np.clip(-(delta + eps), 0.0, None)
+    else:
+        bad = np.clip(delta - eps, 0.0, None)
+    return float(np.mean((bad / max(scale, 1e-9)) ** 2) * 100.0)
+
+
+def _single_lobe_penalty(values: np.ndarray, scale: float, *, peak: bool) -> float:
+    if len(values) < 4:
+        return 0.0
+    best = float("inf")
+    for split in range(1, len(values) - 1):
+        left = np.diff(values[: split + 1])
+        right = np.diff(values[split:])
+        if peak:
+            penalty = _monotone_violation(left, scale, increasing=True) + _monotone_violation(
+                right,
+                scale,
+                increasing=False,
+            )
+        else:
+            penalty = _monotone_violation(left, scale, increasing=False) + _monotone_violation(
+                right,
+                scale,
+                increasing=True,
+            )
+        best = min(best, penalty)
+    return float(best)
 
 
 def _has_turnback(points: np.ndarray) -> bool:

@@ -333,6 +333,7 @@ def build_review_graph_bundle(
         )
     node_list.sort(key=lambda item: (-int(item["degree"]), item["id"]))
     coverage = _edge_coverage_metrics(skeleton, raw_edges, coverage_fragments)
+    junction_points = _make_router_junction_points(router, image_diag)
     design_strokes = _build_design_strokes(
         edges,
         router,
@@ -350,11 +351,13 @@ def build_review_graph_bundle(
         "image_size": {"width": int(w), "height": int(h)},
         "edge_count": len(edges),
         "design_stroke_count": len(design_strokes),
+        "junction_count": len(junction_points),
         "node_count": len(node_list),
         "coverage": coverage,
         "coverage_fragments": coverage_fragments,
         "edges": edges,
         "design_strokes": design_strokes,
+        "junction_points": junction_points,
         "nodes": node_list,
     }, router
 
@@ -370,6 +373,7 @@ def graph_snapshot_for_training(graph: dict[str, Any]) -> dict[str, Any]:
         "image_size": graph.get("image_size"),
         "edge_count": graph.get("edge_count", 0),
         "design_stroke_count": graph.get("design_stroke_count", 0),
+        "junction_count": graph.get("junction_count", 0),
         "node_count": graph.get("node_count", 0),
         "edges": [
             {
@@ -394,6 +398,7 @@ def graph_snapshot_for_training(graph: dict[str, Any]) -> dict[str, Any]:
             }
             for stroke in graph.get("design_strokes", [])
         ],
+        "junction_points": graph.get("junction_points", []),
         "nodes": graph.get("nodes", []),
     }
 
@@ -473,6 +478,70 @@ def _promote_fragment_as_edge(
     if len(points) < 2:
         return False
     return float(length) >= 0.75
+
+
+def _make_router_junction_points(
+    router: SkeletonRouter,
+    image_diag: float,
+) -> list[dict[str, Any]]:
+    coords = np.asarray(router.coords, dtype=float)
+    if len(coords) == 0:
+        return []
+    junction_indices = [
+        idx for idx, neighbors in enumerate(router.adjacency) if len(neighbors) >= 3
+    ]
+    if not junction_indices:
+        return []
+    cluster_radius = max(2.2, min(6.0, float(image_diag) * 0.0016))
+    cell_size = max(cluster_radius, 1.0)
+    clusters: list[dict[str, Any]] = []
+    grid: dict[tuple[int, int], list[int]] = {}
+    for idx in junction_indices:
+        point = coords[idx, :2]
+        degree = len(router.adjacency[idx])
+        cluster_idx = _assign_junction_cluster(clusters, grid, point, cluster_radius, cell_size)
+        cluster = clusters[cluster_idx]
+        cluster["points"].append(point)
+        cluster["degrees"].append(degree)
+    out: list[dict[str, Any]] = []
+    for idx, cluster in enumerate(clusters):
+        points = np.vstack(cluster["points"])
+        point = np.mean(points, axis=0)
+        out.append(
+            {
+                "id": f"junction_{idx:04d}",
+                "x": round(float(point[0]), 3),
+                "y": round(float(point[1]), 3),
+                "degree": int(max(cluster["degrees"])),
+                "pixel_count": int(len(cluster["points"])),
+            }
+        )
+    out.sort(key=lambda item: (float(item["y"]), float(item["x"])))
+    return out
+
+
+def _assign_junction_cluster(
+    clusters: list[dict[str, Any]],
+    grid: dict[tuple[int, int], list[int]],
+    point: np.ndarray,
+    radius: float,
+    cell_size: float,
+) -> int:
+    cell = _grid_cell(point, cell_size)
+    best: tuple[float, int] | None = None
+    for gy in range(cell[1] - 1, cell[1] + 2):
+        for gx in range(cell[0] - 1, cell[0] + 2):
+            for idx in grid.get((gx, gy), []):
+                cluster_point = np.mean(np.vstack(clusters[idx]["points"]), axis=0)
+                dist = float(np.linalg.norm(point - cluster_point))
+                if dist <= radius and (best is None or dist < best[0]):
+                    best = (dist, idx)
+    if best is not None:
+        return best[1]
+    clusters.append({"points": [], "degrees": []})
+    idx = len(clusters) - 1
+    grid.setdefault(cell, []).append(idx)
+    return idx
 
 
 def _build_design_strokes(

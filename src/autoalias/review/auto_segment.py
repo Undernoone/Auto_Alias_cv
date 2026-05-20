@@ -18,7 +18,57 @@ class _GraphEdge:
     length: float
 
 
+@dataclass(slots=True)
+class _SpanCut:
+    s: float
+    point: np.ndarray
+    kind: str
+    source_edge: str = ""
+
+
+@dataclass(slots=True)
+class _EndpointRecord:
+    edge_id: str
+    point: np.ndarray
+    s: float
+    at_start: bool
+
+
+@dataclass(slots=True)
+class _EndpointCluster:
+    id: int
+    point: np.ndarray
+    records: list[_EndpointRecord]
+
+
 def suggest_geometry_segments(
+    graph: dict[str, Any],
+    *,
+    max_curves: int = 32,
+    min_length: float | None = None,
+    max_turn_deg: float = 28.0,
+    max_junction_turn_deg: float = 18.0,
+    max_chain_edges: int = 8,
+    max_gap: float = 0.0,
+    max_gap_turn_deg: float | None = None,
+) -> list[dict[str, Any]]:
+    """Suggest curves by splitting strokes only at real geometric intersections.
+
+    This is the active production path. It deliberately does not extend/merge strokes by
+    tangent continuity. A span boundary is created only at stroke endpoints and at places
+    where another stroke crosses, touches, or branches into the current stroke.
+    """
+    _ = (max_turn_deg, max_junction_turn_deg, max_chain_edges, max_gap, max_gap_turn_deg)
+    return _suggest_intersection_only_segments(
+        graph,
+        max_curves=max_curves,
+        min_length=min_length,
+    )
+
+
+# Legacy chaining logic kept for reference. It is no longer called by
+# `suggest_geometry_segments` because it could merge long car outlines into one curve.
+def _suggest_geometry_segments_legacy(
     graph: dict[str, Any],
     *,
     max_curves: int = 32,
@@ -84,6 +134,792 @@ def suggest_geometry_segments(
             break
 
     return suggestions
+
+
+def _suggest_intersection_only_segments(
+    graph: dict[str, Any],
+    *,
+    max_curves: int,
+    min_length: float | None,
+) -> list[dict[str, Any]]:
+    edges = _read_edges(graph)
+    if not edges:
+        return []
+    image_size = graph.get("image_size", {}) or {}
+    diag = float(
+        math.hypot(
+            float(image_size.get("width", 0.0) or 0.0),
+            float(image_size.get("height", 0.0) or 0.0),
+        )
+    )
+    min_length_value = float(min_length if min_length is not None else max(18.0, diag * 0.018))
+    max_curves = max(1, min(int(max_curves), 512))
+    intersection_radius = max(3.0, diag * 0.0035)
+
+    cuts_by_edge = _intersection_cuts_by_edge(graph, edges, intersection_radius)
+    suggestions: list[dict[str, Any]] = []
+    sorted_edges = sorted(edges.values(), key=lambda item: item.length, reverse=True)
+    for edge in sorted_edges:
+        if edge.length < min_length_value:
+            continue
+        cuts = _sorted_edge_cuts(edge, cuts_by_edge.get(edge.id, []))
+        if len(cuts) < 2:
+            continue
+        route_segments = _route_segments_from_cuts(
+            edge,
+            cuts,
+            min_span_length=max(4.0, min_length_value * 0.12),
+            min_span_chord=max(3.0, diag * 0.0015),
+        )
+        if not route_segments:
+            continue
+        manual_points = _manual_points_from_cuts(edge, route_segments)
+        if len(manual_points) < 2:
+            continue
+        route_points = _round_points(edge.points)
+        suggestions.append(
+            {
+                "id": f"geo_curve_{int(time.time() * 1000):x}_{len(suggestions):03d}",
+                "type": "manual_design_curve",
+                "semantic": edge.label,
+                "edge_ids": [edge.id],
+                "manual_points": manual_points,
+                "cut_points": manual_points,
+                "closed": False,
+                "routed_points": route_points,
+                "route_segments": route_segments,
+                "branch_choices": [0 for _ in route_segments],
+                "route_ok": True,
+                "source": "geometry_auto_segment_junction_corner",
+                "preserve_route_segments": True,
+                "span_split_policy": "junctions_and_corner_blends",
+                "confidence": round(float(min(0.96, 0.42 + edge.length / 900.0)), 3),
+                "reason": (
+                    "junction/corner span split: shared stroke endpoints, endpoint-to-stroke "
+                    "junctions, and localized corner blend regions"
+                ),
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            }
+        )
+        if len(suggestions) >= max_curves:
+            break
+    return suggestions
+
+
+def _intersection_cuts_by_edge(
+    graph: dict[str, Any],
+    edges: dict[str, _GraphEdge],
+    radius: float,
+) -> dict[str, list[_SpanCut]]:
+    cuts: dict[str, list[_SpanCut]] = {edge_id: [] for edge_id in edges}
+    for edge in edges.values():
+        cuts[edge.id].append(_SpanCut(0.0, edge.points[0].copy(), "endpoint"))
+        cuts[edge.id].append(_SpanCut(edge.length, edge.points[-1].copy(), "endpoint"))
+
+    segment_grid, cell_size = _build_segment_grid(edges, radius)
+    endpoint_clusters = _endpoint_clusters(edges, radius)
+    _add_shared_endpoint_cuts(cuts, endpoint_clusters)
+    _add_endpoint_cluster_touch_cuts(cuts, edges, endpoint_clusters, segment_grid, cell_size, radius)
+    _add_corner_blend_cuts(cuts, edges, radius)
+
+    # Deliberately not using raw pixel degree>=3 nodes or arbitrary segment intersections
+    # here. Those create many false junctions on sketch noise, double outlines, and nearby
+    # parallel pencil strokes. The production rule is now: split at shared junctions, at
+    # endpoint-to-stroke T/Y junctions, and at localized high-turn blend regions.
+    return cuts
+
+
+def _endpoint_clusters(
+    edges: dict[str, _GraphEdge],
+    radius: float,
+) -> list[_EndpointCluster]:
+    records: list[_EndpointRecord] = []
+    for edge in edges.values():
+        records.append(_EndpointRecord(edge.id, edge.points[0].copy(), 0.0, True))
+        records.append(_EndpointRecord(edge.id, edge.points[-1].copy(), edge.length, False))
+    if not records:
+        return []
+
+    cluster_radius = max(radius * 1.45, 4.0)
+    parent = list(range(len(records)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        root_left = find(left)
+        root_right = find(right)
+        if root_left != root_right:
+            parent[root_right] = root_left
+
+    grid: dict[tuple[int, int], list[int]] = {}
+    for index, record in enumerate(records):
+        cell = _grid_cell(record.point, cluster_radius)
+        for gy in range(cell[1] - 1, cell[1] + 2):
+            for gx in range(cell[0] - 1, cell[0] + 2):
+                for other_index in grid.get((gx, gy), []):
+                    if np.linalg.norm(record.point - records[other_index].point) <= cluster_radius:
+                        union(index, other_index)
+        grid.setdefault(cell, []).append(index)
+
+    grouped: dict[int, list[_EndpointRecord]] = {}
+    for index, record in enumerate(records):
+        grouped.setdefault(find(index), []).append(record)
+
+    clusters: list[_EndpointCluster] = []
+    for cluster_id, items in enumerate(grouped.values()):
+        points = np.vstack([item.point for item in items])
+        clusters.append(_EndpointCluster(cluster_id, np.mean(points, axis=0), items))
+    return clusters
+
+
+def _add_shared_endpoint_cuts(
+    cuts: dict[str, list[_SpanCut]],
+    clusters: list[_EndpointCluster],
+) -> None:
+    for cluster in clusters:
+        edge_ids = {record.edge_id for record in cluster.records}
+        if len(edge_ids) < 2:
+            continue
+        kind = "shared_junction_endpoint" if len(edge_ids) >= 3 else "shared_endpoint"
+        source = f"endpoint_cluster_{cluster.id}"
+        for record in cluster.records:
+            cuts[record.edge_id].append(_SpanCut(record.s, cluster.point.copy(), kind, source))
+
+
+def _add_endpoint_cluster_touch_cuts(
+    cuts: dict[str, list[_SpanCut]],
+    edges: dict[str, _GraphEdge],
+    clusters: list[_EndpointCluster],
+    segment_grid: dict[tuple[int, int], list[dict[str, Any]]],
+    cell_size: float,
+    radius: float,
+) -> None:
+    """Split through-strokes when an endpoint junction lands on their middle.
+
+    The graph topology is pixel based, so a real T/Y design junction can be missed when
+    branch endpoints are one or two pixels away from the through stroke. This pass detects
+    that case from endpoint clusters while rejecting near-parallel overlaps.
+    """
+    touch_radius = max(radius * 1.85, 5.0)
+    endpoint_margin = max(radius * 1.25, 4.0)
+    min_cross_angle = math.radians(14.0)
+    for cluster in clusters:
+        cluster_edge_ids = {record.edge_id for record in cluster.records}
+        for other_id, projected, other_s, distance in _nearby_polyline_projections(
+            cluster.point,
+            segment_grid,
+            cell_size,
+            touch_radius,
+        ):
+            if other_id in cluster_edge_ids:
+                continue
+            other_edge = edges.get(other_id)
+            if other_edge is None:
+                continue
+            if distance > touch_radius:
+                continue
+            if other_s <= endpoint_margin or other_edge.length - other_s <= endpoint_margin:
+                continue
+            other_tangent = _polyline_tangent_at_s(other_edge.points, other_s)
+            angle_ok = False
+            for record in cluster.records:
+                edge = edges.get(record.edge_id)
+                if edge is None:
+                    continue
+                endpoint_tangent = _edge_tangent_at_endpoint(edge, record.at_start)
+                if _undirected_angle_between(endpoint_tangent, other_tangent) >= min_cross_angle:
+                    angle_ok = True
+                    break
+            if not angle_ok:
+                continue
+            shared_point = projected.copy()
+            source = f"endpoint_cluster_{cluster.id}"
+            for record in cluster.records:
+                cuts[record.edge_id].append(
+                    _SpanCut(record.s, shared_point.copy(), "endpoint_touch_junction", other_id)
+                )
+            cuts[other_id].append(_SpanCut(other_s, shared_point, "endpoint_touch_projection", source))
+
+
+def _add_corner_blend_cuts(
+    cuts: dict[str, list[_SpanCut]],
+    edges: dict[str, _GraphEdge],
+    radius: float,
+) -> None:
+    for edge in edges.values():
+        if edge.length < max(42.0, radius * 12.0) or len(edge.points) < 8:
+            continue
+        existing = cuts.get(edge.id, [])
+        regions = _detect_corner_blend_regions(edge, radius, existing)
+        for region_index, (start_s, end_s) in enumerate(regions):
+            start_point = _interpolate_polyline(edge.points, _cumulative_lengths(edge.points), start_s)
+            end_point = _interpolate_polyline(edge.points, _cumulative_lengths(edge.points), end_s)
+            source = f"corner_blend_{region_index}"
+            cuts[edge.id].append(_SpanCut(start_s, start_point, "corner_blend_start", source))
+            cuts[edge.id].append(_SpanCut(end_s, end_point, "corner_blend_end", source))
+
+
+def _detect_corner_blend_regions(
+    edge: _GraphEdge,
+    radius: float,
+    existing_cuts: list[_SpanCut],
+) -> list[tuple[float, float]]:
+    length = float(edge.length)
+    if length <= 1e-6:
+        return []
+    sample_count = int(max(56, min(220, length / 2.6)))
+    cumulative = _cumulative_lengths(edge.points)
+    s_values = np.linspace(0.0, length, sample_count)
+    sampled = np.vstack([_interpolate_polyline(edge.points, cumulative, s) for s in s_values])
+    sampled = _smooth_xy(sampled, window=9 if sample_count >= 80 else 7)
+
+    vec = np.diff(sampled[:, :2], axis=0)
+    seg_len = np.linalg.norm(vec, axis=1)
+    valid = seg_len > 1e-6
+    if np.count_nonzero(valid) < 8:
+        return []
+    theta = np.unwrap(np.arctan2(vec[:, 1], vec[:, 0]))
+    dtheta = np.diff(theta)
+    ds = np.diff(s_values[:-1])
+    if len(ds) != len(dtheta):
+        ds = np.full(len(dtheta), length / max(len(dtheta), 1), dtype=float)
+    signed_density = dtheta / np.maximum(ds, 1e-6)
+    signed_density = _smooth_1d(signed_density, window=7)
+
+    positive_turn = float(np.sum(np.clip(signed_density, 0.0, None) * ds))
+    negative_turn = float(np.sum(np.clip(-signed_density, 0.0, None) * ds))
+    dominant_sign = 1 if positive_turn >= negative_turn else -1
+    dominant_turn = max(positive_turn, negative_turn)
+    opposite_turn = min(positive_turn, negative_turn)
+    if dominant_turn < math.radians(22.0):
+        return []
+    if opposite_turn > dominant_turn * 0.34:
+        return []
+
+    signal = np.clip(dominant_sign * signed_density, 0.0, None)
+    finite = signal[np.isfinite(signal)]
+    if len(finite) < 8 or float(np.max(finite)) <= 1e-9:
+        return []
+    nonzero = finite[finite > float(np.max(finite)) * 0.02]
+    if len(nonzero) < 4:
+        return []
+    peak = float(np.max(nonzero))
+    median = float(np.median(nonzero))
+    if peak < max(median * 1.45, 1.0 / max(length * 3.0, 1.0)):
+        return []
+
+    threshold = max(peak * 0.23, float(np.percentile(nonzero, 62)) * 0.75)
+    active = signal >= threshold
+    active = _close_boolean_gaps(active, max_gap=2)
+    components = _boolean_components(active)
+    if not components:
+        return []
+
+    min_region_len = max(12.0, radius * 4.0, length * 0.035)
+    max_region_len = max(45.0, length * 0.48)
+    endpoint_margin = max(10.0, radius * 4.0, length * 0.035)
+    existing_s = [float(cut.s) for cut in existing_cuts]
+    out: list[tuple[float, float]] = []
+    for start_idx, end_idx in components:
+        peak_idx = int(start_idx + np.argmax(signal[start_idx : end_idx + 1]))
+        left = peak_idx
+        right = peak_idx
+        low = max(peak * 0.12, threshold * 0.45)
+        while left > 0 and signal[left - 1] >= low:
+            left -= 1
+        while right < len(signal) - 1 and signal[right + 1] >= low:
+            right += 1
+
+        start_s = float(s_values[max(0, left)])
+        end_s = float(s_values[min(len(s_values) - 1, right + 1)])
+        region_len = end_s - start_s
+        if region_len < min_region_len or region_len > max_region_len:
+            continue
+        if start_s < endpoint_margin and length - end_s < endpoint_margin:
+            continue
+        if start_s < endpoint_margin:
+            start_s = 0.0
+        if length - end_s < endpoint_margin:
+            end_s = length
+        if end_s - start_s < min_region_len:
+            continue
+        region_turn = float(np.sum(signal[max(0, left) : min(len(signal), right + 1)] * ds[max(0, left) : min(len(ds), right + 1)]))
+        if region_turn < math.radians(16.0):
+            continue
+        if _near_existing_cut(start_s, existing_s, endpoint_margin * 0.55) and _near_existing_cut(
+            end_s,
+            existing_s,
+            endpoint_margin * 0.55,
+        ):
+            continue
+        if _overlaps_existing_region(start_s, end_s, out, min_gap=max(8.0, radius * 3.0)):
+            continue
+        out.append((start_s, end_s))
+        if len(out) >= 3:
+            break
+    return out
+
+
+def _smooth_xy(points: np.ndarray, window: int) -> np.ndarray:
+    if window < 3 or len(points) < window:
+        return np.asarray(points, dtype=float)
+    if window % 2 == 0:
+        window += 1
+    pts = np.asarray(points, dtype=float)
+    pad = window // 2
+    padded = np.pad(pts, ((pad, pad), (0, 0)), mode="edge")
+    kernel = np.ones(window, dtype=float) / float(window)
+    out = np.vstack([np.convolve(padded[:, idx], kernel, mode="valid") for idx in range(pts.shape[1])]).T
+    out[0] = pts[0]
+    out[-1] = pts[-1]
+    return out
+
+
+def _smooth_1d(values: np.ndarray, window: int) -> np.ndarray:
+    if window < 3 or len(values) < window:
+        return np.asarray(values, dtype=float)
+    if window % 2 == 0:
+        window += 1
+    pad = window // 2
+    padded = np.pad(np.asarray(values, dtype=float), (pad, pad), mode="edge")
+    kernel = np.ones(window, dtype=float) / float(window)
+    return np.convolve(padded, kernel, mode="valid")
+
+
+def _close_boolean_gaps(values: np.ndarray, *, max_gap: int) -> np.ndarray:
+    out = np.asarray(values, dtype=bool).copy()
+    if len(out) == 0:
+        return out
+    idx = 0
+    while idx < len(out):
+        if out[idx]:
+            idx += 1
+            continue
+        start = idx
+        while idx < len(out) and not out[idx]:
+            idx += 1
+        end = idx
+        if start > 0 and end < len(out) and end - start <= max_gap:
+            out[start:end] = True
+    return out
+
+
+def _boolean_components(values: np.ndarray) -> list[tuple[int, int]]:
+    out: list[tuple[int, int]] = []
+    idx = 0
+    while idx < len(values):
+        if not bool(values[idx]):
+            idx += 1
+            continue
+        start = idx
+        while idx + 1 < len(values) and bool(values[idx + 1]):
+            idx += 1
+        out.append((start, idx))
+        idx += 1
+    return out
+
+
+def _near_existing_cut(s: float, existing: list[float], tolerance: float) -> bool:
+    return any(abs(float(s) - other) <= tolerance for other in existing)
+
+
+def _overlaps_existing_region(
+    start_s: float,
+    end_s: float,
+    regions: list[tuple[float, float]],
+    *,
+    min_gap: float,
+) -> bool:
+    for a, b in regions:
+        if start_s <= b + min_gap and end_s >= a - min_gap:
+            return True
+    return False
+
+
+def _read_junction_points(graph: dict[str, Any]) -> list[np.ndarray]:
+    out: list[np.ndarray] = []
+    for item in graph.get("nodes", []) or []:
+        try:
+            degree = int(item.get("degree", 0) or 0)
+        except Exception:
+            degree = 0
+        if degree < 3:
+            continue
+        try:
+            out.append(np.asarray([float(item["x"]), float(item["y"])], dtype=float))
+        except Exception:
+            continue
+    if out:
+        return out
+    for item in graph.get("junction_points", []) or []:
+        try:
+            out.append(np.asarray([float(item["x"]), float(item["y"])], dtype=float))
+        except Exception:
+            continue
+    return out
+
+
+def _project_point_to_polyline(
+    points: np.ndarray,
+    point: np.ndarray,
+) -> tuple[np.ndarray, float, float]:
+    if len(points) == 0:
+        return np.zeros(2, dtype=float), 0.0, float("inf")
+    if len(points) == 1:
+        distance = float(np.linalg.norm(points[0, :2] - point))
+        return points[0, :2].copy(), 0.0, distance
+    cumulative = _cumulative_lengths(points)
+    best: tuple[float, np.ndarray, float] | None = None
+    for index in range(len(points) - 1):
+        projected, t, distance = _project_point_to_segment(point, points[index, :2], points[index + 1, :2])
+        s = float(cumulative[index] + t * max(float(cumulative[index + 1] - cumulative[index]), 1e-9))
+        if best is None or distance < best[0]:
+            best = (distance, projected, s)
+    if best is None:
+        return points[0, :2].copy(), 0.0, float("inf")
+    return best[1], best[2], best[0]
+
+
+def _nearby_polyline_projections(
+    point: np.ndarray,
+    segment_grid: dict[tuple[int, int], list[dict[str, Any]]],
+    cell_size: float,
+    radius: float,
+) -> list[tuple[str, np.ndarray, float, float]]:
+    center = _grid_cell(point, cell_size)
+    search = int(math.ceil(radius / max(cell_size, 1e-6))) + 1
+    best_by_edge: dict[str, tuple[float, np.ndarray, float]] = {}
+    for gy in range(center[1] - search, center[1] + search + 1):
+        for gx in range(center[0] - search, center[0] + search + 1):
+            for seg in segment_grid.get((gx, gy), []):
+                projected, t, distance = _project_point_to_segment(point, seg["a"], seg["b"])
+                if distance > radius:
+                    continue
+                edge_id = str(seg["edge_id"])
+                s = float(seg["s0"] + t * max(float(seg["length"]), 1e-9))
+                previous = best_by_edge.get(edge_id)
+                if previous is None or distance < previous[0]:
+                    best_by_edge[edge_id] = (distance, projected, s)
+    return [
+        (edge_id, projected, s, distance)
+        for edge_id, (distance, projected, s) in best_by_edge.items()
+    ]
+
+
+def _build_segment_grid(
+    edges: dict[str, _GraphEdge],
+    radius: float,
+) -> tuple[dict[tuple[int, int], list[dict[str, Any]]], float]:
+    cell_size = max(radius * 2.0, 6.0)
+    grid: dict[tuple[int, int], list[dict[str, Any]]] = {}
+    for edge in edges.values():
+        cumulative = _cumulative_lengths(edge.points)
+        for index in range(len(edge.points) - 1):
+            a = edge.points[index, :2]
+            b = edge.points[index + 1, :2]
+            length = float(np.linalg.norm(b - a))
+            if length <= 1e-9:
+                continue
+            seg = {
+                "edge_id": edge.id,
+                "index": index,
+                "a": a,
+                "b": b,
+                "length": length,
+                "s0": float(cumulative[index]),
+            }
+            x0 = min(float(a[0]), float(b[0])) - radius
+            x1 = max(float(a[0]), float(b[0])) + radius
+            y0 = min(float(a[1]), float(b[1])) - radius
+            y1 = max(float(a[1]), float(b[1])) + radius
+            c0 = _grid_cell(np.array([x0, y0]), cell_size)
+            c1 = _grid_cell(np.array([x1, y1]), cell_size)
+            for gy in range(c0[1], c1[1] + 1):
+                for gx in range(c0[0], c1[0] + 1):
+                    grid.setdefault((gx, gy), []).append(seg)
+    return grid, cell_size
+
+
+def _segment_pair_key(a: dict[str, Any], b: dict[str, Any]) -> tuple[str, int, str, int]:
+    left = (str(a["edge_id"]), int(a["index"]))
+    right = (str(b["edge_id"]), int(b["index"]))
+    if right < left:
+        left, right = right, left
+    return (left[0], left[1], right[0], right[1])
+
+
+def _segment_intersection_point(
+    a: np.ndarray,
+    b: np.ndarray,
+    c: np.ndarray,
+    d: np.ndarray,
+) -> np.ndarray | None:
+    r = b - a
+    s = d - c
+    denom = float(r[0] * s[1] - r[1] * s[0])
+    if abs(denom) < 1e-9:
+        return None
+    q = c - a
+    t = float((q[0] * s[1] - q[1] * s[0]) / denom)
+    u = float((q[0] * r[1] - q[1] * r[0]) / denom)
+    if -1e-6 <= t <= 1.0 + 1e-6 and -1e-6 <= u <= 1.0 + 1e-6:
+        return a + np.clip(t, 0.0, 1.0) * r
+    return None
+
+
+def _project_point_to_segment(
+    point: np.ndarray,
+    a: np.ndarray,
+    b: np.ndarray,
+) -> tuple[np.ndarray, float, float]:
+    ab = b - a
+    denom = float(np.dot(ab, ab))
+    if denom <= 1e-9:
+        projected = a
+        return projected, 0.0, float(np.linalg.norm(point - projected))
+    t = float(np.clip(np.dot(point - a, ab) / denom, 0.0, 1.0))
+    projected = a + t * ab
+    return projected, t, float(np.linalg.norm(point - projected))
+
+
+def _sorted_edge_cuts(edge: _GraphEdge, cuts: list[_SpanCut]) -> list[_SpanCut]:
+    tolerance = 2.0
+    out: list[_SpanCut] = []
+    for cut in sorted(cuts, key=lambda item: item.s):
+        s = max(0.0, min(float(cut.s), edge.length))
+        point = cut.point.astype(float, copy=False)
+        if out and abs(s - out[-1].s) <= tolerance:
+            if cut.kind != "endpoint":
+                merged_kind = out[-1].kind
+                if cut.kind not in merged_kind.split("+"):
+                    merged_kind = f"{merged_kind}+{cut.kind}"
+                out[-1] = _SpanCut(out[-1].s, point.copy(), merged_kind, cut.source_edge or out[-1].source_edge)
+            continue
+        out.append(_SpanCut(s, point, cut.kind, cut.source_edge))
+    if not out or out[0].s > tolerance:
+        out.insert(0, _SpanCut(0.0, edge.points[0].copy(), "endpoint"))
+    if edge.length - out[-1].s > tolerance:
+        out.append(_SpanCut(edge.length, edge.points[-1].copy(), "endpoint"))
+    return out
+
+
+def _route_segments_from_cuts(
+    edge: _GraphEdge,
+    cuts: list[_SpanCut],
+    *,
+    min_span_length: float,
+    min_span_chord: float,
+) -> list[dict[str, Any]]:
+    cumulative = _cumulative_lengths(edge.points)
+    segments: list[dict[str, Any]] = []
+    kept_boundaries = _compact_span_cuts(
+        edge,
+        cuts,
+        cumulative,
+        min_span_length=min_span_length,
+        min_span_chord=min_span_chord,
+    )
+    if len(kept_boundaries) < 2:
+        return []
+    segment_count = len(kept_boundaries) - 1
+    for index, (start, end) in enumerate(zip(kept_boundaries, kept_boundaries[1:])):
+        points = _slice_polyline(edge.points, cumulative, start.s, end.s)
+        if len(points) < 2:
+            continue
+        points = points.copy()
+        points[0, :2] = start.point[:2]
+        points[-1, :2] = end.point[:2]
+        length = _curve_length(points)
+        chord = float(np.linalg.norm(points[-1, :2] - points[0, :2]))
+        if length < max(1.0, min_span_length * 0.5) or chord < min_span_chord:
+            continue
+        segments.append(
+            {
+                "ok": True,
+                "points": _round_points(points),
+                "start_point": _round_point(start.point),
+                "end_point": _round_point(end.point),
+                "segment_index": index,
+                "selected_candidate": 0,
+                "length": round(float(length), 3),
+                "source": "geometry_auto_segment_junction_corner",
+                "edge_id": edge.id,
+                "start_kind": start.kind,
+                "end_kind": end.kind,
+                "start_s": round(float(start.s), 3),
+                "end_s": round(float(end.s), 3),
+                "segment_count": segment_count,
+            }
+        )
+    return segments
+
+
+def _compact_span_cuts(
+    edge: _GraphEdge,
+    cuts: list[_SpanCut],
+    cumulative: np.ndarray,
+    *,
+    min_span_length: float,
+    min_span_chord: float,
+) -> list[_SpanCut]:
+    if len(cuts) <= 2:
+        return cuts
+    sorted_cuts = sorted(cuts, key=lambda item: item.s)
+    compacted: list[_SpanCut] = [sorted_cuts[0]]
+    for index, cut in enumerate(sorted_cuts[1:], start=1):
+        is_last = index == len(sorted_cuts) - 1
+        previous = compacted[-1]
+        if not is_last and _span_between_cuts_is_too_short(
+            edge,
+            cumulative,
+            previous,
+            cut,
+            min_span_length=min_span_length,
+            min_span_chord=min_span_chord,
+        ):
+            continue
+        compacted.append(cut)
+
+    changed = True
+    while changed and len(compacted) > 2:
+        changed = False
+        for index in range(1, len(compacted) - 1):
+            left_short = _span_between_cuts_is_too_short(
+                edge,
+                cumulative,
+                compacted[index - 1],
+                compacted[index],
+                min_span_length=min_span_length,
+                min_span_chord=min_span_chord,
+            )
+            right_short = _span_between_cuts_is_too_short(
+                edge,
+                cumulative,
+                compacted[index],
+                compacted[index + 1],
+                min_span_length=min_span_length,
+                min_span_chord=min_span_chord,
+            )
+            if left_short or right_short:
+                compacted.pop(index)
+                changed = True
+                break
+    return compacted
+
+
+def _span_between_cuts_is_too_short(
+    edge: _GraphEdge,
+    cumulative: np.ndarray,
+    start: _SpanCut,
+    end: _SpanCut,
+    *,
+    min_span_length: float,
+    min_span_chord: float,
+) -> bool:
+    if end.s - start.s < min_span_length:
+        return True
+    a = _interpolate_polyline(edge.points, cumulative, start.s)
+    b = _interpolate_polyline(edge.points, cumulative, end.s)
+    return float(np.linalg.norm(b - a)) < min_span_chord
+
+
+def _manual_points_from_cuts(
+    edge: _GraphEdge,
+    route_segments: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not route_segments:
+        return []
+    boundaries: list[tuple[float, str, np.ndarray | None]] = []
+    first = route_segments[0]
+    boundaries.append(
+        (
+            float(first.get("start_s", 0.0)),
+            str(first.get("start_kind", "endpoint")),
+            _optional_point(first.get("start_point")),
+        )
+    )
+    for segment in route_segments:
+        boundaries.append(
+            (
+                float(segment.get("end_s", edge.length)),
+                str(segment.get("end_kind", "endpoint")),
+                _optional_point(segment.get("end_point")),
+            )
+        )
+    cumulative = _cumulative_lengths(edge.points)
+    out: list[dict[str, Any]] = []
+    for order, (s, kind, boundary_point) in enumerate(boundaries):
+        point = boundary_point if boundary_point is not None else _interpolate_polyline(edge.points, cumulative, s)
+        out.append(
+            {
+                "x": round(float(point[0]), 3),
+                "y": round(float(point[1]), 3),
+                "order": order,
+                "snap_source": "geometry_auto_segment_junction_corner",
+                "auto_boundary": True,
+                "intersection_boundary": kind != "endpoint",
+                "boundary_kind": kind,
+                "edge_id": edge.id,
+            }
+        )
+    return out
+
+
+def _optional_point(value: Any) -> np.ndarray | None:
+    try:
+        arr = np.asarray(value, dtype=float)
+    except Exception:
+        return None
+    if arr.ndim != 1 or arr.shape[0] < 2:
+        return None
+    return arr[:2].copy()
+
+
+def _cumulative_lengths(points: np.ndarray) -> np.ndarray:
+    if len(points) == 0:
+        return np.zeros(0, dtype=float)
+    if len(points) == 1:
+        return np.zeros(1, dtype=float)
+    distances = np.linalg.norm(np.diff(points[:, :2], axis=0), axis=1)
+    return np.concatenate([[0.0], np.cumsum(distances)])
+
+
+def _interpolate_polyline(points: np.ndarray, cumulative: np.ndarray, s: float) -> np.ndarray:
+    if len(points) == 0:
+        return np.zeros(2, dtype=float)
+    if len(points) == 1 or s <= 0:
+        return points[0, :2].copy()
+    if s >= cumulative[-1]:
+        return points[-1, :2].copy()
+    index = int(np.searchsorted(cumulative, s, side="right") - 1)
+    index = max(0, min(index, len(points) - 2))
+    denom = max(float(cumulative[index + 1] - cumulative[index]), 1e-9)
+    t = float((s - cumulative[index]) / denom)
+    return points[index, :2] * (1.0 - t) + points[index + 1, :2] * t
+
+
+def _slice_polyline(
+    points: np.ndarray,
+    cumulative: np.ndarray,
+    s0: float,
+    s1: float,
+) -> np.ndarray:
+    if s1 < s0:
+        s0, s1 = s1, s0
+    start = _interpolate_polyline(points, cumulative, s0)
+    end = _interpolate_polyline(points, cumulative, s1)
+    internal = points[(cumulative > s0 + 1e-6) & (cumulative < s1 - 1e-6), :2]
+    if len(internal):
+        return _remove_near_duplicate_points(np.vstack([start, internal, end]))
+    return _remove_near_duplicate_points(np.vstack([start, end]))
+
+
+def _grid_cell(point: np.ndarray, cell_size: float) -> tuple[int, int]:
+    return (int(math.floor(float(point[0]) / cell_size)), int(math.floor(float(point[1]) / cell_size)))
 
 
 def _read_edges(graph: dict[str, Any]) -> dict[str, _GraphEdge]:
@@ -410,6 +1246,11 @@ def _round_points(points: np.ndarray) -> list[list[float]]:
     return [[round(float(x), 3), round(float(y), 3)] for x, y in points[:, :2]]
 
 
+def _round_point(point: np.ndarray) -> list[float]:
+    arr = np.asarray(point, dtype=float)
+    return [round(float(arr[0]), 3), round(float(arr[1]), 3)]
+
+
 def _start_tangent(points: np.ndarray) -> np.ndarray:
     if len(points) < 2:
         return np.array([1.0, 0.0])
@@ -426,6 +1267,48 @@ def _end_tangent(points: np.ndarray) -> np.ndarray:
     vec = points[-1, :2] - points[-1 - k, :2]
     norm = float(np.linalg.norm(vec))
     return vec / max(norm, 1e-9)
+
+
+def _edge_tangent_at_endpoint(edge: _GraphEdge, at_start: bool) -> np.ndarray:
+    return _start_tangent(edge.points) if at_start else _end_tangent(edge.points)
+
+
+def _polyline_tangent_at_s(points: np.ndarray, s: float) -> np.ndarray:
+    if len(points) < 2:
+        return np.array([1.0, 0.0])
+    cumulative = _cumulative_lengths(points)
+    if len(cumulative) < 2 or cumulative[-1] <= 1e-9:
+        return _start_tangent(points)
+    index = int(np.searchsorted(cumulative, s, side="right") - 1)
+    index = max(0, min(index, len(points) - 2))
+    left = max(0, index - 3)
+    right = min(len(points) - 1, index + 4)
+    vec = points[right, :2] - points[left, :2]
+    norm = float(np.linalg.norm(vec))
+    if norm <= 1e-9:
+        return _start_tangent(points)
+    return vec / norm
+
+
+def _segment_tangent(segment: dict[str, Any]) -> np.ndarray:
+    vec = np.asarray(segment["b"], dtype=float)[:2] - np.asarray(segment["a"], dtype=float)[:2]
+    norm = float(np.linalg.norm(vec))
+    if norm <= 1e-9:
+        return np.array([1.0, 0.0])
+    return vec / norm
+
+
+def _segment_crossing_angle(a: dict[str, Any], b: dict[str, Any]) -> float:
+    return _undirected_angle_between(_segment_tangent(a), _segment_tangent(b))
+
+
+def _undirected_angle_between(a: np.ndarray, b: np.ndarray) -> float:
+    a_norm = float(np.linalg.norm(a))
+    b_norm = float(np.linalg.norm(b))
+    if a_norm <= 1e-9 or b_norm <= 1e-9:
+        return 0.0
+    angle = _angle_between(a / a_norm, b / b_norm)
+    return min(angle, abs(math.pi - angle))
 
 
 def _angle_between(a: np.ndarray, b: np.ndarray) -> float:

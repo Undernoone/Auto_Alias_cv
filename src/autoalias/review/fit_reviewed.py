@@ -89,6 +89,9 @@ def fit_reviewed_annotations(
                     points = remove_duplicate_points(points, eps=0.5)
                     points = _ensure_minimum_fit_points(points)
                     points = _limit_fit_points(points, max_fit_points)
+                    if not _has_enough_distinct_fit_points(points):
+                        skipped += 1
+                        continue
                     if len(points) < min_points and segment["segment_count"] <= 1:
                         skipped += 1
                         continue
@@ -554,8 +557,7 @@ def _fit_design_curve_chain_fast(
             segment["segment_count"],
         )
         candidate = _make_candidate(label, points, annotation_path, design_curve)
-        selected_degree = int(degree) if isinstance(degree, int) else _fast_degree_for_points(points)
-        curve = SingleSpanFitter(FittingOptions(degree=selected_degree)).fit_candidate(candidate)
+        curve, report = _fit_fast_layout_curve(candidate, points, degree, validator)
         curve.source = "manual_review_fast_fit"
         curve.metadata = _curve_metadata(
             design_curve,
@@ -566,9 +568,65 @@ def _fit_design_curve_chain_fast(
             fit_policy="fast_single_pass_single_span_export",
         )
         curve.metadata["fast_mode"] = True
-        curve.metadata["fast_degree"] = selected_degree
-        out.append((curve, candidate, validator.validate(curve, points)))
+        curve.metadata["fast_degree"] = curve.degree
+        out.append((curve, candidate, report))
     return out
+
+
+def _fit_fast_layout_curve(
+    candidate: CurveCandidate,
+    points: np.ndarray,
+    degree: int | str,
+    validator: ClassAValidator,
+) -> tuple[NURBSCurve, QualityReport]:
+    if isinstance(degree, int):
+        curve = SingleSpanFitter(FittingOptions(degree=int(degree))).fit_candidate(candidate)
+        return curve, validator.validate(curve, points)
+
+    base_degree = _fast_degree_for_points(points)
+    simplicity = _target_curve_simplicity(points)
+    if bool(simplicity.get("simple")):
+        degrees = tuple(dict.fromkeys([base_degree, min(base_degree + 1, 7), 5]))
+    elif base_degree >= 7:
+        degrees = (5, 6, 7)
+    else:
+        degrees = tuple(dict.fromkeys([3, base_degree, min(base_degree + 1, 7), 7]))
+
+    best: tuple[float, NURBSCurve, QualityReport] | None = None
+    for candidate_degree in degrees:
+        curve = SingleSpanFitter(FittingOptions(degree=candidate_degree)).fit_candidate(candidate)
+        report = validator.validate(curve, points)
+        score = _fast_layout_score(curve, report)
+        if best is None or score < best[0]:
+            best = (score, curve, report)
+        if report.passed and candidate_degree <= base_degree:
+            break
+    if best is None:
+        raise ValueError("failed to fit fast layout curve")
+    best[1].metadata["fast_layout_score"] = round(float(best[0]), 4)
+    return best[1], best[2]
+
+
+def _fast_layout_score(curve: NURBSCurve, report: QualityReport) -> float:
+    metrics = report.metrics
+    inflections = int(metrics.get("inflection_count", 0) or 0)
+    spacing_rhythm = float(metrics.get("cv_spacing_rhythm_penalty", 0.0) or 0.0)
+    distance_rhythm = float(metrics.get("cv_curve_distance_rhythm_penalty", 0.0) or 0.0)
+    spacing = float(metrics.get("cv_spacing_ratio", 1.0) or 1.0)
+    chamfer = float(metrics.get("chamfer_mean", 0.0) or 0.0)
+    oscillation = float(metrics.get("curvature_oscillation", 0.0) or 0.0)
+    turnback = bool(metrics.get("control_polygon_turnback", False))
+    return float(
+        len(report.warnings) * 1800.0
+        + max(0, inflections - 1) * 9000.0
+        + spacing_rhythm * 130.0
+        + distance_rhythm * 110.0
+        + max(0.0, spacing - 5.0) * 220.0
+        + chamfer * 24.0
+        + max(0.0, oscillation - 0.55) * 800.0
+        + (12000.0 if turnback else 0.0)
+        + curve.degree * 28.0
+    )
 
 
 def _fast_degree_for_points(points: np.ndarray) -> int:
@@ -3809,7 +3867,10 @@ def _curve_segments(curve: dict[str, Any]) -> list[dict[str, Any]]:
     manual = curve.get("manual_points") or curve.get("cut_points") or []
     route_segments = curve.get("route_segments") or []
     source = str(curve.get("source") or "")
-    if source.startswith("geometry_auto_segment"):
+    preserve_route_segments = bool(curve.get("preserve_route_segments")) or (
+        str(curve.get("span_split_policy") or "") == "intersection_only_junctions"
+    )
+    if source.startswith("geometry_auto_segment") and not preserve_route_segments:
         points = _curve_points(curve)
         if len(points) >= 2:
             return [
@@ -3898,6 +3959,16 @@ def _ensure_minimum_fit_points(points: np.ndarray) -> np.ndarray:
     if len(points) < 2:
         return points
     return _line_points((float(points[0, 0]), float(points[0, 1])), (float(points[-1, 0]), float(points[-1, 1])), count=8)
+
+
+def _has_enough_distinct_fit_points(points: np.ndarray) -> bool:
+    pts = remove_duplicate_points(np.asarray(points, dtype=float), eps=0.5)
+    if len(pts) >= 4:
+        return True
+    if len(pts) < 2:
+        return False
+    chord = float(np.linalg.norm(pts[-1, :2] - pts[0, :2]))
+    return chord >= 3.0
 
 
 def _limit_fit_points(points: np.ndarray, max_fit_points: int | None) -> np.ndarray:
