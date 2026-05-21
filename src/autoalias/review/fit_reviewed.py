@@ -47,7 +47,7 @@ def fit_reviewed_annotations(
     *,
     degree: int | str = "auto",
     min_points: int = 8,
-    max_fit_points: int | None = 220,
+    max_fit_points: int | None = None,
     diagnostic_preview: bool = True,
     fast_mode: bool = False,
 ) -> ReviewedFitResult:
@@ -71,11 +71,19 @@ def fit_reviewed_annotations(
     for annotation_path in resolved_paths:
         data = json.loads(annotation_path.read_text(encoding="utf-8"))
         image_path = data.get("graph", {}).get("image")
+        image_size = data.get("graph", {}).get("image_size", {}) or {}
+        image_diag = float(
+            np.hypot(
+                float(image_size.get("width", 0.0) or 0.0),
+                float(image_size.get("height", 0.0) or 0.0),
+            )
+        )
         if background_image is None and image_path:
             background_image = image_path
 
         for index, design_curve in enumerate(data.get("design_curves", []), start=1):
             raw_segments = _curve_segments(design_curve)
+            raw_segments = _compact_auto_export_segments(raw_segments, design_curve, image_diag=image_diag)
             if not raw_segments:
                 skipped += 1
                 continue
@@ -3917,6 +3925,105 @@ def _curve_segments(curve: dict[str, Any]) -> list[dict[str, Any]]:
     if len(points) >= 2:
         return [{"points": points, "start_order": 0, "end_order": 1, "segment_count": 1}]
     return []
+
+
+def _compact_auto_export_segments(
+    segments: list[dict[str, Any]],
+    curve: dict[str, Any],
+    *,
+    image_diag: float,
+) -> list[dict[str, Any]]:
+    source = str(curve.get("source") or "")
+    if not source.startswith("geometry_auto_segment"):
+        return segments
+    if not segments:
+        return []
+
+    min_length = max(18.0, min(36.0, float(image_diag) * 0.014))
+    min_chord = max(12.0, min(28.0, float(image_diag) * 0.010))
+    current: list[dict[str, Any]] = []
+    for segment in segments:
+        raw_points = segment.get("points")
+        points = np.asarray(raw_points if raw_points is not None else [], dtype=float)
+        current.append({**segment, "points": remove_duplicate_points(points, eps=0.5)})
+    current = [segment for segment in current if len(segment["points"]) >= 2]
+    if not current:
+        return []
+    if len(current) == 1:
+        pts = current[0]["points"]
+        if _polyline_length(pts) < min_length and _polyline_chord(pts) < min_chord:
+            return []
+        return _refresh_segment_counts(current)
+
+    # Tiny spans between auto-generated split points become isolated stray IGES curves.
+    # Merge them into the fairer neighboring span instead of exporting them as separate entities.
+    max_merges = len(current) * 3
+    for _ in range(max_merges):
+        tiny_indices = [
+            idx
+            for idx, segment in enumerate(current)
+            if _auto_segment_is_tiny(segment["points"], min_length=min_length, min_chord=min_chord)
+        ]
+        if not tiny_indices or len(current) <= 1:
+            break
+        idx = min(tiny_indices, key=lambda item: _polyline_length(current[item]["points"]))
+        if idx == 0:
+            current[1] = _merge_export_segments(current[0], current[1])
+            current.pop(0)
+        elif idx == len(current) - 1:
+            current[idx - 1] = _merge_export_segments(current[idx - 1], current[idx])
+            current.pop(idx)
+        else:
+            left_angle = _safe_join_angle(current[idx - 1]["points"], current[idx]["points"])
+            right_angle = _safe_join_angle(current[idx]["points"], current[idx + 1]["points"])
+            if left_angle <= right_angle:
+                current[idx - 1] = _merge_export_segments(current[idx - 1], current[idx])
+                current.pop(idx)
+            else:
+                current[idx + 1] = _merge_export_segments(current[idx], current[idx + 1])
+                current.pop(idx)
+
+    current = [
+        segment
+        for segment in current
+        if not (
+            len(current) > 1
+            and _polyline_length(segment["points"]) < min_length * 0.55
+            and _polyline_chord(segment["points"]) < min_chord * 0.75
+        )
+    ]
+    return _refresh_segment_counts(current)
+
+
+def _auto_segment_is_tiny(points: np.ndarray, *, min_length: float, min_chord: float) -> bool:
+    return _polyline_length(points) < min_length or _polyline_chord(points) < min_chord
+
+
+def _polyline_chord(points: np.ndarray) -> float:
+    if len(points) < 2:
+        return 0.0
+    return float(np.linalg.norm(points[-1, :2] - points[0, :2]))
+
+
+def _safe_join_angle(left: np.ndarray, right: np.ndarray) -> float:
+    try:
+        return _polyline_join_angle(left, right)
+    except Exception:
+        return 180.0
+
+
+def _merge_export_segments(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **left,
+        "points": remove_duplicate_points(
+            _combine_join_points(np.asarray(left["points"], dtype=float), np.asarray(right["points"], dtype=float)),
+            eps=0.5,
+        ),
+        "end_order": right.get("end_order", left.get("end_order")),
+        "export_auto_compacted": True,
+        "source_segment_indices": list(left.get("source_segment_indices") or [left.get("start_order", 0)])
+        + list(right.get("source_segment_indices") or [right.get("start_order", 0)]),
+    }
 
 
 def _curve_points(curve: dict[str, Any]) -> np.ndarray:

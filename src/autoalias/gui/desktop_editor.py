@@ -217,9 +217,9 @@ class ExportWorker(QObject):
                 self.output_dir,
                 degree=self.degree,
                 min_points=4,
-                max_fit_points=180,
+                max_fit_points=None,
                 diagnostic_preview=False,
-                fast_mode=True,
+                fast_mode=False,
             )
             self.finished.emit(result)
         except Exception as exc:  # pragma: no cover - GUI worker path.

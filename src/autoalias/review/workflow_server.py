@@ -406,14 +406,15 @@ def _make_handler(
                 session.save(corrections, design_curves)
                 degree = payload.get("degree", "auto")
                 export_dir = output_dir / "alias_exports" / session.image_path.stem
+                max_fit_points = _clean_max_fit_points(payload.get("max_fit_points", None))
                 result = fit_reviewed_annotations(
                     [session.corrections_path],
                     export_dir,
                     degree=degree,
                     min_points=8,
-                    max_fit_points=int(payload.get("max_fit_points", 180) or 180),
+                    max_fit_points=max_fit_points,
                     diagnostic_preview=bool(payload.get("diagnostic_preview", False)),
-                    fast_mode=bool(payload.get("fast_mode", True)),
+                    fast_mode=_clean_bool(payload.get("fast_mode", False)),
                 )
                 exports[sid] = {
                     "iges": export_dir / "reviewed_curves.igs",
@@ -1107,6 +1108,25 @@ def _clean_parallel_collapse(value: str) -> str:
     value = (value or "off").strip().lower()
     allowed = {"off", "soft", "medium", "strong"}
     return value if value in allowed else "off"
+
+
+def _clean_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    text = str(value).strip().lower()
+    return text in {"1", "true", "yes", "on"}
+
+
+def _clean_max_fit_points(value: Any) -> int | None:
+    if value in (None, "", "none", "None", "auto", "null", 0, "0"):
+        return None
+    try:
+        limit = int(value)
+    except Exception:
+        return None
+    return limit if limit > 0 else None
 
 
 def _unique_path(path: Path) -> Path:
@@ -2600,9 +2620,9 @@ async function exportIges() {
       corrections: [],
       design_curves: designCurves,
       degree: document.getElementById("degree").value,
-      max_fit_points: 180,
+      max_fit_points: null,
       diagnostic_preview: false,
-      fast_mode: true
+      fast_mode: false
     })
   });
   const result = await res.json();

@@ -87,7 +87,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_fit_reviewed.add_argument("--degree", default="auto", help="auto, 3, 4, 5, 6 or 7")
     p_fit_reviewed.add_argument("--min-points", type=int, default=8)
     p_fit_reviewed.add_argument("--fast", action="store_true", help="use the fast export path for large auto-segmented jobs")
-    p_fit_reviewed.add_argument("--max-fit-points", type=int, default=220)
+    p_fit_reviewed.add_argument("--max-fit-points", type=int, default=None)
     p_fit_reviewed.add_argument("--diagnostic-preview", action="store_true", help="also write the heavy CV/comb diagnostic SVG")
 
     p_build = sub.add_parser(

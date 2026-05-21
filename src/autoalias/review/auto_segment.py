@@ -159,6 +159,8 @@ def _suggest_intersection_only_segments(
     cuts_by_edge = _intersection_cuts_by_edge(graph, edges, intersection_radius)
     suggestions: list[dict[str, Any]] = []
     sorted_edges = sorted(edges.values(), key=lambda item: item.length, reverse=True)
+    accepted_paths: list[np.ndarray] = []
+    suggestion_seed = int(time.time() * 1000)
     for edge in sorted_edges:
         if edge.length < min_length_value:
             continue
@@ -173,34 +175,47 @@ def _suggest_intersection_only_segments(
         )
         if not route_segments:
             continue
-        manual_points = _manual_points_from_cuts(edge, route_segments)
-        if len(manual_points) < 2:
-            continue
-        route_points = _round_points(edge.points)
-        suggestions.append(
-            {
-                "id": f"geo_curve_{int(time.time() * 1000):x}_{len(suggestions):03d}",
-                "type": "manual_design_curve",
-                "semantic": edge.label,
-                "edge_ids": [edge.id],
-                "manual_points": manual_points,
-                "cut_points": manual_points,
-                "closed": False,
-                "routed_points": route_points,
-                "route_segments": route_segments,
-                "branch_choices": [0 for _ in route_segments],
-                "route_ok": True,
-                "source": "geometry_auto_segment_junction_corner",
-                "preserve_route_segments": True,
-                "span_split_policy": "junctions_and_corner_blends",
-                "confidence": round(float(min(0.96, 0.42 + edge.length / 900.0)), 3),
-                "reason": (
-                    "junction/corner span split: shared stroke endpoints, endpoint-to-stroke "
-                    "junctions, and localized corner blend regions"
-                ),
-                "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            }
-        )
+        for segment in route_segments:
+            points = _segment_points_array(segment)
+            if len(points) < 2:
+                continue
+            if _route_segment_duplicates_existing(
+                points,
+                accepted_paths,
+                distance=max(2.6, diag * 0.0016),
+            ):
+                continue
+            manual_points = _manual_points_from_segment(edge, segment)
+            if len(manual_points) < 2:
+                continue
+            single_segment = {**segment, "segment_index": 0, "segment_count": 1}
+            accepted_paths.append(points)
+            suggestions.append(
+                {
+                    "id": f"geo_curve_{suggestion_seed:x}_{len(suggestions):03d}",
+                    "type": "manual_design_curve",
+                    "semantic": edge.label,
+                    "edge_ids": [edge.id],
+                    "manual_points": manual_points,
+                    "cut_points": manual_points,
+                    "closed": False,
+                    "routed_points": _round_points(points),
+                    "route_segments": [single_segment],
+                    "branch_choices": [0],
+                    "route_ok": True,
+                    "source": "geometry_auto_segment_atomic",
+                    "preserve_route_segments": True,
+                    "span_split_policy": "atomic_junction_or_corner_interval",
+                    "confidence": round(float(min(0.96, 0.42 + float(segment.get("length", 0.0) or 0.0) / 900.0)), 3),
+                    "reason": (
+                        "atomic geometry split: one editable curve per interval between "
+                        "neighboring junction/corner boundaries"
+                    ),
+                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                }
+            )
+            if len(suggestions) >= max_curves:
+                break
         if len(suggestions) >= max_curves:
             break
     return suggestions
@@ -220,7 +235,9 @@ def _intersection_cuts_by_edge(
     endpoint_clusters = _endpoint_clusters(edges, radius)
     _add_shared_endpoint_cuts(cuts, endpoint_clusters)
     _add_endpoint_cluster_touch_cuts(cuts, edges, endpoint_clusters, segment_grid, cell_size, radius)
-    _add_corner_blend_cuts(cuts, edges, radius)
+    # Temporarily disabled by request: validate pure junction-based segmentation first.
+    # Corner/blend cuts can be re-enabled after the intersection-only behavior is stable.
+    # _add_corner_blend_cuts(cuts, edges, radius)
 
     # Deliberately not using raw pixel degree>=3 nodes or arbitrary segment intersections
     # here. Those create many false junctions on sketch noise, double outlines, and nearby
@@ -391,7 +408,7 @@ def _detect_corner_blend_regions(
     signed_density = _smooth_1d(signed_density, window=9 if len(signed_density) >= 48 else 7)
 
     min_region_len = max(12.0, radius * 4.0, length * 0.030)
-    max_region_len = max(42.0, length * 0.42)
+    max_region_len = max(42.0, min(length * 0.22, max(90.0, radius * 32.0)))
     endpoint_margin = max(10.0, radius * 4.0, length * 0.035)
     existing_s = [float(cut.s) for cut in existing_cuts]
 
@@ -1065,9 +1082,21 @@ def _project_point_to_segment(
 
 def _sorted_edge_cuts(edge: _GraphEdge, cuts: list[_SpanCut]) -> list[_SpanCut]:
     tolerance = 2.0
-    out: list[_SpanCut] = []
-    for cut in sorted(cuts, key=lambda item: item.s):
+    prepared: list[_SpanCut] = []
+    for cut in cuts:
         s = max(0.0, min(float(cut.s), edge.length))
+        point = cut.point.astype(float, copy=False)
+        prepared.append(_SpanCut(s, point.copy(), cut.kind, cut.source_edge))
+    hard_s = [cut.s for cut in prepared if _is_hard_span_cut(cut.kind)]
+    corner_guard = max(8.0, min(42.0, edge.length * 0.035))
+    filtered = [
+        cut
+        for cut in prepared
+        if not (_is_corner_span_cut(cut.kind) and any(abs(cut.s - hard) <= corner_guard for hard in hard_s))
+    ]
+    out: list[_SpanCut] = []
+    for cut in sorted(filtered, key=lambda item: item.s):
+        s = cut.s
         point = cut.point.astype(float, copy=False)
         if out and abs(s - out[-1].s) <= tolerance:
             if cut.kind != "endpoint":
@@ -1082,6 +1111,25 @@ def _sorted_edge_cuts(edge: _GraphEdge, cuts: list[_SpanCut]) -> list[_SpanCut]:
     if edge.length - out[-1].s > tolerance:
         out.append(_SpanCut(edge.length, edge.points[-1].copy(), "endpoint"))
     return out
+
+
+def _is_hard_span_cut(kind: str) -> bool:
+    parts = set(str(kind or "").split("+"))
+    return bool(
+        parts
+        & {
+            "endpoint",
+            "shared_endpoint",
+            "shared_junction_endpoint",
+            "endpoint_touch_junction",
+            "endpoint_touch_projection",
+        }
+    )
+
+
+def _is_corner_span_cut(kind: str) -> bool:
+    parts = set(str(kind or "").split("+"))
+    return bool(parts & {"corner_blend_start", "corner_blend_end"})
 
 
 def _route_segments_from_cuts(
@@ -1244,6 +1292,98 @@ def _manual_points_from_cuts(
             }
         )
     return out
+
+
+def _manual_points_from_segment(edge: _GraphEdge, segment: dict[str, Any]) -> list[dict[str, Any]]:
+    start_s = float(segment.get("start_s", 0.0) or 0.0)
+    end_s = float(segment.get("end_s", edge.length) or edge.length)
+    start_kind = str(segment.get("start_kind", "endpoint") or "endpoint")
+    end_kind = str(segment.get("end_kind", "endpoint") or "endpoint")
+    start_point = _optional_point(segment.get("start_point"))
+    end_point = _optional_point(segment.get("end_point"))
+    cumulative = _cumulative_lengths(edge.points)
+    if start_point is None:
+        start_point = _interpolate_polyline(edge.points, cumulative, start_s)
+    if end_point is None:
+        end_point = _interpolate_polyline(edge.points, cumulative, end_s)
+    out: list[dict[str, Any]] = []
+    for order, (point, kind) in enumerate(((start_point, start_kind), (end_point, end_kind))):
+        out.append(
+            {
+                "x": round(float(point[0]), 3),
+                "y": round(float(point[1]), 3),
+                "order": order,
+                "snap_source": "geometry_auto_segment_atomic",
+                "auto_boundary": True,
+                "intersection_boundary": kind != "endpoint",
+                "boundary_kind": kind,
+                "edge_id": edge.id,
+            }
+        )
+    return out
+
+
+def _segment_points_array(segment: dict[str, Any]) -> np.ndarray:
+    try:
+        points = np.asarray(segment.get("points") or [], dtype=float)
+    except Exception:
+        return np.zeros((0, 2), dtype=float)
+    if points.ndim != 2 or points.shape[0] < 2 or points.shape[1] < 2:
+        return np.zeros((0, 2), dtype=float)
+    return points[:, :2].astype(float, copy=False)
+
+
+def _route_segment_duplicates_existing(
+    points: np.ndarray,
+    existing: list[np.ndarray],
+    *,
+    distance: float,
+) -> bool:
+    """Reject repeated auto segments without deleting nearby parallel design lines."""
+    if len(points) < 2:
+        return True
+    length = _curve_length(points)
+    if length <= 1e-6:
+        return True
+    sample = _sample_polyline_evenly(points, 32)
+    for other in existing:
+        if len(other) < 2:
+            continue
+        other_length = _curve_length(other)
+        if other_length <= 1e-6:
+            continue
+        other_sample = _sample_polyline_evenly(other, 40)
+        one_way = _mean_nearest_distance(sample, other_sample)
+        if one_way > distance:
+            continue
+        length_ratio = max(length, other_length) / max(min(length, other_length), 1e-6)
+        if length_ratio <= 1.18:
+            reverse_one_way = _mean_nearest_distance(other_sample, sample)
+            if reverse_one_way <= distance * 1.25:
+                return True
+        elif length <= other_length:
+            return True
+    return False
+
+
+def _sample_polyline_evenly(points: np.ndarray, count: int) -> np.ndarray:
+    points = np.asarray(points, dtype=float)
+    if len(points) <= 1:
+        return points[:, :2].copy()
+    cumulative = _cumulative_lengths(points)
+    length = float(cumulative[-1])
+    if length <= 1e-6:
+        return points[:1, :2].copy()
+    sample_count = max(2, min(int(count), max(2, int(length / 2.0))))
+    return np.vstack([_interpolate_polyline(points, cumulative, s) for s in np.linspace(0.0, length, sample_count)])
+
+
+def _mean_nearest_distance(a: np.ndarray, b: np.ndarray) -> float:
+    if len(a) == 0 or len(b) == 0:
+        return float("inf")
+    diff = a[:, None, :2] - b[None, :, :2]
+    dist = np.linalg.norm(diff, axis=2)
+    return float(np.mean(np.min(dist, axis=1)))
 
 
 def _optional_point(value: Any) -> np.ndarray | None:
