@@ -50,6 +50,7 @@ def fit_reviewed_annotations(
     max_fit_points: int | None = None,
     diagnostic_preview: bool = True,
     fast_mode: bool = False,
+    fit_mode: str = "manual_class_a_g2",
 ) -> ReviewedFitResult:
     """Fit Alias-ready curves strictly from manually saved design-curve annotations.
 
@@ -161,6 +162,7 @@ def fit_reviewed_annotations(
                 degree,
                 validator,
                 fast_mode=fast_mode,
+                fit_mode=fit_mode,
             )
             for curve, candidate, report in fitted:
                 curves.append(curve)
@@ -371,6 +373,7 @@ def _fit_design_curve_chain(
     *,
     allow_auto_merge: bool = False,
     fast_mode: bool = False,
+    fit_mode: str = "manual_class_a_g2",
 ) -> list[tuple[NURBSCurve, CurveCandidate, QualityReport]]:
     """Fit one reviewed curve.
 
@@ -380,6 +383,15 @@ def _fit_design_curve_chain(
     """
     if fast_mode:
         return _fit_design_curve_chain_fast(
+            design_curve,
+            annotation_path,
+            design_index,
+            segments,
+            degree,
+            validator,
+        )
+    if _should_use_manual_class_a_g2(design_curve, segments, fit_mode):
+        return _fit_design_curve_chain_class_a_g2(
             design_curve,
             annotation_path,
             design_index,
@@ -528,6 +540,7 @@ def _fit_design_curve_chain(
             degree,
             validator,
             allow_auto_merge=False,
+            fit_mode=fit_mode,
         )
     if (
         not isinstance(degree, int)
@@ -542,8 +555,472 @@ def _fit_design_curve_chain(
             7,
             validator,
             allow_auto_merge=False,
+            fit_mode=fit_mode,
         )
     return out
+
+
+def _should_use_manual_class_a_g2(
+    design_curve: dict[str, Any],
+    segments: list[dict[str, Any]],
+    fit_mode: str,
+) -> bool:
+    if str(fit_mode or "").lower() not in {"manual_class_a_g2", "class_a_g2"}:
+        return False
+    if len(segments) <= 1:
+        return False
+    source = str(design_curve.get("source") or "").lower()
+    if source.startswith("geometry_auto_segment"):
+        return False
+    return True
+
+
+def _fit_design_curve_chain_class_a_g2(
+    design_curve: dict[str, Any],
+    annotation_path: Path,
+    design_index: int,
+    segments: list[dict[str, Any]],
+    degree: int | str,
+    validator: ClassAValidator,
+) -> list[tuple[NURBSCurve, CurveCandidate, QualityReport]]:
+    """Fit a manual split chain as Alias-style single-span G2 curves.
+
+    The important difference from the old endpoint fairing path is that the G2
+    boundary conditions are estimated from the routed target first, then each span is
+    solved with those constraints. That preserves G0/G1 before asking for curvature
+    continuity and avoids the "pull one CV after fitting" jump-point failure mode.
+    """
+    closed = bool(design_curve.get("closed", False))
+    normalized_segments = [
+        {**segment, "points": remove_duplicate_points(np.asarray(segment["points"], dtype=float), eps=0.5)}
+        for segment in segments
+    ]
+    try:
+        return _fit_design_curve_chain_global_c2(
+            design_curve,
+            annotation_path,
+            design_index,
+            normalized_segments,
+            degree,
+            validator,
+        )
+    except Exception:
+        # Fall back to the older constrained-span path if the global solve is singular
+        # for a degenerate hand route.
+        pass
+
+    base_curves: list[NURBSCurve] = []
+    for segment_index, segment in enumerate(normalized_segments, start=1):
+        points = segment["points"]
+        label = _curve_label(
+            design_curve,
+            annotation_path,
+            design_index,
+            segment_index,
+            segment["segment_count"],
+        )
+        candidate = _make_candidate(label, points, annotation_path, design_curve)
+        try:
+            base_curves.append(
+                _fit_chain_lowest_degree(
+                    candidate,
+                    points,
+                    degree,
+                    validator,
+                    segment_index=segment_index,
+                    segment_count=segment["segment_count"],
+                    closed=closed,
+                )
+            )
+        except Exception:
+            base_curves.append(_fit_lowest_degree(candidate, points, degree, validator))
+    fitted_curves: list[tuple[NURBSCurve, CurveCandidate, np.ndarray, dict[str, Any], int]] = []
+    constraints = _class_a_g2_join_constraints(
+        normalized_segments,
+        closed=closed,
+        base_curves=base_curves,
+        curvature_scale=0.62,
+        handle_scale=1.0,
+    )
+
+    for segment_index, segment in enumerate(normalized_segments, start=1):
+        points = segment["points"]
+        label = _curve_label(
+            design_curve,
+            annotation_path,
+            design_index,
+            segment_index,
+            segment["segment_count"],
+        )
+        candidate = _make_candidate(label, points, annotation_path, design_curve)
+        start_constraint = None
+        end_constraint = None
+        if segment_index > 1 or (closed and len(normalized_segments) > 2):
+            start_constraint = constraints.get((segment_index - 2) % len(normalized_segments))
+        if segment_index < len(normalized_segments) or (closed and len(normalized_segments) > 2):
+            end_constraint = constraints.get((segment_index - 1) % len(normalized_segments))
+
+        curve = _fit_class_a_g2_segment(
+            candidate,
+            points,
+            degree,
+            validator,
+            start_constraint=start_constraint,
+            end_constraint=end_constraint,
+        )
+        curve.source = "manual_review_class_a_g2_fit"
+        curve.metadata = _curve_metadata(
+            design_curve,
+            annotation_path,
+            segment,
+            points,
+            segment_index,
+            fit_policy="manual_class_a_g2_global_constraints_single_span",
+        )
+        curve.metadata.update(_fit_metadata_notes(curve))
+        curve.metadata["class_a_g2"] = True
+        curve.metadata["class_a_g2_start_constrained"] = start_constraint is not None
+        curve.metadata["class_a_g2_end_constrained"] = end_constraint is not None
+        curve.metadata["class_a_g2_method"] = "target_curvature_constrained_least_squares"
+        fitted_curves.append((curve, candidate, points, segment, segment_index))
+
+    target_segments = [item[2] for item in fitted_curves]
+    curves = [item[0] for item in fitted_curves]
+    _fair_free_interior_cvs_for_curves(curves, closed=closed, target_segments=target_segments)
+    _repair_class_a_cv_layout(curves, target_segments, closed=closed)
+
+    out: list[tuple[NURBSCurve, CurveCandidate, QualityReport]] = []
+    for curve, candidate, points, _segment, _segment_index in fitted_curves:
+        _stamp_cv_side_diagnostics(curve, points)
+        _stamp_cv_target_corridor_diagnostics(curve, points)
+        _stamp_curvature_sign_diagnostics(curve, points)
+        _stamp_blend_fairness_diagnostics(curve, points)
+        out.append((curve, candidate, validator.validate(curve, points)))
+    _stamp_class_a_g2_diagnostics(out, closed=closed)
+    return out
+
+
+def _fit_design_curve_chain_global_c2(
+    design_curve: dict[str, Any],
+    annotation_path: Path,
+    design_index: int,
+    segments: list[dict[str, Any]],
+    degree: int | str,
+    validator: ClassAValidator,
+) -> list[tuple[NURBSCurve, CurveCandidate, QualityReport]]:
+    closed = bool(design_curve.get("closed", False))
+    segment_count = len(segments)
+    if segment_count <= 1:
+        raise ValueError("global C2 chain requires at least two segments")
+    solve_degree = 7 if not isinstance(degree, int) else min(max(int(degree), 5), 7)
+    curves = _solve_global_c2_bezier_chain(segments, degree=solve_degree, closed=closed)
+    fitted: list[tuple[NURBSCurve, CurveCandidate, QualityReport]] = []
+    for segment_index, (curve, segment) in enumerate(zip(curves, segments, strict=False), start=1):
+        points = segment["points"]
+        label = _curve_label(
+            design_curve,
+            annotation_path,
+            design_index,
+            segment_index,
+            segment["segment_count"],
+        )
+        candidate = _make_candidate(label, points, annotation_path, design_curve)
+        curve.label = label
+        curve.confidence = candidate.confidence
+        curve.source = "manual_review_class_a_global_c2_fit"
+        curve.metadata = _curve_metadata(
+            design_curve,
+            annotation_path,
+            segment,
+            points,
+            segment_index,
+            fit_policy="manual_class_a_global_c2_least_squares",
+        )
+        curve.metadata.update(_fit_metadata_notes(curve))
+        curve.metadata["class_a_g2"] = True
+        curve.metadata["class_a_g2_method"] = "global_constrained_least_squares_c0_c1_c2"
+        curve.metadata["class_a_g2_global_degree"] = solve_degree
+        _stamp_cv_side_diagnostics(curve, points)
+        _stamp_cv_target_corridor_diagnostics(curve, points)
+        _stamp_curvature_sign_diagnostics(curve, points)
+        _stamp_blend_fairness_diagnostics(curve, points)
+        fitted.append((curve, candidate, validator.validate(curve, points)))
+    _stamp_class_a_g2_diagnostics(fitted, closed=closed)
+    return fitted
+
+
+def _solve_global_c2_bezier_chain(
+    segments: list[dict[str, Any]],
+    *,
+    degree: int,
+    closed: bool,
+) -> list[NURBSCurve]:
+    count = len(segments)
+    cv_count = degree + 1
+    var_count = count * cv_count
+    rows: list[np.ndarray] = []
+    rhs: list[np.ndarray] = []
+    constraints: list[np.ndarray] = []
+    constraint_rhs: list[np.ndarray] = []
+
+    def var(seg_index: int, cv_index: int) -> int:
+        return seg_index * cv_count + cv_index
+
+    def add_row(coeffs: dict[int, float], value: np.ndarray, weight: float = 1.0) -> None:
+        row = np.zeros(var_count, dtype=float)
+        for index, coeff in coeffs.items():
+            row[index] += float(coeff) * weight
+        rows.append(row)
+        rhs.append(np.asarray(value, dtype=float) * weight)
+
+    def add_constraint(coeffs: dict[int, float], value: np.ndarray | None = None) -> None:
+        row = np.zeros(var_count, dtype=float)
+        for index, coeff in coeffs.items():
+            row[index] += float(coeff)
+        constraints.append(row)
+        if value is None:
+            constraint_rhs.append(np.zeros(3, dtype=float))
+        else:
+            constraint_rhs.append(np.asarray(value, dtype=float))
+
+    prepared_points: list[np.ndarray] = []
+    lengths: list[float] = []
+    for seg_index, segment in enumerate(segments):
+        pts = remove_duplicate_points(np.asarray(segment["points"], dtype=float), eps=0.5)
+        if len(pts) < 4:
+            raise ValueError("not enough distinct points for global C2 solve")
+        sample_count = max(36, min(140, int(_polyline_length(pts) / 2.0)))
+        pts = resample_polyline(pts, sample_count)
+        pts = smooth_polyline(pts, window=5)
+        prepared_points.append(pts)
+        lengths.append(max(_polyline_length(pts), 1.0))
+        u = chord_length_parameter(pts)
+        basis = bernstein_basis(degree, u)
+        for row_basis, point in zip(basis, pts, strict=False):
+            add_row({var(seg_index, i): float(row_basis[i]) for i in range(cv_count)}, point, weight=1.0)
+
+    join_points = _global_chain_join_points(prepared_points, closed=closed)
+    if closed:
+        for seg_index in range(count):
+            add_constraint({var(seg_index, 0): 1.0}, join_points[seg_index])
+            add_constraint({var(seg_index, degree): 1.0}, join_points[(seg_index + 1) % count])
+    else:
+        for seg_index in range(count):
+            add_constraint({var(seg_index, 0): 1.0}, join_points[seg_index])
+            add_constraint({var(seg_index, degree): 1.0}, join_points[seg_index + 1])
+
+    join_count = count if closed and count > 2 else count - 1
+    for join_index in range(join_count):
+        left = join_index
+        right = (join_index + 1) % count
+        left_len = lengths[left]
+        right_len = lengths[right]
+        p = float(degree)
+        add_constraint(
+            {
+                var(left, degree): p / left_len,
+                var(left, degree - 1): -p / left_len,
+                var(right, 1): -p / right_len,
+                var(right, 0): p / right_len,
+            }
+        )
+        pp = float(degree * (degree - 1))
+        add_constraint(
+            {
+                var(left, degree): pp / (left_len * left_len),
+                var(left, degree - 1): -2.0 * pp / (left_len * left_len),
+                var(left, degree - 2): pp / (left_len * left_len),
+                var(right, 2): -pp / (right_len * right_len),
+                var(right, 1): 2.0 * pp / (right_len * right_len),
+                var(right, 0): -pp / (right_len * right_len),
+            }
+        )
+
+    _add_global_fairness_rows(rows, rhs, var, count, degree, var_count)
+
+    a = np.vstack(rows)
+    b = np.vstack(rhs)
+    c = np.vstack(constraints)
+    d = np.vstack(constraint_rhs)
+    ata = a.T @ a
+    atb = a.T @ b
+    # Tiny diagonal damping protects nearly straight chains without visually moving CVs.
+    ata += np.eye(var_count, dtype=float) * 1e-8
+    zeros = np.zeros((c.shape[0], c.shape[0]), dtype=float)
+    kkt = np.block([[ata, c.T], [c, zeros]])
+    right = np.vstack([atb, d])
+    solution, *_ = np.linalg.lstsq(kkt, right, rcond=None)
+    cvs_flat = solution[:var_count]
+
+    curves: list[NURBSCurve] = []
+    for seg_index in range(count):
+        cvs = np.vstack([cvs_flat[var(seg_index, i)] for i in range(cv_count)])
+        curves.append(
+            NURBSCurve.single_span(
+                label=f"class_a_segment_{seg_index + 1:03d}",
+                degree=degree,
+                cvs=cvs,
+                confidence=1.0,
+                source="manual_review_class_a_global_c2_fit",
+                metadata={},
+            )
+        )
+    return curves
+
+
+def _global_chain_join_points(points: list[np.ndarray], *, closed: bool) -> list[np.ndarray]:
+    count = len(points)
+    if closed:
+        out: list[np.ndarray] = []
+        for index in range(count):
+            prev_end = points[(index - 1) % count][-1]
+            this_start = points[index][0]
+            out.append(0.5 * (prev_end + this_start))
+        return out
+    out = [points[0][0]]
+    for index in range(count - 1):
+        out.append(0.5 * (points[index][-1] + points[index + 1][0]))
+    out.append(points[-1][-1])
+    return out
+
+
+def _add_global_fairness_rows(
+    rows: list[np.ndarray],
+    rhs: list[np.ndarray],
+    var,
+    segment_count: int,
+    degree: int,
+    var_count: int,
+) -> None:
+    cv_count = degree + 1
+
+    def add_diff(order: int, lam: float) -> None:
+        if lam <= 0 or cv_count <= order:
+            return
+        scale = float(lam) ** 0.5
+        coeff = np.array([(-1) ** (order - k) * _binom(order, k) for k in range(order + 1)], dtype=float)
+        for seg_index in range(segment_count):
+            for start in range(cv_count - order):
+                row = np.zeros(var_count, dtype=float)
+                for off, c in enumerate(coeff):
+                    row[var(seg_index, start + off)] += scale * float(c)
+                rows.append(row)
+                rhs.append(np.zeros(3, dtype=float))
+
+    add_diff(2, 0.012)
+    add_diff(3, 0.010)
+
+
+def _fit_class_a_g2_segment(
+    candidate: CurveCandidate,
+    points: np.ndarray,
+    degree: int | str,
+    validator: ClassAValidator,
+    *,
+    start_constraint: _G2Constraint | None,
+    end_constraint: _G2Constraint | None,
+) -> NURBSCurve:
+    degree_candidates = _class_a_degree_candidates(points, degree, start_constraint, end_constraint)
+    best_curve: NURBSCurve | None = None
+    best_score = float("inf")
+    for candidate_degree in degree_candidates:
+        try:
+            fit_points = _prepare_fit_points(points)
+            cvs = _fit_fixed_degree_with_g2_constraints(
+                fit_points,
+                candidate_degree,
+                start_constraint=start_constraint,
+                end_constraint=end_constraint,
+            )
+            curve = NURBSCurve.single_span(
+                label=candidate.label,
+                degree=candidate_degree,
+                cvs=cvs,
+                confidence=candidate.confidence,
+                source="manual_review_class_a_g2_fit",
+                metadata={"candidate_points": len(candidate.points)},
+            )
+            _fair_free_interior_cvs_guarded(curve, points)
+            report = validator.validate(curve, points)
+            score = _class_a_segment_score(curve, points, report)
+            if score < best_score:
+                best_score = score
+                best_curve = curve
+            if _class_a_segment_is_good_enough(curve, points, report):
+                break
+        except Exception:
+            continue
+    if best_curve is None:
+        return _fit_lowest_degree(candidate, points, degree, validator)
+    return best_curve
+
+
+def _class_a_degree_candidates(
+    points: np.ndarray,
+    requested_degree: int | str,
+    start_constraint: _G2Constraint | None,
+    end_constraint: _G2Constraint | None,
+) -> list[int]:
+    if isinstance(requested_degree, int):
+        degree = min(max(int(requested_degree), 3), 7)
+        if start_constraint is not None and end_constraint is not None:
+            degree = max(degree, 5)
+        elif start_constraint is not None or end_constraint is not None:
+            degree = max(degree, 4)
+        return [degree]
+
+    both = start_constraint is not None and end_constraint is not None
+    one = (start_constraint is not None) != (end_constraint is not None)
+    simplicity = _target_curve_simplicity(points)
+    if both:
+        # Two-sided G2 fixes P0/P1/P2 and Pn/Pn-1/Pn-2. Degree 5 has no free
+        # interior CVs and degree 6 only has one, which makes the fit drift far
+        # from the hand-routed skeleton. Degree 7 is still single-span but leaves
+        # two free interior CVs for Alias-style shape control.
+        return [7]
+    if one:
+        return [5, 6, 7, 4] if bool(simplicity["smooth_arc"]) else [6, 7, 5, 4]
+    return [3, 4, 5, 6, 7]
+
+
+def _class_a_segment_score(curve: NURBSCurve, points: np.ndarray, report: QualityReport) -> float:
+    mean_error = float(report.metrics.get("chamfer_mean", 999.0))
+    max_error = _bezier_max_error(curve, points)
+    layout = _cv_layout_penalty(curve.cvs)
+    dent = _cv_dent_penalty(curve.cvs)
+    side = _cv_side_consistency_penalty(curve, points)
+    corridor = _cv_target_corridor_penalty(curve, points)
+    sign = 450.0 if _has_forbidden_curvature_sign_change(curve, points) else 0.0
+    forbidden_side = 450.0 if _has_forbidden_cv_side_switch(curve, points) else 0.0
+    blend = _curve_blend_fairness_metrics(curve, points)
+    blend_penalty = 500.0 if bool(blend["forbidden"]) else float(blend.get("score", 0.0))
+    warnings = len(report.warnings) * 60.0
+    return float(
+        warnings
+        + mean_error * 18.0
+        + max(0.0, max_error - _max_fit_budget(points)) * 9.0
+        + layout * 4.0
+        + dent * 8.0
+        + side * 11.0
+        + corridor * 7.0
+        + sign
+        + forbidden_side
+        + blend_penalty
+        + curve.degree * 0.08
+    )
+
+
+def _class_a_segment_is_good_enough(curve: NURBSCurve, points: np.ndarray, report: QualityReport) -> bool:
+    if _has_forbidden_cv_side_switch(curve, points):
+        return False
+    if _has_forbidden_curvature_sign_change(curve, points):
+        return False
+    if bool(_curve_blend_fairness_metrics(curve, points)["forbidden"]):
+        return False
+    if _curve_exceeds_precision_budget(curve, points):
+        return False
+    mean_error = float(report.metrics.get("chamfer_mean", 999.0))
+    return bool(mean_error <= _mean_fit_budget(points) * 0.82)
 
 
 def _fit_design_curve_chain_fast(
@@ -3656,6 +4133,211 @@ def _free_cv_regularization(
     if not rows:
         return np.zeros((0, len(free_indices))), np.zeros((0, 3))
     return np.vstack(rows), np.vstack(rhs)
+
+
+def _class_a_g2_join_constraints(
+    segments: list[dict[str, Any]],
+    *,
+    closed: bool,
+    base_curves: list[NURBSCurve] | None = None,
+    curvature_scale: float = 1.0,
+    handle_scale: float = 1.0,
+) -> dict[int, _G2Constraint]:
+    count = len(segments)
+    join_count = count if closed and count > 2 else count - 1
+    constraints: dict[int, _G2Constraint] = {}
+    for join_index in range(join_count):
+        left_points = np.asarray(segments[join_index]["points"], dtype=float)
+        right_points = np.asarray(segments[(join_index + 1) % count]["points"], dtype=float)
+        left_len = _polyline_length(left_points)
+        right_len = _polyline_length(right_points)
+        if left_len <= 1e-6 or right_len <= 1e-6:
+            continue
+        local_len = max(min(left_len, right_len), 1.0)
+        point = 0.5 * (left_points[-1].astype(float) + right_points[0].astype(float))
+        tangent = _target_join_tangent(left_points, right_points)
+        if np.linalg.norm(tangent) < 1e-9:
+            before = _point_before_end(left_points, min(max(left_len * 0.18, 8.0), 48.0))[:2]
+            after = _point_after_start(right_points, min(max(right_len * 0.18, 8.0), 48.0))[:2]
+            tangent = _unit(after - before)
+        if np.linalg.norm(tangent) < 1e-9:
+            continue
+
+        target_curvature = _target_join_curvature(left_points, right_points)
+        samples = _join_curvature_samples(left_points, right_points)
+        sample_curvature = _select_target_join_curvature(samples)
+        if abs(sample_curvature) > abs(target_curvature):
+            target_curvature = sample_curvature
+        if base_curves is not None and len(base_curves) == count:
+            base_left = base_curves[join_index]
+            base_right = base_curves[(join_index + 1) % count]
+            base_left_k = _bezier_curvature_end(base_left)
+            base_right_k = _bezier_curvature_start(base_right)
+            target_curvature = _desired_join_curvature(
+                base_left_k,
+                base_right_k,
+                target_curvature,
+                left_points,
+                right_points,
+                local_len,
+                samples=samples,
+            )
+        meaningful = _meaningful_join_curvature(local_len)
+        if abs(target_curvature) < meaningful:
+            target_curvature = 0.0
+        max_curvature = min(0.018, 1.65 / max(local_len, 1.0))
+        target_curvature = float(np.clip(target_curvature * curvature_scale, -max_curvature, max_curvature))
+
+        base_handle = None
+        if base_curves is not None and len(base_curves) == count:
+            base_handle = _class_a_base_join_handle(
+                base_curves[join_index],
+                base_curves[(join_index + 1) % count],
+            )
+        handle = _class_a_join_handle_length(left_points, right_points, tangent, local_len, base_handle=base_handle)
+        handle = float(np.clip(handle * handle_scale, max(local_len * 0.045, 2.5), min(max(local_len * 0.22, 8.0), 42.0)))
+        # The derivative is parameter-speed, not CV distance. A 6x reference keeps
+        # degree-5/7 handle offsets in a natural Alias editing range.
+        speed = handle * 6.0
+        normal = np.array([-tangent[1], tangent[0]], dtype=float)
+        d1 = np.array([tangent[0] * speed, tangent[1] * speed, 0.0], dtype=float)
+        d2 = np.array(
+            [
+                normal[0] * target_curvature * speed * speed,
+                normal[1] * target_curvature * speed * speed,
+                0.0,
+            ],
+            dtype=float,
+        )
+        constraints[join_index] = _G2Constraint(point=point.astype(float), d1=d1, d2=d2)
+    return constraints
+
+
+def _class_a_join_handle_length(
+    left_points: np.ndarray,
+    right_points: np.ndarray,
+    tangent: np.ndarray,
+    local_len: float,
+    *,
+    base_handle: float | None = None,
+) -> float:
+    left_len = _polyline_length(left_points)
+    right_len = _polyline_length(right_points)
+    before = _point_before_end(left_points, min(max(left_len * 0.16, 7.0), 42.0))[:2]
+    after = _point_after_start(right_points, min(max(right_len * 0.16, 7.0), 42.0))[:2]
+    join = 0.5 * (left_points[-1, :2] + right_points[0, :2])
+    left_proj = abs(float(np.dot(join - before, tangent[:2])))
+    right_proj = abs(float(np.dot(after - join, tangent[:2])))
+    observed = 0.5 * (left_proj + right_proj)
+    lower = max(local_len * 0.045, 2.5)
+    upper = min(max(local_len * 0.22, 8.0), 42.0)
+    if base_handle is not None and np.isfinite(base_handle) and base_handle > 1e-6:
+        return float(np.clip(base_handle, lower, upper))
+    if not np.isfinite(observed) or observed <= 1e-6:
+        observed = local_len * 0.13
+    return float(np.clip(observed * 0.48, lower, upper))
+
+
+def _class_a_base_join_handle(left: NURBSCurve, right: NURBSCurve) -> float | None:
+    if len(left.cvs) < 2 or len(right.cvs) < 2:
+        return None
+    left_handle = float(np.linalg.norm(left.cvs[-1, :2] - left.cvs[-2, :2]))
+    right_handle = float(np.linalg.norm(right.cvs[1, :2] - right.cvs[0, :2]))
+    values = [value for value in (left_handle, right_handle) if np.isfinite(value) and value > 1e-6]
+    if not values:
+        return None
+    if len(values) == 1:
+        return values[0]
+    ratio = max(values) / max(min(values), 1e-6)
+    if ratio > 3.6:
+        return float(np.median(values))
+    return float(0.5 * (values[0] + values[1]))
+
+
+def _repair_class_a_cv_layout(
+    curves: list[NURBSCurve],
+    target_segments: list[np.ndarray],
+    *,
+    closed: bool,
+) -> None:
+    if not curves:
+        return
+    for index, curve in enumerate(curves):
+        base = _clone_curve(curve)
+        _fair_free_interior_cvs_guarded(curve, target_segments[index])
+        if _class_a_curve_layout_worse(curve, base, target_segments[index]):
+            curve.cvs = base.cvs
+    _enforce_class_a_join_exactness(curves, closed=closed)
+
+
+def _class_a_curve_layout_worse(curve: NURBSCurve, base: NURBSCurve, points: np.ndarray) -> bool:
+    base_score = (
+        _cv_layout_penalty(base.cvs)
+        + _cv_dent_penalty(base.cvs) * 1.7
+        + _cv_side_consistency_penalty(base, points) * 3.0
+        + _cv_target_corridor_penalty(base, points) * 2.0
+        + _bezier_mean_error(base, points) * 6.0
+    )
+    score = (
+        _cv_layout_penalty(curve.cvs)
+        + _cv_dent_penalty(curve.cvs) * 1.7
+        + _cv_side_consistency_penalty(curve, points) * 3.0
+        + _cv_target_corridor_penalty(curve, points) * 2.0
+        + _bezier_mean_error(curve, points) * 6.0
+    )
+    if _has_forbidden_cv_side_switch(curve, points) and not _has_forbidden_cv_side_switch(base, points):
+        return True
+    if _has_forbidden_curvature_sign_change(curve, points) and not _has_forbidden_curvature_sign_change(base, points):
+        return True
+    return bool(score > base_score + 2.0)
+
+
+def _enforce_class_a_join_exactness(curves: list[NURBSCurve], *, closed: bool) -> None:
+    if len(curves) <= 1:
+        return
+    join_count = len(curves) if closed and len(curves) > 2 else len(curves) - 1
+    for join_index in range(join_count):
+        left = curves[join_index]
+        right = curves[(join_index + 1) % len(curves)]
+        if left.degree < 3 or right.degree < 3 or len(left.cvs) < 4 or len(right.cvs) < 4:
+            continue
+        point = 0.5 * (left.cvs[-1] + right.cvs[0])
+        left_d1 = _bezier_d1_end(left)
+        right_d1 = _bezier_d1_start(right)
+        d1 = 0.5 * (left_d1 + right_d1)
+        if np.linalg.norm(d1[:2]) < 1e-9:
+            d1 = left_d1 if np.linalg.norm(left_d1[:2]) > 1e-9 else right_d1
+        left_d2 = _bezier_d2_end(left)
+        right_d2 = _bezier_d2_start(right)
+        d2 = 0.5 * (left_d2 + right_d2)
+        _apply_end_derivatives(left, point, d1, d2)
+        _apply_start_derivatives(right, point, d1, d2)
+
+
+def _stamp_class_a_g2_diagnostics(
+    fitted: list[tuple[NURBSCurve, CurveCandidate, QualityReport]],
+    *,
+    closed: bool,
+) -> None:
+    if len(fitted) <= 1:
+        return
+    join_count = len(fitted) if closed and len(fitted) > 2 else len(fitted) - 1
+    for join_index in range(join_count):
+        left = fitted[join_index][0]
+        right = fitted[(join_index + 1) % len(fitted)][0]
+        left_points = fitted[join_index][1].points
+        right_points = fitted[(join_index + 1) % len(fitted)][1].points
+        local_len = max(min(_polyline_length(left_points), _polyline_length(right_points)), 1.0)
+        g01 = _join_g0_g1_metrics(left, right, local_len)
+        curvature_delta = abs(_bezier_curvature_end(left) - _bezier_curvature_start(right))
+        left.metadata[f"class_a_g2_join_{join_index}_g0_ok"] = bool(g01["g0_ok"])
+        left.metadata[f"class_a_g2_join_{join_index}_g1_ok"] = bool(g01["g1_ok"])
+        left.metadata[f"class_a_g2_join_{join_index}_tangent_angle_deg"] = float(g01["tangent_angle_deg"])
+        left.metadata[f"class_a_g2_join_{join_index}_curvature_delta"] = float(curvature_delta)
+        right.metadata[f"class_a_g2_join_{join_index}_g0_ok"] = bool(g01["g0_ok"])
+        right.metadata[f"class_a_g2_join_{join_index}_g1_ok"] = bool(g01["g1_ok"])
+        right.metadata[f"class_a_g2_join_{join_index}_tangent_angle_deg"] = float(g01["tangent_angle_deg"])
+        right.metadata[f"class_a_g2_join_{join_index}_curvature_delta"] = float(curvature_delta)
 
 
 def _g2_join_constraints(

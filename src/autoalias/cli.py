@@ -88,6 +88,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_fit_reviewed.add_argument("--min-points", type=int, default=8)
     p_fit_reviewed.add_argument("--fast", action="store_true", help="use the fast export path for large auto-segmented jobs")
     p_fit_reviewed.add_argument("--max-fit-points", type=int, default=None)
+    p_fit_reviewed.add_argument(
+        "--fit-mode",
+        choices=("manual_class_a_g2", "standard"),
+        default="manual_class_a_g2",
+        help="manual_class_a_g2 enables the new hand-split Alias Class-A continuity fitter",
+    )
     p_fit_reviewed.add_argument("--diagnostic-preview", action="store_true", help="also write the heavy CV/comb diagnostic SVG")
 
     p_build = sub.add_parser(
@@ -244,6 +250,7 @@ def _fit_reviewed(args: argparse.Namespace) -> int:
         max_fit_points=args.max_fit_points,
         diagnostic_preview=args.diagnostic_preview,
         fast_mode=args.fast,
+        fit_mode=args.fit_mode,
     )
     passed = sum(1 for report in result.reports if report.passed)
     print(f"AutoAlias fitted {len(result.curves)} manually reviewed curve(s) to {result.out}")

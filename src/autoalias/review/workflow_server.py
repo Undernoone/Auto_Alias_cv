@@ -415,6 +415,7 @@ def _make_handler(
                     max_fit_points=max_fit_points,
                     diagnostic_preview=bool(payload.get("diagnostic_preview", False)),
                     fast_mode=_clean_bool(payload.get("fast_mode", False)),
+                    fit_mode=str(payload.get("fit_mode") or "manual_class_a_g2"),
                 )
                 exports[sid] = {
                     "iges": export_dir / "reviewed_curves.igs",
@@ -913,6 +914,7 @@ def _fit_preview_g2_chain(
             parsed_segments,
             degree,
             validator,
+            fit_mode="manual_class_a_g2",
         )
         previews: list[dict[str, Any]] = []
         for index, (curve, _candidate, report) in enumerate(fitted):
@@ -2622,7 +2624,8 @@ async function exportIges() {
       degree: document.getElementById("degree").value,
       max_fit_points: null,
       diagnostic_preview: false,
-      fast_mode: false
+      fast_mode: false,
+      fit_mode: "manual_class_a_g2"
     })
   });
   const result = await res.json();
