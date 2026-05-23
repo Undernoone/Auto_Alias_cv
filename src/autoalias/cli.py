@@ -94,6 +94,17 @@ def build_parser() -> argparse.ArgumentParser:
         default="manual_class_a_g2",
         help="manual_class_a_g2 enables the new hand-split Alias Class-A continuity fitter",
     )
+    p_fit_reviewed.add_argument(
+        "--wire",
+        action="store_true",
+        help="also convert reviewed_curves.igs to reviewed_curves.wire through Autodesk IgesToAl",
+    )
+    p_fit_reviewed.add_argument(
+        "--iges-to-al",
+        type=Path,
+        default=None,
+        help="full path to Autodesk Alias IgesToAl.exe; otherwise AUTOALIAS_IGES_TO_AL/PATH is used",
+    )
     p_fit_reviewed.add_argument("--diagnostic-preview", action="store_true", help="also write the heavy CV/comb diagnostic SVG")
 
     p_build = sub.add_parser(
@@ -251,11 +262,19 @@ def _fit_reviewed(args: argparse.Namespace) -> int:
         diagnostic_preview=args.diagnostic_preview,
         fast_mode=args.fast,
         fit_mode=args.fit_mode,
+        wire_export=args.wire,
+        iges_to_al=args.iges_to_al,
     )
     passed = sum(1 for report in result.reports if report.passed)
     print(f"AutoAlias fitted {len(result.curves)} manually reviewed curve(s) to {result.out}")
     print(f"Quality: {passed}/{len(result.reports)} passed")
     print(f"Alias file: {result.out / 'reviewed_curves.igs'}")
+    if result.wire_result is not None:
+        if result.wire_result.ok:
+            print(f"Alias WIRE file: {result.wire_result.wire_path}")
+        else:
+            print(f"WIRE not generated: {result.wire_result.message}")
+            print(f"WIRE status: {result.out / 'reviewed_curves.wire_status.json'}")
     print(f"Compact curve JSON: {result.out / 'reviewed_curves.json'}")
     print(f"Preview SVG: {result.out / 'reviewed_clean_preview.svg'}")
     if result.skipped_count:

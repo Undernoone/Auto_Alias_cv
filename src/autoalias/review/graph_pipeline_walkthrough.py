@@ -273,7 +273,7 @@ def step10_coverage(
     coverage_fragments: list[list[list[float]]],
 ) -> dict[str, float | int]:
     print("\n[步骤 10] `_edge_coverage_metrics`")
-    print("  把 raw_edges 与 fragments 画到掩膜上（线宽 3），与 skeleton 对比。")
+    print("  把 raw_edges 与 fragments 画到掩膜上（线宽 3），与 skeleton 自动G2。")
     cov = _edge_coverage_metrics(skeleton, raw_edges, coverage_fragments)
     print(f"  coverage_ratio ≈ {cov.get('coverage_ratio')}（1 表示骨架全被边/碎片覆盖到）")
     return cov

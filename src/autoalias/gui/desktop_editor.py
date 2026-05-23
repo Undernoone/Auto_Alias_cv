@@ -221,6 +221,7 @@ class ExportWorker(QObject):
                 diagnostic_preview=False,
                 fast_mode=False,
                 fit_mode="manual_class_a_g2",
+                wire_export=True,
             )
             self.finished.emit(result)
         except Exception as exc:  # pragma: no cover - GUI worker path.
@@ -1495,12 +1496,19 @@ class DesktopEditor(QMainWindow):
         self.last_export_dir = result.out
         self.last_export_label.setText(f"最近导出：{result.out}")
         self._set_status(f"IGES 导出完成：{result.out}")
+        wire_text = "WIRE：未请求"
+        if result.wire_result is not None:
+            if result.wire_result.ok:
+                wire_text = f"WIRE：{result.wire_result.wire_path}"
+            else:
+                wire_text = f"WIRE：未生成（见 {result.out / 'reviewed_curves.wire_status.json'}）"
         QMessageBox.information(
             self,
             "导出完成",
             f"曲线：{len(result.curves)}\n"
             f"通过：{sum(1 for report in result.reports if report.passed)}/{len(result.reports)}\n"
             f"IGES：{result.out / 'reviewed_curves.igs'}\n"
+            f"{wire_text}\n"
             f"SVG：{result.out / 'reviewed_clean_preview.svg'}",
         )
 

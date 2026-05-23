@@ -12,7 +12,14 @@ try:
 except Exception:  # pragma: no cover - scipy is optional for portable installs.
     minimize = None
 
-from autoalias.exporters import write_iges, write_json_bundle, write_svg_preview
+from autoalias.exporters import (
+    WireExportResult,
+    write_iges,
+    write_json_bundle,
+    write_svg_preview,
+    write_wire_from_iges,
+    write_wire_status,
+)
 from autoalias.geometry.bezier import bernstein_basis, evaluate_bezier, signed_curvature_2d
 from autoalias.geometry.fitting import FittingOptions, SingleSpanFitter, _binom
 from autoalias.geometry.polyline import chord_length_parameter, resample_polyline, smooth_polyline
@@ -27,6 +34,7 @@ class ReviewedFitResult:
     curves: list[NURBSCurve]
     reports: list[QualityReport]
     skipped_count: int
+    wire_result: WireExportResult | None = None
 
 
 @dataclass(slots=True)
@@ -51,6 +59,8 @@ def fit_reviewed_annotations(
     diagnostic_preview: bool = True,
     fast_mode: bool = False,
     fit_mode: str = "manual_class_a_g2",
+    wire_export: bool = False,
+    iges_to_al: str | Path | None = None,
 ) -> ReviewedFitResult:
     """Fit Alias-ready curves strictly from manually saved design-curve annotations.
 
@@ -68,6 +78,7 @@ def fit_reviewed_annotations(
     candidates: list[CurveCandidate] = []
     skipped = 0
     background_image: str | Path | None = None
+    wire_result: WireExportResult | None = None
 
     for annotation_path in resolved_paths:
         data = json.loads(annotation_path.read_text(encoding="utf-8"))
@@ -171,7 +182,15 @@ def fit_reviewed_annotations(
 
     write_json_bundle(out_path / "reviewed_curves.json", curves, reports)
     if curves:
-        write_iges(out_path / "reviewed_curves.igs", curves)
+        iges_path = out_path / "reviewed_curves.igs"
+        write_iges(iges_path, curves)
+        if wire_export:
+            wire_result = write_wire_from_iges(
+                iges_path,
+                out_path / "reviewed_curves.wire",
+                converter=iges_to_al,
+            )
+            write_wire_status(out_path / "reviewed_curves.wire_status.json", wire_result)
         if diagnostic_preview:
             write_svg_preview(
                 out_path / "reviewed_preview.svg",
@@ -193,7 +212,13 @@ def fit_reviewed_annotations(
             show_cvs=False,
             show_candidates=False,
         )
-    return ReviewedFitResult(out=out_path, curves=curves, reports=reports, skipped_count=skipped)
+    return ReviewedFitResult(
+        out=out_path,
+        curves=curves,
+        reports=reports,
+        skipped_count=skipped,
+        wire_result=wire_result,
+    )
 
 
 def _expand_annotation_paths(paths: list[str | Path]) -> list[Path]:

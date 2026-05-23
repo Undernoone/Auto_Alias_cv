@@ -55,7 +55,7 @@ def _write_manual_iges(path: str | Path, curves: list[NURBSCurve]) -> None:
     d_seq = 1
     for curve in curves:
         pdata = _curve_parameter_data(curve)
-        chunks = _chunks(pdata, 64)
+        chunks = _parameter_chunks(pdata, 64)
         first_p = p_seq
         line_count = len(chunks)
         parameter_records.extend(_parameter_records(chunks, d_seq, p_seq))
@@ -120,34 +120,34 @@ def _parameter_records(chunks: list[str], d_seq: int, first_seq: int) -> list[st
 def _global_records() -> list[str]:
     # Minimal but standards-shaped global section.
     params = [
-        "1H,",
-        "1H;",
-        "16HAutoAlias Curves",
-        "16HAutoAlias Curves",
-        "32HAutoAlias single-span NURBS export",
-        "1H1",
-        "1H1",
+        _h(","),
+        _h(";"),
+        _h("AutoAlias Curves"),
+        _h("AutoAlias Curves"),
+        _h("AutoAlias single-span NURBS export"),
+        _h("1"),
+        _h("1"),
         "32",
         "38",
         "6",
         "308",
         "15",
-        "16HAutoAlias Curves",
+        _h("AutoAlias Curves"),
         "1.0",
         "1",
-        "4HINCH",
+        _h("INCH"),
         "1",
         "0.01",
-        "15H20260430.000000",
+        _h("20260430.000000"),
         "1E-06",
         "1000.0",
-        "4Huser",
-        "8HAutoAlias",
+        _h("user"),
+        _h("AutoAlias"),
         "11",
         "0",
-        "15H20260430.000000",
+        _h("20260430.000000"),
     ]
-    return _section_records([",".join(params) + ";"], "G")
+    return _section_records_from_chunks(_parameter_chunks(",".join(params) + ";", 72), "G")
 
 
 def _section_records(payloads: list[str], section: str) -> list[str]:
@@ -160,6 +160,10 @@ def _section_records(payloads: list[str], section: str) -> list[str]:
     return records
 
 
+def _section_records_from_chunks(chunks: list[str], section: str) -> list[str]:
+    return [f"{chunk:<72}{section}{seq:7d}" for seq, chunk in enumerate(chunks, start=1)]
+
+
 def _terminate_record(s_count: int, g_count: int, d_count: int, p_count: int) -> str:
     data = f"S{s_count:7d}G{g_count:7d}D{d_count:7d}P{p_count:7d}"
     return f"{data:<72}T{1:7d}"
@@ -169,6 +173,54 @@ def _chunks(text: str, size: int) -> list[str]:
     return [text[i : i + size] for i in range(0, len(text), size)] or [""]
 
 
+def _parameter_chunks(text: str, size: int) -> list[str]:
+    """Split IGES parameter data without cutting numeric values in half."""
+    chunks: list[str] = []
+    current = ""
+    for token in _parameter_tokens(text):
+        if current and len(current) + len(token) > size:
+            chunks.append(current)
+            current = ""
+        if len(token) > size:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.extend(_chunks(token, size))
+            token = ""
+            continue
+        current += token
+    if current:
+        chunks.append(current)
+    return chunks or [""]
+
+
+def _parameter_tokens(text: str) -> list[str]:
+    tokens: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        start = i
+        j = i
+        while j < n and text[j].isdigit():
+            j += 1
+        if j > i and j < n and text[j] == "H":
+            length = int(text[i:j])
+            i = j + 1 + length
+            if i < n and text[i] in ",;":
+                i += 1
+            tokens.append(text[start:i])
+            continue
+        while i < n and text[i] not in ",;":
+            i += 1
+        if i < n:
+            i += 1
+        tokens.append(text[start:i])
+    return [token for token in tokens if token]
+
+
 def _fmt(value: float) -> str:
     return f"{float(value):.12g}"
 
+
+def _h(text: str) -> str:
+    return f"{len(text)}H{text}"

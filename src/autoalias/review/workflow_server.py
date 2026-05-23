@@ -416,9 +416,13 @@ def _make_handler(
                     diagnostic_preview=bool(payload.get("diagnostic_preview", False)),
                     fast_mode=_clean_bool(payload.get("fast_mode", False)),
                     fit_mode=str(payload.get("fit_mode") or "manual_class_a_g2"),
+                    wire_export=_clean_bool(payload.get("wire_export", True)),
+                    iges_to_al=payload.get("iges_to_al") or None,
                 )
                 exports[sid] = {
                     "iges": export_dir / "reviewed_curves.igs",
+                    "wire": export_dir / "reviewed_curves.wire",
+                    "wire_status": export_dir / "reviewed_curves.wire_status.json",
                     "json": export_dir / "reviewed_curves.json",
                     "preview": export_dir / "reviewed_preview.svg",
                     "clean_preview": export_dir / "reviewed_clean_preview.svg",
@@ -2625,7 +2629,8 @@ async function exportIges() {
       max_fit_points: null,
       diagnostic_preview: false,
       fast_mode: false,
-      fit_mode: "manual_class_a_g2"
+      fit_mode: "manual_class_a_g2",
+      wire_export: true
     })
   });
   const result = await res.json();
@@ -2635,6 +2640,8 @@ async function exportIges() {
   }
   const links = [];
   if (result.exports.iges) links.push(`<a href="${result.exports.iges.url}">下载 IGES</a>`);
+  if (result.exports.wire) links.push(`<a href="${result.exports.wire.url}">下载 WIRE</a>`);
+  if (!result.exports.wire && result.exports.wire_status) links.push(`<a href="${result.exports.wire_status.url}">WIRE 状态</a>`);
   if (result.exports.json) links.push(`<a href="${result.exports.json.url}">下载 JSON</a>`);
   if (result.exports.clean_preview) links.push(`<a href="${result.exports.clean_preview.url}">下载预览 SVG</a>`);
   setExport(`${result.curve_count} 条曲线，${result.passed_count} 条通过。<br>${links.join(" / ")}<br>${result.out}`);
