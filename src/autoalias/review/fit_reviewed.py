@@ -725,6 +725,46 @@ def _fit_design_curve_chain_class_a_g2(
     return out
 
 
+def _review_fit_has_visual_fairness_failure(
+    fitted: list[tuple[NURBSCurve, CurveCandidate, QualityReport]],
+) -> bool:
+    for curve, candidate, report in fitted:
+        points = np.asarray(candidate.points, dtype=float)
+        if not bool(report.passed):
+            return True
+        if _has_forbidden_curvature_sign_change(curve, points):
+            return True
+        if _has_forbidden_cv_side_switch(curve, points):
+            return True
+        if bool(_curve_blend_fairness_metrics(curve, points)["forbidden"]):
+            return True
+        if _curve_exceeds_precision_budget(curve, points):
+            return True
+    return False
+
+
+def _review_fit_visual_fairness_score(
+    fitted: list[tuple[NURBSCurve, CurveCandidate, QualityReport]],
+) -> float:
+    score = 0.0
+    for curve, candidate, report in fitted:
+        points = np.asarray(candidate.points, dtype=float)
+        score += 20000.0 if not bool(report.passed) else 0.0
+        score += 22000.0 if _has_forbidden_curvature_sign_change(curve, points) else 0.0
+        score += 18000.0 if _has_forbidden_cv_side_switch(curve, points) else 0.0
+        blend = _curve_blend_fairness_metrics(curve, points)
+        score += 16000.0 if bool(blend["forbidden"]) else 0.0
+        score += float(blend["penalty"]) * 120.0
+        score += 14000.0 if _curve_exceeds_precision_budget(curve, points) else 0.0
+        score += _bezier_mean_error(curve, points) * 30.0
+        score += _cv_side_consistency_penalty(curve, points) * 12.0
+        score += _cv_target_corridor_penalty(curve, points) * 12.0
+        score += _curvature_sign_penalty(curve, points) * 3.0
+        score += _cv_layout_penalty(curve.cvs) * 8.0
+        score += _cv_dent_penalty(curve.cvs) * 3.0
+    return float(score)
+
+
 def _fit_design_curve_chain_global_c2(
     design_curve: dict[str, Any],
     annotation_path: Path,
@@ -738,7 +778,112 @@ def _fit_design_curve_chain_global_c2(
     if segment_count <= 1:
         raise ValueError("global C2 chain requires at least two segments")
     solve_degree = 7 if not isinstance(degree, int) else min(max(int(degree), 5), 7)
-    curves = _solve_global_c2_bezier_chain(segments, degree=solve_degree, closed=closed)
+    prior_cvs = _global_c2_cv_priors(segments, degree=solve_degree)
+    best: list[tuple[NURBSCurve, CurveCandidate, QualityReport]] | None = None
+    best_score = float("inf")
+    best_prior_weight = 0.0
+    for prior_weight in (0.0, 0.18, 0.38, 0.72, 1.15, 1.75, 2.6):
+        curves = _solve_global_c2_bezier_chain(
+            segments,
+            degree=solve_degree,
+            closed=closed,
+            cv_priors=prior_cvs if prior_weight > 0.0 else None,
+            cv_prior_weight=prior_weight,
+            visual_optimize=False,
+        )
+        fitted = _package_global_c2_fit(
+            design_curve,
+            annotation_path,
+            design_index,
+            segments,
+            curves,
+            solve_degree,
+            validator,
+            prior_weight=prior_weight,
+        )
+        score = _review_fit_visual_fairness_score(fitted)
+        if score < best_score:
+            best = fitted
+            best_score = score
+            best_prior_weight = prior_weight
+        if not _review_fit_has_visual_fairness_failure(fitted):
+            best = fitted
+            best_prior_weight = prior_weight
+            break
+    if best is not None and _review_fit_has_visual_fairness_failure(best):
+        try:
+            curves = _solve_global_c2_bezier_chain(
+                segments,
+                degree=solve_degree,
+                closed=closed,
+                cv_priors=prior_cvs if best_prior_weight > 0.0 else None,
+                cv_prior_weight=best_prior_weight,
+                visual_optimize=True,
+                hard_join_curvature=False,
+            )
+            optimized = _package_global_c2_fit(
+                design_curve,
+                annotation_path,
+                design_index,
+                segments,
+                curves,
+                solve_degree,
+                validator,
+                prior_weight=best_prior_weight,
+            )
+            optimized_score = _review_fit_visual_fairness_score(optimized)
+            if optimized_score <= best_score:
+                best = optimized
+                best_score = optimized_score
+        except Exception:
+            pass
+    if best is not None and _review_fit_has_visual_fairness_failure(best):
+        try:
+            curves = _solve_global_c2_bezier_chain(
+                segments,
+                degree=solve_degree,
+                closed=closed,
+                cv_priors=prior_cvs if best_prior_weight > 0.0 else None,
+                cv_prior_weight=best_prior_weight,
+                visual_optimize=True,
+                hard_join_curvature=True,
+            )
+            hard_fit = _package_global_c2_fit(
+                design_curve,
+                annotation_path,
+                design_index,
+                segments,
+                curves,
+                solve_degree,
+                validator,
+                prior_weight=best_prior_weight,
+            )
+            hard_score = _review_fit_visual_fairness_score(hard_fit)
+            if hard_score <= best_score or not _review_fit_has_visual_fairness_failure(hard_fit):
+                best = hard_fit
+                best_score = hard_score
+        except Exception:
+            pass
+    if best is None:
+        raise ValueError("global C2 solve failed")
+    for curve, _candidate, _report in best:
+        curve.metadata["class_a_g2_cv_prior_weight"] = float(best_prior_weight)
+        curve.metadata["class_a_g2_visual_fairness_score"] = round(float(best_score), 4)
+    _stamp_class_a_g2_diagnostics(best, closed=closed)
+    return best
+
+
+def _package_global_c2_fit(
+    design_curve: dict[str, Any],
+    annotation_path: Path,
+    design_index: int,
+    segments: list[dict[str, Any]],
+    curves: list[NURBSCurve],
+    solve_degree: int,
+    validator: ClassAValidator,
+    *,
+    prior_weight: float,
+) -> list[tuple[NURBSCurve, CurveCandidate, QualityReport]]:
     fitted: list[tuple[NURBSCurve, CurveCandidate, QualityReport]] = []
     for segment_index, (curve, segment) in enumerate(zip(curves, segments, strict=False), start=1):
         points = segment["points"]
@@ -763,15 +908,34 @@ def _fit_design_curve_chain_global_c2(
         )
         curve.metadata.update(_fit_metadata_notes(curve))
         curve.metadata["class_a_g2"] = True
-        curve.metadata["class_a_g2_method"] = "global_constrained_least_squares_c0_c1_c2"
+        curve.metadata["class_a_g2_method"] = "global_constrained_least_squares_c0_c1_c2_with_cv_prior"
         curve.metadata["class_a_g2_global_degree"] = solve_degree
+        curve.metadata["class_a_g2_cv_prior_weight"] = float(prior_weight)
         _stamp_cv_side_diagnostics(curve, points)
         _stamp_cv_target_corridor_diagnostics(curve, points)
         _stamp_curvature_sign_diagnostics(curve, points)
         _stamp_blend_fairness_diagnostics(curve, points)
         fitted.append((curve, candidate, validator.validate(curve, points)))
-    _stamp_class_a_g2_diagnostics(fitted, closed=closed)
     return fitted
+
+
+def _global_c2_cv_priors(segments: list[dict[str, Any]], *, degree: int) -> list[np.ndarray]:
+    priors: list[np.ndarray] = []
+    for index, segment in enumerate(segments):
+        points = np.asarray(segment["points"], dtype=float)
+        candidate = CurveCandidate(
+            label=f"global_c2_prior_{index + 1:03d}",
+            points=points,
+            confidence=1.0,
+            source="manual_review_prior",
+        )
+        try:
+            curve = SingleSpanFitter(FittingOptions(degree=degree)).fit_candidate(candidate)
+            curve = _refine_non_s_single_side_curve(curve, points)
+            priors.append(np.asarray(curve.cvs, dtype=float))
+        except Exception:
+            priors.append(np.zeros((degree + 1, 3), dtype=float))
+    return priors
 
 
 def _solve_global_c2_bezier_chain(
@@ -779,6 +943,10 @@ def _solve_global_c2_bezier_chain(
     *,
     degree: int,
     closed: bool,
+    cv_priors: list[np.ndarray] | None = None,
+    cv_prior_weight: float = 0.0,
+    visual_optimize: bool = False,
+    hard_join_curvature: bool = False,
 ) -> list[NURBSCurve]:
     count = len(segments)
     cv_count = degree + 1
@@ -824,6 +992,18 @@ def _solve_global_c2_bezier_chain(
         for row_basis, point in zip(basis, pts, strict=False):
             add_row({var(seg_index, i): float(row_basis[i]) for i in range(cv_count)}, point, weight=1.0)
 
+    if cv_priors is not None and cv_prior_weight > 0.0:
+        for seg_index, cvs in enumerate(cv_priors[:count]):
+            if len(cvs) != cv_count:
+                continue
+            for cv_index in range(1, degree):
+                edge_factor = 1.45 if cv_index in (1, 2, degree - 2, degree - 1) else 1.0
+                add_row(
+                    {var(seg_index, cv_index): 1.0},
+                    np.asarray(cvs[cv_index], dtype=float),
+                    weight=float(cv_prior_weight) * edge_factor,
+                )
+
     join_points = _global_chain_join_points(prepared_points, closed=closed)
     if closed:
         for seg_index in range(count):
@@ -860,6 +1040,29 @@ def _solve_global_c2_bezier_chain(
                 var(right, 0): -pp / (right_len * right_len),
             }
         )
+        if hard_join_curvature:
+            target_d2 = _global_join_curvature_prior_target(prepared_points, lengths, left, right)
+            if target_d2 is not None:
+                scale = pp / max(left_len * left_len, 1e-9)
+                add_constraint(
+                    {
+                        var(left, degree): scale,
+                        var(left, degree - 1): -2.0 * scale,
+                        var(left, degree - 2): scale,
+                    },
+                    target_d2,
+                )
+        else:
+            _add_global_join_curvature_prior_row(
+                add_row,
+                var,
+                prepared_points,
+                lengths,
+                left,
+                right,
+                degree,
+                weight=30.0,
+            )
 
     _add_global_fairness_rows(rows, rhs, var, count, degree, var_count)
 
@@ -876,6 +1079,15 @@ def _solve_global_c2_bezier_chain(
     right = np.vstack([atb, d])
     solution, *_ = np.linalg.lstsq(kkt, right, rcond=None)
     cvs_flat = solution[:var_count]
+    if visual_optimize:
+        cvs_flat = _optimize_global_c2_visual_nullspace(
+            cvs_flat,
+            c,
+            d,
+            prepared_points,
+            degree=degree,
+            cv_priors=cv_priors,
+        )
 
     curves: list[NURBSCurve] = []
     for seg_index in range(count):
@@ -891,6 +1103,93 @@ def _solve_global_c2_bezier_chain(
             )
         )
     return curves
+
+
+def _add_global_join_curvature_prior_row(
+    add_row,
+    var,
+    prepared_points: list[np.ndarray],
+    lengths: list[float],
+    left: int,
+    right: int,
+    degree: int,
+    *,
+    weight: float,
+) -> None:
+    target_d2 = _global_join_curvature_prior_target(prepared_points, lengths, left, right)
+    if target_d2 is None:
+        return
+    pp = float(degree * (degree - 1))
+    scale = pp / max(lengths[left] * lengths[left], 1e-9)
+    add_row(
+        {
+            var(left, degree): scale,
+            var(left, degree - 1): -2.0 * scale,
+            var(left, degree - 2): scale,
+        },
+        target_d2,
+        weight=weight,
+    )
+
+
+def _global_join_curvature_prior_target(
+    prepared_points: list[np.ndarray],
+    lengths: list[float],
+    left: int,
+    right: int,
+) -> np.ndarray | None:
+    left_points = prepared_points[left]
+    right_points = prepared_points[right]
+    local_len = max(min(lengths[left], lengths[right]), 1.0)
+    tangent = _target_join_tangent(left_points, right_points)
+    if np.linalg.norm(tangent) < 1e-9:
+        return None
+    normal = np.array([-tangent[1], tangent[0], 0.0], dtype=float)
+    desired_sign = _global_join_desired_curvature_sign(left_points, right_points)
+    if desired_sign == 0:
+        return None
+    samples = _join_curvature_samples(left_points, right_points)
+    finite = np.asarray([abs(value) for value in samples if np.isfinite(value) and abs(value) > 1e-8], dtype=float)
+    if len(finite):
+        magnitude = float(np.nanpercentile(finite, 52)) * 0.42
+    else:
+        magnitude = 0.0
+    magnitude = float(np.clip(magnitude, 0.00008, min(0.0042, 0.42 / local_len)))
+    return normal * float(desired_sign) * magnitude
+
+
+def _global_join_desired_curvature_sign(left_points: np.ndarray, right_points: np.ndarray) -> int:
+    left_sign = _dominant_target_polyline_curvature_sign(left_points)
+    right_sign = _dominant_target_polyline_curvature_sign(right_points)
+    if left_sign and right_sign:
+        if left_sign == right_sign:
+            return int(left_sign)
+        left_strength = _target_curvature_sign_strength(left_points, left_sign)
+        right_strength = _target_curvature_sign_strength(right_points, right_sign)
+        return int(left_sign if left_strength >= right_strength else right_sign)
+    if left_sign:
+        return int(left_sign)
+    if right_sign:
+        return int(right_sign)
+    target = _target_join_curvature(left_points, right_points)
+    if target > 1e-8:
+        return 1
+    if target < -1e-8:
+        return -1
+    return 0
+
+
+def _target_curvature_sign_strength(points: np.ndarray, sign: int) -> float:
+    pts = remove_duplicate_points(np.asarray(points, dtype=float), eps=0.5)
+    if len(pts) < 5 or sign == 0:
+        return 0.0
+    pts = smooth_polyline(resample_polyline(pts, min(max(len(pts), 50), 120)), window=7)
+    values = []
+    for idx in range(1, len(pts) - 1):
+        value = _signed_three_point_curvature(pts[idx - 1, :2], pts[idx, :2], pts[idx + 1, :2])
+        if sign * value > 0.0:
+            values.append(abs(value))
+    return float(np.sum(values))
 
 
 def _global_chain_join_points(points: list[np.ndarray], *, closed: bool) -> list[np.ndarray]:
@@ -2824,6 +3123,220 @@ def _repair_cv_turn_side(curve: NURBSCurve, desired_sign: int, target_points: np
     ) <= _bezier_max_error(curve, target_points) + 6.0:
         curve.cvs = cvs
         curve.metadata["cv_turn_side_repaired"] = True
+
+
+def _optimize_global_c2_visual_nullspace(
+    cvs_flat: np.ndarray,
+    constraints: np.ndarray,
+    constraint_rhs: np.ndarray,
+    prepared_points: list[np.ndarray],
+    *,
+    degree: int,
+    cv_priors: list[np.ndarray] | None,
+) -> np.ndarray:
+    if minimize is None:
+        return cvs_flat
+    try:
+        from scipy.linalg import null_space
+    except Exception:
+        return cvs_flat
+    c = np.asarray(constraints, dtype=float)
+    if c.size == 0:
+        return cvs_flat
+    ns = null_space(c)
+    if ns.size == 0 or ns.shape[1] == 0:
+        return cvs_flat
+
+    base = np.asarray(cvs_flat, dtype=float).copy()
+    n_vars = base.shape[0]
+    cv_count = degree + 1
+    segment_count = len(prepared_points)
+    if n_vars != segment_count * cv_count:
+        return cvs_flat
+
+    # The KKT solve should already satisfy C0/C1/C2. Project the start point
+    # through the nullspace so every optimizer step remains exactly on that
+    # same G2 constraint manifold.
+    x0 = np.zeros((ns.shape[1], 2), dtype=float)
+    priors = cv_priors if cv_priors is not None else [None] * segment_count
+    segment_data = _global_visual_objective_data(prepared_points, priors, degree)
+    if not segment_data:
+        return cvs_flat
+
+    base_score = _global_visual_objective(base[:, :2], ns, x0, segment_data, degree)
+    try:
+        result = minimize(
+            lambda z: _global_visual_objective(base[:, :2], ns, z.reshape(ns.shape[1], 2), segment_data, degree),
+            x0.reshape(-1),
+            method="L-BFGS-B",
+            options={"maxiter": 52, "ftol": 1e-7, "maxls": 16},
+        )
+    except Exception:
+        return cvs_flat
+    if not getattr(result, "success", False) and not hasattr(result, "x"):
+        return cvs_flat
+
+    z = np.asarray(result.x, dtype=float).reshape(ns.shape[1], 2)
+    optimized_xy = base[:, :2] + ns @ z
+    trial = base.copy()
+    trial[:, :2] = optimized_xy
+    trial_score = _global_visual_objective(base[:, :2], ns, z, segment_data, degree)
+    if not np.isfinite(trial_score) or trial_score > base_score * 0.985:
+        return cvs_flat
+    # Guard against numerical leakage from the equality manifold.
+    if np.linalg.norm(c @ trial - constraint_rhs) > 1e-5:
+        return cvs_flat
+    return trial
+
+
+def _global_visual_objective_data(
+    prepared_points: list[np.ndarray],
+    cv_priors: list[np.ndarray | None],
+    degree: int,
+) -> list[dict[str, Any]]:
+    data: list[dict[str, Any]] = []
+    for seg_index, points in enumerate(prepared_points):
+        pts = np.asarray(points, dtype=float)
+        if len(pts) < 4:
+            continue
+        length = max(_polyline_length(pts), 1.0)
+        u_fit = chord_length_parameter(pts)
+        u_curv = np.linspace(0.015, 0.985, 80)
+        prior = cv_priors[seg_index] if seg_index < len(cv_priors) else None
+        if prior is not None and len(prior) == degree + 1:
+            prior_xy = np.asarray(prior[:, :2], dtype=float)
+            prior_curve = NURBSCurve.single_span(
+                label="visual_prior",
+                degree=degree,
+                cvs=np.column_stack([prior_xy, np.zeros(len(prior_xy))]),
+            )
+            desired_sign = _dominant_curve_curvature_sign(prior_curve, pts)
+        else:
+            prior_xy = None
+            desired_sign = 0
+        if desired_sign == 0:
+            desired_sign = _dominant_target_polyline_curvature_sign(pts)
+        if desired_sign == 0:
+            desired_sign = 1
+        desired_side = 0
+        if prior_xy is not None:
+            prior_curve = NURBSCurve.single_span(
+                label="visual_prior_side",
+                degree=degree,
+                cvs=np.column_stack([prior_xy, np.zeros(len(prior_xy))]),
+            )
+            desired_side = _dominant_cv_target_side(prior_curve, pts)
+        if desired_side == 0:
+            desired_side = -desired_sign
+        refs = []
+        tangents = []
+        for cv_index in range(1, degree):
+            ref, tangent = _target_point_tangent_at_fraction(pts, cv_index / float(degree))
+            refs.append(ref)
+            tangents.append(tangent)
+        data.append(
+            {
+                "segment_index": seg_index,
+                "points": pts,
+                "length": length,
+                "basis": bernstein_basis(degree, u_fit),
+                "target_xy": pts[:, :2],
+                "d1_basis": bernstein_basis(degree - 1, u_curv),
+                "d2_basis": bernstein_basis(degree - 2, u_curv),
+                "prior_xy": prior_xy,
+                "desired_sign": int(desired_sign),
+                "desired_side": int(desired_side),
+                "refs": np.asarray(refs, dtype=float),
+                "tangents": np.asarray(tangents, dtype=float),
+            }
+        )
+    return data
+
+
+def _global_visual_objective(
+    base_xy: np.ndarray,
+    nullspace: np.ndarray,
+    z: np.ndarray,
+    segment_data: list[dict[str, Any]],
+    degree: int,
+) -> float:
+    xy = base_xy + nullspace @ z
+    cv_count = degree + 1
+    total = 0.0
+    for item in segment_data:
+        seg_index = int(item["segment_index"])
+        start = seg_index * cv_count
+        seg_xy = xy[start : start + cv_count]
+        length = float(item["length"])
+        sampled = item["basis"] @ seg_xy
+        target = item["target_xy"]
+        fit_scale = max(_mean_fit_budget(item["points"]), 1.0)
+        data = float(np.mean(np.sum((sampled - target) ** 2, axis=1)) / (fit_scale**2))
+
+        d2 = np.diff(seg_xy, n=2, axis=0)
+        d3 = np.diff(seg_xy, n=3, axis=0)
+        fair = float(np.mean(np.sum(d2**2, axis=1)) / (length**2)) if len(d2) else 0.0
+        jerk = float(np.mean(np.sum(d3**2, axis=1)) / (length**2)) if len(d3) else 0.0
+
+        prior_xy = item["prior_xy"]
+        prior_term = 0.0
+        if prior_xy is not None and len(prior_xy) == len(seg_xy):
+            drift_limit = max(length * 0.11, 10.0)
+            prior_term = float(np.mean(np.sum((seg_xy[1:-1] - prior_xy[1:-1]) ** 2, axis=1)) / (drift_limit**2))
+
+        k = _signed_curvature_samples_from_cvs(seg_xy, item["d1_basis"], item["d2_basis"], degree)
+        k = k[np.isfinite(k)]
+        desired_sign = int(item["desired_sign"])
+        if len(k):
+            k_scale = max(float(np.nanpercentile(np.abs(k), 82)), 1.0 / max(length * 2.6, 1.0), 1e-6)
+            fair_k = desired_sign * k
+            wrong = np.clip(-fair_k - k_scale * 0.004, 0.0, None)
+            sign_penalty = float(np.mean((wrong / k_scale) ** 2))
+            lobe_penalty = float(_curvature_lobe_penalty_from_values(fair_k, scale=k_scale))
+        else:
+            sign_penalty = 0.0
+            lobe_penalty = 0.0
+
+        side_penalty = 0.0
+        refs = item["refs"]
+        tangents = item["tangents"]
+        desired_side = int(item["desired_side"])
+        if desired_side and len(refs) == degree - 1:
+            interior = seg_xy[1:-1]
+            signed = tangents[:, 0] * (interior[:, 1] - refs[:, 1]) - tangents[:, 1] * (interior[:, 0] - refs[:, 0])
+            side_eps = max(length * 0.004, 0.55)
+            wrong_side = np.clip(-(desired_side * signed) - side_eps, 0.0, None)
+            side_penalty = float(np.mean((wrong_side / max(side_eps * 3.5, 1.0)) ** 2))
+
+        edge = np.diff(seg_xy, axis=0)
+        edge_len = np.linalg.norm(edge, axis=1)
+        turn_side = 0.0
+        turn_angle = 0.0
+        turnback = 0.0
+        if len(edge) >= 2 and desired_sign:
+            unit = edge / np.maximum(edge_len[:, None], 1e-9)
+            dots = np.sum(unit[:-1] * unit[1:], axis=1)
+            angles = np.arccos(np.clip(dots, -1.0, 1.0))
+            turn_angle = float(np.mean(np.clip(angles - np.deg2rad(28.0), 0.0, None) ** 2))
+            turnback = float(np.mean(np.clip(-dots - 0.015, 0.0, None) ** 2))
+            cross = edge[:-1, 0] * edge[1:, 1] - edge[:-1, 1] * edge[1:, 0]
+            normalized = cross / np.maximum(edge_len[:-1] * edge_len[1:], 1e-9)
+            wrong_turn = np.clip(-(desired_sign * normalized) - 0.0025, 0.0, None)
+            turn_side = float(np.mean(wrong_turn**2))
+
+        total += (
+            data * 42.0
+            + fair * 24.0
+            + jerk * 7.0
+            + prior_term * 12.0
+            + sign_penalty * 22000.0
+            + lobe_penalty * 420.0
+            + side_penalty * 520.0
+            + turn_angle * 18000.0
+            + turnback * 12000.0
+            + turn_side * 14000.0
+        )
+    return float(total)
 
 
 def _signed_curvature_samples_from_cvs(
