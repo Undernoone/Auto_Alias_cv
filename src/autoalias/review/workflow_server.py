@@ -184,6 +184,7 @@ def _make_handler(
             target.write_bytes(self.rfile.read(length))
             try:
                 extraction_mode = self.headers.get("X-Extraction-Mode", "auto")
+                input_preprocess = self.headers.get("X-Input-Preprocess", "none")
                 parallel_collapse = self.headers.get("X-Parallel-Collapse", "off")
                 weak_line_threshold = float(self.headers.get("X-Weak-Line-Threshold", "32") or 32)
                 session = ReviewSession.create(
@@ -191,6 +192,7 @@ def _make_handler(
                     output_dir,
                     ReviewGraphOptions(
                         extraction_mode=_clean_extraction_mode(extraction_mode),
+                        input_preprocess=_clean_input_preprocess(input_preprocess),
                         parallel_collapse=_clean_parallel_collapse(parallel_collapse),
                         weak_line_threshold=weak_line_threshold,
                     ),
@@ -1110,6 +1112,12 @@ def _clean_extraction_mode(value: str) -> str:
     return value if value in allowed else "auto"
 
 
+def _clean_input_preprocess(value: str) -> str:
+    value = (value or "none").strip().lower()
+    allowed = {"none", "raw_feature_lines", "thick_stroke_contours"}
+    return value if value in allowed else "none"
+
+
 def _clean_parallel_collapse(value: str) -> str:
     value = (value or "off").strip().lower()
     allowed = {"off", "soft", "medium", "strong"}
@@ -1183,40 +1191,343 @@ def _html() -> str:
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>AutoAlias 骨架分段导出</title>
 <style>
-:root { --bg:#f5f6f3; --panel:#fff; --ink:#1f2423; --muted:#68706d; --line:#d8ddd9; --blue:#006dff; --orange:#f27b25; }
+:root {
+  color-scheme: light;
+  --bg:#f3f6fb;
+  --surface:#ffffff;
+  --surface-soft:rgba(255,255,255,.78);
+  --ink:#162033;
+  --muted:#647084;
+  --faint:#8b96a8;
+  --line:#dbe4ef;
+  --line-strong:#c5d1df;
+  --blue:#2563eb;
+  --blue-soft:#eaf2ff;
+  --cyan:#0ea5e9;
+  --green:#169b62;
+  --green-soft:#eaf8f1;
+  --orange:#f08a24;
+  --orange-soft:#fff5e8;
+  --red:#dc3b3b;
+  --red-soft:#fff0f0;
+  --shadow:0 20px 60px rgba(20,34,56,.11);
+  --shadow-soft:0 10px 28px rgba(20,34,56,.08);
+  --radius:18px;
+}
 * { box-sizing:border-box; }
-body { margin:0; overflow:hidden; background:var(--bg); color:var(--ink); font:14px/1.45 "Segoe UI","Microsoft YaHei",Arial,sans-serif; }
-.app { display:grid; grid-template-columns:minmax(0,1fr) 340px; height:100vh; }
-.stage { position:relative; min-width:0; }
-canvas { display:block; width:100%; height:100%; background:#fff; cursor:crosshair; }
-.panel { border-left:1px solid var(--line); background:var(--panel); padding:14px; overflow:auto; }
-h1 { margin:0 0 12px; font-size:18px; }
-h2 { margin:16px 0 8px; padding-top:12px; border-top:1px solid var(--line); color:var(--muted); font-size:13px; }
-.row { display:grid; grid-template-columns:1fr auto; gap:8px; padding:6px 0; border-bottom:1px solid #eef1ef; }
+html { scroll-behavior:smooth; }
+body {
+  margin:0;
+  overflow:hidden;
+  background:
+    radial-gradient(circle at 18% 8%, rgba(37,99,235,.08), transparent 32%),
+    linear-gradient(135deg,#f8fafc 0%,#eef3f8 100%);
+  color:var(--ink);
+  font:14px/1.55 "Inter","Segoe UI","Microsoft YaHei",Arial,sans-serif;
+  -webkit-font-smoothing:antialiased;
+}
+.app {
+  display:grid;
+  grid-template-columns:minmax(0,1fr) clamp(390px,30vw,460px);
+  gap:16px;
+  height:100dvh;
+  padding:16px;
+}
+.stage {
+  position:relative;
+  min-width:0;
+  overflow:hidden;
+  border:1px solid rgba(197,209,223,.85);
+  border-radius:24px;
+  background:linear-gradient(180deg,#ffffff 0%,#f9fbff 100%);
+  box-shadow:var(--shadow);
+}
+.stage::after {
+  content:"";
+  position:absolute;
+  inset:0;
+  pointer-events:none;
+  border-radius:24px;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.9), inset 0 0 0 1px rgba(255,255,255,.35);
+}
+canvas {
+  display:block;
+  width:100%;
+  height:100%;
+  background:#fff;
+  cursor:crosshair;
+}
+.panel {
+  overflow:auto;
+  scroll-behavior:smooth;
+  border:1px solid rgba(197,209,223,.95);
+  border-radius:24px;
+  background:rgba(255,255,255,.9);
+  box-shadow:var(--shadow);
+  backdrop-filter:blur(18px);
+}
+.panel::-webkit-scrollbar { width:10px; }
+.panel::-webkit-scrollbar-track { background:transparent; }
+.panel::-webkit-scrollbar-thumb { background:#c8d3e1; border:3px solid rgba(255,255,255,.9); border-radius:999px; }
+.panelHeader {
+  position:sticky;
+  top:0;
+  z-index:5;
+  padding:18px 18px 14px;
+  border-bottom:1px solid rgba(219,228,239,.9);
+  background:linear-gradient(180deg,rgba(255,255,255,.98),rgba(255,255,255,.86));
+  backdrop-filter:blur(18px);
+}
+.brandRow { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+.brandMark {
+  width:34px;
+  height:34px;
+  border-radius:12px;
+  background:linear-gradient(135deg,var(--blue),var(--cyan));
+  box-shadow:0 10px 22px rgba(37,99,235,.25);
+}
+.eyebrow {
+  margin:0;
+  color:var(--faint);
+  font-size:11px;
+  font-weight:700;
+  letter-spacing:.08em;
+  text-transform:uppercase;
+}
+h1 {
+  margin:2px 0 0;
+  font-size:22px;
+  line-height:1.2;
+  letter-spacing:0;
+}
+.sectionNav {
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+  margin-top:14px;
+}
+.sectionNav a {
+  display:inline-flex;
+  align-items:center;
+  min-height:30px;
+  padding:0 10px;
+  border:1px solid transparent;
+  border-radius:999px;
+  color:var(--muted);
+  text-decoration:none;
+  font-size:12px;
+  font-weight:650;
+  transition:background .18s ease, border-color .18s ease, color .18s ease, transform .18s ease;
+}
+.sectionNav a:hover {
+  transform:translateY(-1px);
+  border-color:var(--line);
+  background:#f7faff;
+  color:var(--ink);
+}
+.sectionNav a.active {
+  border-color:rgba(37,99,235,.2);
+  background:var(--blue-soft);
+  color:var(--blue);
+}
+.panel > :not(.panelHeader) {
+  margin-left:16px;
+  margin-right:16px;
+}
+.panel > :last-child { margin-bottom:18px; }
+#uploadBox,
+#workBox {
+  display:grid;
+  gap:12px;
+  margin-top:16px;
+}
+#workBox.hidden,
+.hidden { display:none !important; }
+h2 {
+  margin:18px 0 10px;
+  padding-top:16px;
+  border-top:1px solid rgba(219,228,239,.9);
+  color:var(--ink);
+  font-size:13px;
+  font-weight:800;
+  letter-spacing:0;
+}
+h2::before {
+  content:"";
+  display:inline-block;
+  width:6px;
+  height:6px;
+  margin-right:8px;
+  border-radius:999px;
+  background:linear-gradient(135deg,var(--blue),var(--cyan));
+  vertical-align:2px;
+}
+.row {
+  display:grid;
+  grid-template-columns:1fr auto;
+  gap:10px;
+  align-items:center;
+  padding:10px 12px;
+  border:1px solid rgba(219,228,239,.9);
+  border-radius:14px;
+  background:linear-gradient(180deg,#fff,#f8fbff);
+}
 .row span:first-child { color:var(--muted); }
-button, select, input[type=file] { width:100%; min-height:34px; border:1px solid #cbd2ce; border-radius:6px; background:#fafbf9; color:var(--ink); font:inherit; }
-button { cursor:pointer; }
-button:hover { border-color:#8fa09a; background:#fff; }
-button.primary { border-color:#7aa2e8; background:#eaf2ff; color:#0b4cad; }
-button.good { border-color:#88bd9d; background:#effaf4; color:#126d47; }
-button.warn { border-color:#e1b179; background:#fff4e8; color:#8a4a0c; }
-button.bad { border-color:#df9b9b; background:#fff0f0; color:#a52424; }
-button:disabled { opacity:.45; cursor:default; }
-.grid2 { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
-.stack { display:grid; gap:8px; }
-.box { border:1px solid var(--line); border-radius:6px; padding:8px; background:#fbfcfb; color:var(--muted); word-break:break-all; }
-.item { border:1px solid var(--line); border-radius:6px; padding:8px; background:#fbfcfb; cursor:pointer; }
-.item.active { border-color:var(--orange); box-shadow:0 0 0 2px rgba(242,123,37,.14); }
+.row strong { font-size:13px; }
+button,
+select,
+input[type=file] {
+  width:100%;
+  min-height:38px;
+  border:1px solid var(--line-strong);
+  border-radius:12px;
+  background:#fff;
+  color:var(--ink);
+  font:inherit;
+  outline:none;
+  transition:border-color .18s ease, background .18s ease, box-shadow .18s ease, transform .18s ease;
+}
+select {
+  padding:0 34px 0 12px;
+  appearance:none;
+  background-image:
+    linear-gradient(45deg,transparent 50%,#718096 50%),
+    linear-gradient(135deg,#718096 50%,transparent 50%);
+  background-position:calc(100% - 17px) 16px, calc(100% - 11px) 16px;
+  background-size:6px 6px, 6px 6px;
+  background-repeat:no-repeat;
+}
+input[type=file] { padding:7px; }
+input[type=file]::file-selector-button {
+  margin-right:10px;
+  border:0;
+  border-radius:10px;
+  background:var(--blue-soft);
+  color:var(--blue);
+  padding:7px 11px;
+  font-weight:700;
+  cursor:pointer;
+}
+button {
+  cursor:pointer;
+  font-weight:700;
+}
+button:hover,
+select:hover,
+input[type=file]:hover {
+  border-color:#9fb1c8;
+  box-shadow:0 8px 20px rgba(20,34,56,.07);
+}
+button:hover { transform:translateY(-1px); }
+button.primary { border-color:rgba(37,99,235,.18); background:linear-gradient(135deg,#2563eb,#0ea5e9); color:#fff; }
+button.good { border-color:rgba(22,155,98,.2); background:var(--green-soft); color:#08764a; }
+button.warn { border-color:rgba(240,138,36,.25); background:var(--orange-soft); color:#99520a; }
+button.bad { border-color:rgba(220,59,59,.26); background:var(--red-soft); color:#a42121; }
+button:disabled {
+  opacity:.48;
+  cursor:default;
+  transform:none;
+  box-shadow:none;
+}
+.grid2 { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+.stack { display:grid; gap:10px; }
+.box {
+  border:1px solid rgba(219,228,239,.95);
+  border-radius:14px;
+  padding:12px;
+  background:linear-gradient(180deg,#fff,#f9fbff);
+  color:var(--muted);
+  word-break:break-word;
+  box-shadow:0 1px 0 rgba(255,255,255,.7);
+}
+.item {
+  border:1px solid rgba(219,228,239,.95);
+  border-radius:14px;
+  padding:12px;
+  background:#fff;
+  cursor:pointer;
+  transition:border-color .18s ease, box-shadow .18s ease, transform .18s ease, background .18s ease;
+}
+.item:hover {
+  transform:translateY(-2px);
+  border-color:#b9c7d8;
+  box-shadow:var(--shadow-soft);
+}
+.item.active {
+  border-color:rgba(240,138,36,.5);
+  background:linear-gradient(180deg,#fff,#fff9f0);
+  box-shadow:0 0 0 3px rgba(240,138,36,.12);
+}
 .item strong { display:block; }
 .item small { color:var(--muted); }
 .itemHead { display:grid; grid-template-columns:1fr auto; gap:8px; align-items:start; }
-.miniBad { width:auto; min-height:26px; padding:0 8px; border-color:#df9b9b; background:#fff0f0; color:#a52424; font-size:12px; }
-.floating { position:absolute; left:12px; top:12px; background:rgba(255,255,255,.92); border:1px solid var(--line); border-radius:6px; padding:8px 10px; color:var(--muted); pointer-events:none; }
-.hidden { display:none; }
-.progress { height:10px; border-radius:999px; overflow:hidden; background:#e7ebe8; border:1px solid #d3dad5; }
-.progress > div { height:100%; width:0%; background:linear-gradient(90deg,#0b6dff,#28b875); transition:width .35s ease; }
+.miniBad {
+  width:auto;
+  min-height:28px;
+  padding:0 9px;
+  border-color:rgba(220,59,59,.25);
+  background:var(--red-soft);
+  color:#a42121;
+  font-size:12px;
+}
+.floating {
+  position:absolute;
+  left:18px;
+  top:18px;
+  z-index:2;
+  max-width:min(560px,calc(100% - 36px));
+  border:1px solid rgba(197,209,223,.9);
+  border-radius:999px;
+  padding:9px 14px;
+  background:rgba(255,255,255,.86);
+  color:var(--muted);
+  box-shadow:0 12px 30px rgba(20,34,56,.10);
+  backdrop-filter:blur(14px);
+  pointer-events:none;
+}
+.progress {
+  height:10px;
+  border-radius:999px;
+  overflow:hidden;
+  background:#e7edf5;
+  border:1px solid #d3deea;
+}
+.progress > div {
+  height:100%;
+  width:0%;
+  background:linear-gradient(90deg,var(--blue),var(--green));
+  transition:width .35s ease;
+}
 .subtle { color:var(--muted); font-size:12px; }
-a { color:#075fd7; }
+a { color:var(--blue); }
+label { color:var(--muted); }
+@media (max-width:1080px) {
+  body { overflow:auto; }
+  .app {
+    grid-template-columns:1fr;
+    grid-template-rows:minmax(50dvh,1fr) auto;
+    height:100dvh;
+    overflow:hidden;
+  }
+  .panel {
+    max-height:46dvh;
+    border-radius:22px;
+  }
+}
+@media (max-width:680px) {
+  .app { padding:10px; gap:10px; grid-template-rows:minmax(48dvh,1fr) auto; }
+  .stage { border-radius:18px; }
+  .panel { max-height:50dvh; border-radius:18px; }
+  .panelHeader { padding:14px; }
+  h1 { font-size:19px; }
+  .panel > :not(.panelHeader) { margin-left:12px; margin-right:12px; }
+  .grid2 { grid-template-columns:1fr; }
+  .sectionNav { gap:6px; }
+  .sectionNav a { min-height:28px; padding:0 9px; }
+}
+@media (prefers-reduced-motion:reduce) {
+  * { transition:none !important; scroll-behavior:auto !important; }
+}
 </style>
 </head>
 <body>
@@ -1226,10 +1537,32 @@ a { color:#075fd7; }
     <div class="floating" id="status">请先上传图片</div>
   </div>
   <aside class="panel">
-    <h1>AutoAlias 骨架分段导出</h1>
+    <div class="panelHeader">
+      <div class="brandRow">
+        <div>
+          <p class="eyebrow">LAN Workbench</p>
+          <h1>AutoAlias 骨架分段导出</h1>
+        </div>
+        <div class="brandMark" aria-hidden="true"></div>
+      </div>
+      <nav class="sectionNav" aria-label="工作区导航">
+        <a href="#uploadBox" class="active">上传</a>
+        <a href="#manualSection">分段</a>
+        <a href="#repairSection">修补</a>
+        <a href="#aiSection">AI</a>
+        <a href="#displaySection">显示</a>
+        <a href="#exportSection">导出</a>
+        <a href="#curveSection">曲线</a>
+      </nav>
+    </div>
 
     <div class="stack" id="uploadBox">
       <input id="fileInput" type="file" accept="image/*" />
+      <select id="inputPreprocess">
+        <option value="none" selected>输入不预处理</option>
+        <option value="raw_feature_lines">原图预处理为黑线白底</option>
+        <option value="thick_stroke_contours">粗笔画/Logo 轮廓</option>
+      </select>
       <select id="extractionMode">
         <option value="auto" selected>自动识别提取模式</option>
         <option value="white_on_black_sketch">黑底白线草图</option>
@@ -1260,7 +1593,7 @@ a { color:#075fd7; }
       <div class="row"><span>已保存曲线</span><strong id="curveCount">0</strong></div>
       <div class="row"><span>当前点数</span><strong id="pointCount">0</strong></div>
 
-      <h2>当前分段</h2>
+      <h2 id="manualSection">当前分段</h2>
       <div class="stack">
         <select id="semantic">
           <option value="outer_profile">外轮廓</option>
@@ -1294,7 +1627,7 @@ a { color:#075fd7; }
       <div class="box" id="branchBox" style="margin-top:8px">暂无分支候选</div>
       <div class="box" id="qualityBox" style="margin-top:8px">暂无拟合质量</div>
 
-      <h2>骨架修补</h2>
+      <h2 id="repairSection">骨架修补</h2>
       <div class="grid2">
         <button id="btnSkeletonEdit">骨架编辑 OFF</button>
         <select id="skeletonEditTool">
@@ -1310,7 +1643,7 @@ a { color:#075fd7; }
         <button id="btnSkeletonChainBreak">断开连续添加</button>
       </div>
 
-      <h2>AI 辅助分线</h2>
+      <h2 id="aiSection">AI 辅助分线</h2>
       <div class="stack">
         <select id="autoSegmentMode">
           <option value="main">主线模式</option>
@@ -1329,7 +1662,7 @@ a { color:#075fd7; }
         </div>
       </div>
 
-      <h2>显示</h2>
+      <h2 id="displaySection">显示</h2>
       <div class="grid2">
         <button class="primary" id="btnImage">隐藏原图</button>
         <button class="primary" id="btnFullSkeleton">隐藏完整骨架</button>
@@ -1340,7 +1673,7 @@ a { color:#075fd7; }
         <button id="btnReset">重置视图</button>
       </div>
 
-      <h2>导出 Alias</h2>
+      <h2 id="exportSection">导出 Alias</h2>
       <div class="stack">
         <select id="degree">
           <option value="auto" selected>degree 自动</option>
@@ -1348,14 +1681,18 @@ a { color:#075fd7; }
           <option value="5">degree 5</option>
           <option value="7">degree 7</option>
         </select>
+        <label style="display:flex;align-items:center;gap:8px">
+          <input id="precisionFit" type="checkbox" />
+          精度优先（忽略 CV 美学）
+        </label>
         <button class="warn" id="btnExport">按手动分段导出 IGES</button>
         <div class="box" id="exportBox">尚未导出</div>
       </div>
 
-      <h2>曲线列表</h2>
+      <h2 id="curveSection">曲线列表</h2>
       <div class="stack" id="curveList"></div>
 
-      <h2>文件</h2>
+      <h2 id="fileSection">文件</h2>
       <div class="box" id="pathBox"></div>
     </div>
   </aside>
@@ -1409,6 +1746,36 @@ let suppressNextClick = false;
 let snapRequestId = 0;
 let aiSuggestRequestId = 0;
 let aiPollTimer = null;
+const panelEl = document.querySelector(".panel");
+const navLinks = Array.from(document.querySelectorAll(".sectionNav a"));
+let navRaf = 0;
+
+function isNavTargetVisible(target) {
+  return !!target && target.getClientRects().length > 0;
+}
+
+function updateNavHighlight() {
+  if (!panelEl || navLinks.length === 0) return;
+  const marker = panelEl.getBoundingClientRect().top + 96;
+  let active = navLinks.find(link => isNavTargetVisible(document.querySelector(link.getAttribute("href")))) || navLinks[0];
+  for (const link of navLinks) {
+    const target = document.querySelector(link.getAttribute("href"));
+    if (!isNavTargetVisible(target)) continue;
+    if (target.getBoundingClientRect().top <= marker) active = link;
+  }
+  for (const link of navLinks) link.classList.toggle("active", link === active);
+}
+
+function scheduleNavHighlight() {
+  if (navRaf) return;
+  navRaf = requestAnimationFrame(() => {
+    navRaf = 0;
+    updateNavHighlight();
+  });
+}
+
+panelEl?.addEventListener("scroll", scheduleNavHighlight, { passive: true });
+window.addEventListener("resize", scheduleNavHighlight);
 
 function api(path) { return path + (path.includes("?") ? "&" : "?") + "sid=" + encodeURIComponent(sid); }
 
@@ -1436,6 +1803,7 @@ async function uploadImage() {
   const file = document.getElementById("fileInput").files[0];
   if (!file) return;
   const mode = document.getElementById("extractionMode").value || "auto";
+  const preprocess = document.getElementById("inputPreprocess").value || "none";
   const collapse = document.getElementById("parallelCollapse").value || "off";
   const weakThreshold = document.getElementById("weakLineThreshold").value || "32";
   setStatus("正在上传并提取骨架...");
@@ -1445,6 +1813,7 @@ async function uploadImage() {
       "Content-Type": "application/octet-stream",
       "X-Filename": encodeURIComponent(file.name),
       "X-Extraction-Mode": mode,
+      "X-Input-Preprocess": preprocess,
       "X-Weak-Line-Threshold": weakThreshold,
       "X-Parallel-Collapse": collapse
     },
@@ -2629,7 +2998,7 @@ async function exportIges() {
       max_fit_points: null,
       diagnostic_preview: false,
       fast_mode: false,
-      fit_mode: "manual_class_a_g2",
+      fit_mode: document.getElementById("precisionFit").checked ? "precision" : "manual_class_a_g2",
       wire_export: true
     })
   });
@@ -2787,6 +3156,7 @@ function updatePanel() {
   document.getElementById("btnAutoSegment").disabled = !graph;
   document.getElementById("btnAiSuggest").disabled = !graph;
   renderCurveList();
+  scheduleNavHighlight();
 }
 
 function renderBranchControls() {

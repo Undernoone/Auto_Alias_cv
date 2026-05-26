@@ -47,6 +47,8 @@ class _G2Constraint:
 G2_SPLIT_MAX_SHIFT_PX = 18.0
 ENABLE_G2_CONSTRAINTS = False
 ENABLE_G2_EDITOR_OVERRIDES = False
+PRECISION_FIT_MAX_DEGREE = 24
+PRECISION_FIT_DEGREE_TIEBREAK_WEIGHT = 0.015
 
 
 def fit_reviewed_annotations(
@@ -415,6 +417,15 @@ def _fit_design_curve_chain(
             degree,
             validator,
         )
+    if _is_precision_fit_mode(fit_mode):
+        return _fit_design_curve_chain_precision(
+            design_curve,
+            annotation_path,
+            design_index,
+            segments,
+            degree,
+            validator,
+        )
     if _should_use_manual_class_a_g2(design_curve, segments, fit_mode):
         return _fit_design_curve_chain_class_a_g2(
             design_curve,
@@ -600,6 +611,16 @@ def _should_use_manual_class_a_g2(
     return True
 
 
+def _is_precision_fit_mode(fit_mode: str) -> bool:
+    return str(fit_mode or "").strip().lower() in {
+        "precision",
+        "accuracy",
+        "fit_accuracy",
+        "precision_no_cv",
+        "ignore_cv",
+    }
+
+
 def _fit_design_curve_chain_class_a_g2(
     design_curve: dict[str, Any],
     annotation_path: Path,
@@ -777,7 +798,7 @@ def _fit_design_curve_chain_global_c2(
     segment_count = len(segments)
     if segment_count <= 1:
         raise ValueError("global C2 chain requires at least two segments")
-    solve_degree = 7 if not isinstance(degree, int) else min(max(int(degree), 5), 7)
+    solve_degree = _select_global_c2_solve_degree(segments, degree, closed=closed)
     prior_cvs = _global_c2_cv_priors(segments, degree=solve_degree)
     best: list[tuple[NURBSCurve, CurveCandidate, QualityReport]] | None = None
     best_score = float("inf")
@@ -864,13 +885,100 @@ def _fit_design_curve_chain_global_c2(
                 best_score = hard_score
         except Exception:
             pass
+    if (
+        best is not None
+        and not isinstance(degree, int)
+        and solve_degree < 7
+        and _review_fit_has_visual_fairness_failure(best)
+    ):
+        # Degree 5 is the preferred Class-A minimum for simple G2 chains, but it
+        # has no free CV after both endpoint C2 constraints are satisfied. If it
+        # visibly loses the hand-routed path or creates a poor comb, retry the
+        # same chain as degree 7 instead of exporting an underfit curve.
+        return _fit_design_curve_chain_global_c2(
+            design_curve,
+            annotation_path,
+            design_index,
+            segments,
+            7,
+            validator,
+        )
     if best is None:
+        if not isinstance(degree, int) and solve_degree < 7:
+            return _fit_design_curve_chain_global_c2(
+                design_curve,
+                annotation_path,
+                design_index,
+                segments,
+                7,
+                validator,
+            )
         raise ValueError("global C2 solve failed")
     for curve, _candidate, _report in best:
         curve.metadata["class_a_g2_cv_prior_weight"] = float(best_prior_weight)
         curve.metadata["class_a_g2_visual_fairness_score"] = round(float(best_score), 4)
+        curve.metadata["class_a_g2_auto_low_degree"] = bool(not isinstance(degree, int) and solve_degree == 5)
     _stamp_class_a_g2_diagnostics(best, closed=closed)
     return best
+
+
+def _select_global_c2_solve_degree(
+    segments: list[dict[str, Any]],
+    requested_degree: int | str,
+    *,
+    closed: bool,
+) -> int:
+    if isinstance(requested_degree, int):
+        return min(max(int(requested_degree), 5), 7)
+    return 5 if _global_c2_chain_prefers_degree5(segments, closed=closed) else 7
+
+
+def _global_c2_chain_prefers_degree5(segments: list[dict[str, Any]], *, closed: bool) -> bool:
+    """Return True when a hand-split G2 chain should use the Class-A minimum degree.
+
+    Degree 5 is the lowest practical single-span Bezier degree for a segment that
+    may be C2-constrained at both ends. It is ideal for near-straight styling
+    lines and broad one-direction arcs, but too restrictive for S-curves, tight
+    blends, loops, and noisy multi-feature chains.
+    """
+    if not segments:
+        return False
+    if closed and len(segments) > 2:
+        return False
+
+    simple_or_arc = 0
+    total_length = 0.0
+    worst_angle = 0.0
+    worst_sinuosity = 1.0
+    worst_sag = 0.0
+    for segment in segments:
+        pts = remove_duplicate_points(np.asarray(segment.get("points"), dtype=float), eps=0.5)
+        if len(pts) < 4:
+            continue
+        total_length += _polyline_length(pts)
+        if _target_has_macro_s_shape(pts):
+            return False
+        simplicity = _target_curve_simplicity(pts)
+        max_angle = float(simplicity.get("max_angle_deg", 180.0) or 180.0)
+        sinuosity = float(simplicity.get("sinuosity", 999.0) or 999.0)
+        sag_ratio = float(simplicity.get("sag_ratio", 999.0) or 999.0)
+        worst_angle = max(worst_angle, max_angle)
+        worst_sinuosity = max(worst_sinuosity, sinuosity)
+        worst_sag = max(worst_sag, sag_ratio)
+
+        if bool(simplicity.get("simple")):
+            simple_or_arc += 1
+            continue
+        if bool(simplicity.get("smooth_arc")) and sinuosity < 1.14 and max_angle < 7.5 and sag_ratio < 0.12:
+            simple_or_arc += 1
+            continue
+        return False
+
+    if simple_or_arc == 0 or total_length < 10.0:
+        return False
+    # Long open roof/belt lines can have several gentle spans; keep them degree 5
+    # as long as each span is visually calm. Tight or very wavy chains stay at 7.
+    return bool(worst_angle < 11.0 and worst_sinuosity < 1.18 and worst_sag < 0.16)
 
 
 def _package_global_c2_fit(
@@ -1380,6 +1488,493 @@ def _fit_design_curve_chain_fast(
         curve.metadata["fast_degree"] = curve.degree
         out.append((curve, candidate, report))
     return out
+
+
+def _fit_design_curve_chain_precision(
+    design_curve: dict[str, Any],
+    annotation_path: Path,
+    design_index: int,
+    segments: list[dict[str, Any]],
+    degree: int | str,
+    validator: ClassAValidator,
+) -> list[tuple[NURBSCurve, CurveCandidate, QualityReport]]:
+    """Fit reviewed spans with image accuracy as the primary objective.
+
+    This mode intentionally ignores Class-A CV aesthetics and G2 coupling. It is
+    for logos, icons, decals and dense local details where the user wants the
+    Alias curve to trace the routed skeleton as closely as possible.
+    """
+    out: list[tuple[NURBSCurve, CurveCandidate, QualityReport]] = []
+    for segment_index, segment in enumerate(segments, start=1):
+        points = segment["points"]
+        label = _curve_label(
+            design_curve,
+            annotation_path,
+            design_index,
+            segment_index,
+            segment["segment_count"],
+        )
+        candidate = _make_candidate(label, points, annotation_path, design_curve)
+        curve, report = _fit_precision_curve(candidate, points, degree)
+        precision_notes = dict(curve.metadata)
+        curve.source = "manual_review_precision_fit"
+        curve.metadata = _curve_metadata(
+            design_curve,
+            annotation_path,
+            segment,
+            points,
+            segment_index,
+            fit_policy="precision_fit_ignore_cv_aesthetic",
+        )
+        curve.metadata.update(_fit_metadata_notes(curve))
+        curve.metadata["precision_fit"] = True
+        curve.metadata["precision_fit_ignores_cv_aesthetic"] = True
+        if "precision_fit_score" in precision_notes:
+            curve.metadata["precision_fit_score"] = precision_notes["precision_fit_score"]
+        if "precision_fit_sample_count" in precision_notes:
+            curve.metadata["precision_fit_sample_count"] = precision_notes["precision_fit_sample_count"]
+        for key, value in precision_notes.items():
+            if str(key).startswith("precision_"):
+                curve.metadata[key] = value
+        curve.metadata["precision_fit_mean_error"] = round(_bezier_mean_error(curve, points), 4)
+        curve.metadata["precision_fit_max_error"] = round(_bezier_max_error(curve, points), 4)
+        out.append((curve, candidate, _precision_quality_report(curve, points)))
+    return out
+
+
+def _fit_precision_curve(
+    candidate: CurveCandidate,
+    points: np.ndarray,
+    degree: int | str,
+) -> tuple[NURBSCurve, QualityReport]:
+    if isinstance(degree, int):
+        return _fit_best_precision_regularization(candidate, points, int(degree))
+
+    trials: list[tuple[int, float, float, bool, NURBSCurve, QualityReport]] = []
+    for candidate_degree in _precision_degree_candidates(points):
+        curve, report, score = _fit_scored_precision_degree(candidate, points, candidate_degree)
+        mean_error = _bezier_mean_error(curve, points)
+        max_error = _bezier_max_error(curve, points)
+        fit_score = _precision_fit_score(mean_error, max_error)
+        stability = _precision_cv_stability_metrics(curve, points)
+        editable = _precision_cv_is_editable(stability, points)
+        trials.append((candidate_degree, fit_score, score, editable, curve, report))
+    if not trials:
+        raise ValueError("failed to fit precision curve")
+    selected = _select_precision_trial(trials, points)
+    selected_degree, fit_score, total_score, editable, curve, report = selected
+    curve.metadata["precision_fit_score"] = round(float(total_score), 4)
+    curve.metadata["precision_fit_selection_score"] = round(float(fit_score), 4)
+    curve.metadata["precision_fit_selected_lowest_close_degree"] = True
+    curve.metadata["precision_fit_cv_editable"] = bool(editable)
+    curve.metadata["precision_fit_selected_degree"] = int(selected_degree)
+    return curve, report
+
+
+def _fit_best_precision_regularization(
+    candidate: CurveCandidate,
+    points: np.ndarray,
+    degree: int,
+) -> tuple[NURBSCurve, QualityReport]:
+    curve, report, score = _fit_scored_precision_degree(candidate, points, degree)
+    curve.metadata["precision_fit_score"] = round(float(score), 4)
+    return curve, report
+
+
+def _fit_scored_precision_degree(
+    candidate: CurveCandidate,
+    points: np.ndarray,
+    degree: int,
+) -> tuple[NURBSCurve, QualityReport, float]:
+    best: tuple[float, NURBSCurve, QualityReport] | None = None
+    for regularization in _precision_regularization_candidates(degree):
+        curve = _fit_precision_fixed_degree(candidate, points, degree, regularization_strength=regularization)
+        report = _precision_quality_report(curve, points)
+        mean_error = _bezier_mean_error(curve, points)
+        max_error = _bezier_max_error(curve, points)
+        stability = _precision_cv_stability_metrics(curve, points)
+        score = (
+            _precision_fit_score(mean_error, max_error)
+            + float(stability["penalty"])
+            + degree * PRECISION_FIT_DEGREE_TIEBREAK_WEIGHT
+        )
+        if best is None or score < best[0]:
+            best = (score, curve, report)
+    if best is None:
+        raise ValueError("failed to fit precision curve")
+    return best[1], best[2], best[0]
+
+
+def _precision_fit_score(mean_error: float, max_error: float) -> float:
+    return float(mean_error) + float(max_error) * 0.35
+
+
+def _select_precision_trial(
+    trials: list[tuple[int, float, float, bool, NURBSCurve, QualityReport]],
+    points: np.ndarray,
+) -> tuple[int, float, float, bool, NURBSCurve, QualityReport]:
+    """Choose the lowest degree that is visually as accurate as the best fit.
+
+    Precision mode does not have a fixed degree. It first rejects CV polygons
+    that leave the target corridor, then finds the best remaining image fit.
+    Among curves within a small perceptual error band of that best fit, it
+    chooses the lowest degree. This keeps the curve close to the source without
+    producing high-degree flying control polygons.
+    """
+    editable_trials = [trial for trial in trials if trial[3]]
+    pool = editable_trials or trials
+    best_fit = min(trial[1] for trial in pool)
+    tolerance = _precision_fit_equivalence_tolerance(points, best_fit)
+    close = [trial for trial in pool if trial[1] <= best_fit + tolerance]
+    if close:
+        return min(
+            close,
+            key=lambda trial: (
+                trial[0],
+                _precision_cv_selection_penalty(trial[4], points),
+                trial[1],
+                trial[2],
+            ),
+        )
+    return min(
+        pool,
+        key=lambda trial: (
+            trial[1],
+            _precision_cv_selection_penalty(trial[4], points),
+            trial[0],
+        ),
+    )
+
+
+def _precision_fit_equivalence_tolerance(points: np.ndarray, best_fit_score: float) -> float:
+    length = max(_polyline_length(np.asarray(points, dtype=float)), 1.0)
+    return max(0.42, min(6.5, best_fit_score * 0.18 + length * 0.0045))
+
+
+def _precision_cv_selection_penalty(curve: NURBSCurve, points: np.ndarray) -> float:
+    stability = _precision_cv_stability_metrics(curve, points)
+    return float(stability["penalty"]) + max(0.0, float(stability["precision_cv_polyline_ratio"]) - 1.8) * 18.0
+
+
+def _precision_regularization_candidates(degree: int) -> tuple[float, ...]:
+    if degree <= 7:
+        return (0.22, 0.42, 0.75, 1.1)
+    if degree <= 13:
+        return (0.18, 0.34, 0.58, 0.92, 1.35)
+    return (0.14, 0.26, 0.46, 0.74, 1.08, 1.55)
+
+
+def _fit_precision_fixed_degree(
+    candidate: CurveCandidate,
+    points: np.ndarray,
+    degree: int,
+    *,
+    regularization_strength: float = 1.0,
+) -> NURBSCurve:
+    degree = min(max(int(degree), 3), PRECISION_FIT_MAX_DEGREE)
+    sample_count = max(260, min(1200, int(len(points) * 1.6)))
+    fit_points = remove_duplicate_points(np.asarray(points, dtype=float), eps=0.35)
+    fit_points = resample_polyline(fit_points, max(sample_count, degree + 8))
+    u = chord_length_parameter(fit_points)
+    basis = bernstein_basis(degree, u)
+    p0 = fit_points[0]
+    p1 = fit_points[-1]
+    fixed = basis[:, [0]] * p0 + basis[:, [-1]] * p1
+    rhs = fit_points - fixed
+    a = basis[:, 1:-1]
+    if a.shape[1] > 0:
+        a_aug, rhs_aug = _precision_augmented_system(
+            a,
+            rhs,
+            fit_points,
+            degree,
+            p0,
+            p1,
+            regularization_strength=regularization_strength,
+        )
+        interior, *_ = np.linalg.lstsq(a_aug, rhs_aug, rcond=None)
+        cvs = np.vstack([p0, interior, p1])
+    else:
+        cvs = np.vstack([p0, p1])
+    cvs = _clamp_precision_cvs_to_target_corridor(cvs, fit_points)
+    curve = NURBSCurve.single_span(
+        label=candidate.label,
+        degree=degree,
+        cvs=cvs,
+        confidence=candidate.confidence,
+        source="manual_review_precision_fit",
+        metadata={"candidate_points": len(candidate.points)},
+    )
+    curve.metadata["precision_fit_sample_count"] = sample_count
+    curve.metadata["precision_fit_max_degree"] = PRECISION_FIT_MAX_DEGREE
+    curve.metadata["precision_fit_regularization"] = round(float(regularization_strength), 4)
+    curve.metadata.update(_precision_cv_stability_metrics(curve, points))
+    return curve
+
+
+def _precision_degree_candidates(points: np.ndarray) -> tuple[int, ...]:
+    distinct = len(remove_duplicate_points(np.asarray(points, dtype=float), eps=0.5))
+    max_degree = min(PRECISION_FIT_MAX_DEGREE, max(7, distinct - 1))
+    base = [3, 5, 7, 9, 11, 12, 13, 16, 20, 24]
+    degrees = [degree for degree in base if degree <= max_degree]
+    if max_degree not in degrees:
+        degrees.append(max_degree)
+    return tuple(dict.fromkeys(degrees))
+
+
+def _precision_augmented_system(
+    fit_matrix: np.ndarray,
+    fit_rhs: np.ndarray,
+    fit_points: np.ndarray,
+    degree: int,
+    p0: np.ndarray,
+    p1: np.ndarray,
+    *,
+    regularization_strength: float = 1.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Regularize high-degree precision fits so CVs stay editable in Alias.
+
+    A pure Bernstein least-squares solve is numerically legal but badly
+    conditioned at high degree. It may trace the pixels while sending control
+    vertices far away from the curve. The extra rows keep the unknown interior
+    CVs close to a chord-length prior and preserve the prior's second
+    difference rhythm.
+    """
+    interior_count = max(degree - 1, 0)
+    if interior_count <= 0:
+        return fit_matrix, fit_rhs
+
+    length = max(_polyline_length(fit_points), 1.0)
+    prior = resample_polyline(fit_points, degree + 1)
+    prior = _smooth_precision_cv_prior(prior, fit_points)
+
+    rows: list[np.ndarray] = [fit_matrix]
+    rhs_rows: list[np.ndarray] = [fit_rhs]
+
+    sample_count = max(len(fit_points), 1)
+    strength = max(0.05, float(regularization_strength))
+    prior_weight = max(0.35, min(80.0, (sample_count / max(interior_count, 1)) * (0.28 + degree * 0.038) * strength))
+    rows.append(np.eye(interior_count, dtype=float) * np.sqrt(prior_weight))
+    rhs_rows.append(prior[1:-1] * np.sqrt(prior_weight))
+
+    if interior_count >= 2:
+        diff_rows, diff_rhs = _precision_difference_prior_rows(prior, p0, p1, order=1)
+        if len(diff_rows):
+            rhythm_weight = max(0.8, min(18.0, prior_weight * 0.28))
+            rows.append(diff_rows * np.sqrt(rhythm_weight))
+            rhs_rows.append(diff_rhs * np.sqrt(rhythm_weight))
+
+    if interior_count >= 3:
+        diff2_rows, diff2_rhs = _precision_difference_prior_rows(prior, p0, p1, order=2)
+        if len(diff2_rows):
+            smooth_weight = max(0.35, min(12.0, prior_weight * 0.16))
+            rows.append(diff2_rows * np.sqrt(smooth_weight))
+            rhs_rows.append(diff2_rhs * np.sqrt(smooth_weight))
+
+    ridge = max(1e-5, min(0.018, 0.0004 + degree * degree * 0.000018))
+    rows.append(np.eye(interior_count, dtype=float) * np.sqrt(ridge))
+    rhs_rows.append(prior[1:-1] * np.sqrt(ridge))
+
+    augmented_a = np.vstack(rows)
+    augmented_rhs = np.vstack(rhs_rows)
+    if not np.all(np.isfinite(augmented_a)) or not np.all(np.isfinite(augmented_rhs)):
+        return fit_matrix, fit_rhs
+    # Length is intentionally referenced so future tuning can remain
+    # length-scaled without changing the public behavior.
+    _ = length
+    return augmented_a, augmented_rhs
+
+
+def _smooth_precision_cv_prior(prior: np.ndarray, fit_points: np.ndarray) -> np.ndarray:
+    if len(prior) < 5:
+        return prior
+    smoothed = prior.copy()
+    # Keep endpoints exact; only calm the interior reference polygon.
+    for idx in range(1, len(prior) - 1):
+        smoothed[idx] = prior[idx] * 0.5 + (prior[idx - 1] + prior[idx + 1]) * 0.25
+    smoothed[0] = fit_points[0]
+    smoothed[-1] = fit_points[-1]
+    return smoothed
+
+
+def _precision_difference_prior_rows(
+    prior: np.ndarray,
+    p0: np.ndarray,
+    p1: np.ndarray,
+    *,
+    order: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    degree = len(prior) - 1
+    interior_count = max(degree - 1, 0)
+    if interior_count <= 0:
+        return np.zeros((0, 0), dtype=float), np.zeros((0, 3), dtype=float)
+
+    full_rows: list[np.ndarray] = []
+    if order == 1:
+        for idx in range(degree):
+            row = np.zeros(degree + 1, dtype=float)
+            row[idx] = -1.0
+            row[idx + 1] = 1.0
+            full_rows.append(row)
+    elif order == 2:
+        for idx in range(1, degree):
+            row = np.zeros(degree + 1, dtype=float)
+            row[idx - 1] = 1.0
+            row[idx] = -2.0
+            row[idx + 1] = 1.0
+            full_rows.append(row)
+    else:
+        return np.zeros((0, interior_count), dtype=float), np.zeros((0, 3), dtype=float)
+
+    full = np.vstack(full_rows)
+    target = full @ prior
+    boundary = full[:, [0]] * p0 + full[:, [-1]] * p1
+    return full[:, 1:-1], target - boundary
+
+
+def _clamp_precision_cvs_to_target_corridor(cvs: np.ndarray, target_points: np.ndarray) -> np.ndarray:
+    target = remove_duplicate_points(np.asarray(target_points, dtype=float), eps=0.5)
+    if len(target) < 4 or len(cvs) < 4:
+        return cvs
+    length = max(_polyline_length(target), 1.0)
+    # This is a guardrail, not a projector onto the curve. Bezier CVs may sit
+    # away from the visible curve, but they must not leave the design corridor.
+    normal_limit = max(10.0, min(90.0, length * 0.18))
+    tangent_limit = max(12.0, min(110.0, length * 0.22))
+    out = np.asarray(cvs, dtype=float).copy()
+    for cv_index in range(1, len(out) - 1):
+        fraction = cv_index / float(len(out) - 1)
+        ref, tangent = _target_point_tangent_at_fraction(target, fraction)
+        if np.linalg.norm(tangent) < 1e-9:
+            continue
+        normal = np.array([-tangent[1], tangent[0]], dtype=float)
+        delta = out[cv_index, :2] - ref
+        along = float(np.clip(np.dot(delta, tangent), -tangent_limit, tangent_limit))
+        side = float(np.clip(np.dot(delta, normal), -normal_limit, normal_limit))
+        out[cv_index, :2] = ref + tangent * along + normal * side
+    return out
+
+
+def _precision_cv_stability_metrics(curve: NURBSCurve, target_points: np.ndarray) -> dict[str, float | int | bool]:
+    target = remove_duplicate_points(np.asarray(target_points, dtype=float), eps=0.5)
+    cvs = np.asarray(curve.cvs, dtype=float)
+    length = max(_polyline_length(target), 1.0)
+    if len(target) < 4 or len(cvs) < 4:
+        return {
+            "precision_cv_stability_penalty": 0.0,
+            "precision_cv_max_reference_distance": 0.0,
+            "precision_cv_polyline_ratio": 1.0,
+            "precision_cv_corridor_penalty": 0.0,
+            "penalty": 0.0,
+        }
+
+    ref_distances: list[float] = []
+    tangent_offsets: list[float] = []
+    normal_offsets: list[float] = []
+    for cv_index in range(1, len(cvs) - 1):
+        fraction = cv_index / float(len(cvs) - 1)
+        ref, tangent = _target_point_tangent_at_fraction(target, fraction)
+        if np.linalg.norm(tangent) < 1e-9:
+            continue
+        delta = cvs[cv_index, :2] - ref
+        ref_distances.append(float(np.linalg.norm(delta)))
+        tangent_offsets.append(abs(float(np.dot(delta, tangent))))
+        normal_offsets.append(abs(float(tangent[0] * delta[1] - tangent[1] * delta[0])))
+
+    cv_length = _polyline_length(cvs)
+    ratio = cv_length / length
+    max_ref = max(ref_distances) if ref_distances else 0.0
+    max_tangent = max(tangent_offsets) if tangent_offsets else 0.0
+    max_normal = max(normal_offsets) if normal_offsets else 0.0
+    corridor = _cv_target_corridor_metrics(curve, target)
+    corridor_penalty = float(corridor["penalty"])
+    distance_limit = max(14.0, min(120.0, length * 0.24))
+    tangent_limit = max(16.0, min(130.0, length * 0.26))
+    normal_limit = max(11.0, min(95.0, length * 0.20))
+
+    penalty = 0.0
+    penalty += max(0.0, ratio - 2.9) * 30.0
+    penalty += max(0.0, max_ref - distance_limit) / max(distance_limit, 1.0) * 115.0
+    penalty += max(0.0, max_tangent - tangent_limit) / max(tangent_limit, 1.0) * 52.0
+    penalty += max(0.0, max_normal - normal_limit) / max(normal_limit, 1.0) * 78.0
+    penalty += corridor_penalty * 0.42
+    penalty += _cv_layout_penalty(cvs) * 0.22
+    penalty += _cv_dent_penalty(cvs) * 0.34
+    if int(corridor["target_side_switches"]) > 0:
+        penalty += 90.0 * int(corridor["target_side_switches"])
+    if int(corridor["wrong_side_count"]) > 0:
+        penalty += 70.0 * int(corridor["wrong_side_count"])
+
+    return {
+        "precision_cv_stability_penalty": round(float(penalty), 4),
+        "precision_cv_max_reference_distance": round(float(max_ref), 4),
+        "precision_cv_max_tangent_offset": round(float(max_tangent), 4),
+        "precision_cv_max_normal_offset": round(float(max_normal), 4),
+        "precision_cv_polyline_ratio": round(float(ratio), 4),
+        "precision_cv_corridor_penalty": round(float(corridor_penalty), 4),
+        "precision_cv_side_switches": int(corridor["target_side_switches"]),
+        "precision_cv_wrong_side_count": int(corridor["wrong_side_count"]),
+        "penalty": float(penalty),
+    }
+
+
+def _precision_cv_is_editable(metrics: dict[str, float | int | bool], target_points: np.ndarray) -> bool:
+    length = max(_polyline_length(np.asarray(target_points, dtype=float)), 1.0)
+    max_reference = float(metrics.get("precision_cv_max_reference_distance", 0.0) or 0.0)
+    max_normal = float(metrics.get("precision_cv_max_normal_offset", 0.0) or 0.0)
+    ratio = float(metrics.get("precision_cv_polyline_ratio", 1.0) or 1.0)
+    penalty = float(metrics.get("precision_cv_stability_penalty", 0.0) or 0.0)
+    side_switches = int(metrics.get("precision_cv_side_switches", 0) or 0)
+    wrong_side = int(metrics.get("precision_cv_wrong_side_count", 0) or 0)
+
+    reference_limit = max(18.0, min(160.0, length * 0.30))
+    normal_limit = max(12.0, min(110.0, length * 0.22))
+    if max_reference > reference_limit:
+        return False
+    if max_normal > normal_limit:
+        return False
+    if ratio > 3.6:
+        return False
+    if penalty > 170.0:
+        return False
+    if wrong_side > 0:
+        return False
+    if side_switches > 0 and not _target_has_macro_s_shape(np.asarray(target_points, dtype=float)):
+        return False
+    return True
+
+
+def _precision_quality_report(curve: NURBSCurve, target_points: np.ndarray) -> QualityReport:
+    mean_error = _bezier_mean_error(curve, target_points)
+    max_error = _bezier_max_error(curve, target_points)
+    length = max(_polyline_length(target_points), 1.0)
+    mean_budget = max(2.4, min(9.0, length * 0.012))
+    max_budget = max(7.0, min(28.0, length * 0.04))
+    stability = _precision_cv_stability_metrics(curve, target_points)
+    warnings: list[str] = []
+    if mean_error > mean_budget:
+        warnings.append("precision mean fit error is above target")
+    if max_error > max_budget:
+        warnings.append("precision max fit error is above target")
+    if float(stability["precision_cv_stability_penalty"]) > 120.0:
+        warnings.append("precision CV polygon leaves the target corridor")
+    if int(stability["precision_cv_side_switches"]) > 0:
+        warnings.append("precision CV polygon changes side on a non-S target")
+    metrics: dict[str, float | int | bool | list[float] | str] = {
+        "degree": curve.degree,
+        "span": curve.span_count,
+        "single_span": curve.is_single_span,
+        "cv_count": len(curve.cvs),
+        "knot_count": len(curve.knots),
+        "precision_fit": True,
+        "precision_mean_error": float(mean_error),
+        "precision_max_error": float(max_error),
+        "precision_mean_budget": float(mean_budget),
+        "precision_max_budget": float(max_budget),
+        "degree_limit_ignored": bool(curve.degree > 7),
+    }
+    metrics.update(stability)
+    return QualityReport(label=curve.label, passed=len(warnings) == 0, metrics=metrics, warnings=warnings)
 
 
 def _fit_fast_layout_curve(

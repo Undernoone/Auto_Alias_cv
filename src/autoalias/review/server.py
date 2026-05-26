@@ -5,13 +5,14 @@ import mimetypes
 import socket
 import time
 import webbrowser
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 from autoalias.review.graph import ReviewGraphOptions, build_review_graph_bundle, graph_snapshot_for_training
+from autoalias.review.preprocess import preprocess_raw_feature_lines, preprocess_thick_stroke_contours
 
 
 @dataclass(slots=True)
@@ -34,7 +35,42 @@ class ReviewSession:
         image = Path(image_path).resolve()
         out = Path(output_dir).resolve()
         out.mkdir(parents=True, exist_ok=True)
+        graph_options = graph_options or ReviewGraphOptions()
+        source_image = image
+        preprocess_mode = _clean_input_preprocess(graph_options.input_preprocess)
+        preprocess_meta: dict[str, Any] = {}
+        if preprocess_mode == "raw_feature_lines":
+            preprocessed = preprocess_raw_feature_lines(image, out / "preprocessed")
+            image = preprocessed.output_path
+            graph_options = replace(
+                graph_options,
+                input_preprocess=preprocess_mode,
+                extraction_mode="black_on_white_line_art",
+            )
+            preprocess_meta = {
+                "source_image": str(source_image),
+                "preprocessed_image": str(preprocessed.output_path),
+                "preprocess_crop_bbox": list(preprocessed.crop_bbox),
+                "preprocess_line_pixels": preprocessed.line_pixels,
+            }
+        elif preprocess_mode == "thick_stroke_contours":
+            preprocessed = preprocess_thick_stroke_contours(image, out / "preprocessed")
+            image = preprocessed.output_path
+            graph_options = replace(
+                graph_options,
+                input_preprocess=preprocess_mode,
+                extraction_mode="black_on_white_line_art",
+            )
+            preprocess_meta = {
+                "source_image": str(source_image),
+                "preprocessed_image": str(preprocessed.output_path),
+                "preprocess_crop_bbox": list(preprocessed.crop_bbox),
+                "preprocess_line_pixels": preprocessed.line_pixels,
+            }
+        else:
+            graph_options = replace(graph_options, input_preprocess="none")
         graph, router = build_review_graph_bundle(image, graph_options)
+        graph.update(preprocess_meta)
         corrections_path = out / f"{image.stem}.topology_corrections.json"
         corrections: list[dict[str, Any]] = []
         design_curves: list[dict[str, Any]] = []
@@ -117,6 +153,11 @@ def _coerce_point(item: Any) -> tuple[float, float] | None:
     if isinstance(item, (list, tuple)) and len(item) >= 2:
         return (float(item[0]), float(item[1]))
     return None
+
+
+def _clean_input_preprocess(value: str | None) -> str:
+    clean = str(value or "none").strip().lower()
+    return clean if clean in {"none", "raw_feature_lines", "thick_stroke_contours"} else "none"
 
 
 def run_review_app(

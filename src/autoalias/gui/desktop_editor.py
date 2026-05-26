@@ -15,6 +15,7 @@ try:
         QBrush,
         QColor,
         QDesktopServices,
+        QFont,
         QImage,
         QKeySequence,
         QPainter,
@@ -30,11 +31,13 @@ try:
         QFileDialog,
         QGraphicsEllipseItem,
         QGraphicsItem,
+        QGraphicsOpacityEffect,
         QGraphicsPathItem,
         QGraphicsPixmapItem,
         QGraphicsScene,
         QGraphicsSimpleTextItem,
         QGraphicsView,
+        QFrame,
         QHBoxLayout,
         QLabel,
         QListWidget,
@@ -42,6 +45,7 @@ try:
         QMainWindow,
         QMessageBox,
         QPushButton,
+        QScrollArea,
         QSpinBox,
         QSplitter,
         QStatusBar,
@@ -164,6 +168,7 @@ class SessionWorker(QObject):
         image_path: Path,
         output_dir: Path,
         extraction_mode: str,
+        input_preprocess: str,
         parallel_collapse: str,
         weak_line_threshold: float,
     ) -> None:
@@ -171,6 +176,7 @@ class SessionWorker(QObject):
         self.image_path = image_path
         self.output_dir = output_dir
         self.extraction_mode = extraction_mode
+        self.input_preprocess = input_preprocess
         self.parallel_collapse = parallel_collapse
         self.weak_line_threshold = weak_line_threshold
 
@@ -178,6 +184,7 @@ class SessionWorker(QObject):
         try:
             options = ReviewGraphOptions(
                 extraction_mode=self.extraction_mode,
+                input_preprocess=self.input_preprocess,
                 parallel_collapse=self.parallel_collapse,
                 weak_line_threshold=self.weak_line_threshold,
                 max_points_per_edge=480,
@@ -185,9 +192,9 @@ class SessionWorker(QObject):
             session = ReviewSession.create(self.image_path, self.output_dir, options)
             skeleton_edits = _read_skeleton_edits(session.corrections_path)
             _replay_skeleton_edits(session, skeleton_edits)
-            image = QImage(str(self.image_path))
+            image = QImage(str(session.image_path))
             if image.isNull():
-                raise FileNotFoundError(f"cannot load image: {self.image_path}")
+                raise FileNotFoundError(f"cannot load image: {session.image_path}")
             self.finished.emit(
                 LoadedSession(session=session, image=image, skeleton_edits=skeleton_edits)
             )
@@ -204,11 +211,13 @@ class ExportWorker(QObject):
         annotation_path: Path,
         output_dir: Path,
         degree: int | str,
+        fit_mode: str,
     ) -> None:
         super().__init__()
         self.annotation_path = annotation_path
         self.output_dir = output_dir
         self.degree = degree
+        self.fit_mode = fit_mode
 
     def run(self) -> None:
         try:
@@ -220,7 +229,7 @@ class ExportWorker(QObject):
                 max_fit_points=None,
                 diagnostic_preview=False,
                 fast_mode=False,
-                fit_mode="manual_class_a_g2",
+                fit_mode=self.fit_mode,
                 wire_export=True,
             )
             self.finished.emit(result)
@@ -282,6 +291,12 @@ class EditorView(QGraphicsView):
     def wheelEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
         self.scale(factor, factor)
+        self.window.update_reference_preview_position()
+
+    def resizeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        super().resizeEvent(event)
+        self.window.update_reference_preview_position()
+        self.window.update_empty_scene_layout()
 
     def mousePressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         if event.button() == Qt.MouseButton.MiddleButton or (
@@ -313,6 +328,7 @@ class EditorView(QGraphicsView):
             self._last_pan = event.position()
             self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - int(delta.x()))
             self.verticalScrollBar().setValue(self.verticalScrollBar().value() - int(delta.y()))
+            self.window.update_reference_preview_position()
             event.accept()
             return
         super().mouseMoveEvent(event)
@@ -326,17 +342,33 @@ class EditorView(QGraphicsView):
         super().mouseReleaseEvent(event)
 
 
+class NoWheelComboBox(QComboBox):
+    def wheelEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if self.hasFocus():
+            super().wheelEvent(event)
+            return
+        event.ignore()
+
+
+class NoWheelSpinBox(QSpinBox):
+    def wheelEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if self.hasFocus():
+            super().wheelEvent(event)
+            return
+        event.ignore()
+
+
 class DesktopEditor(QMainWindow):
     def __init__(self, output_dir: Path) -> None:
         super().__init__()
         self.setWindowTitle("AutoAlias Desktop Editor")
-        self.resize(1480, 900)
         self.output_dir = output_dir.resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self.session: ReviewSession | None = None
         self.current_image: QImage | None = None
         self.image_item: QGraphicsPixmapItem | None = None
+        self.reference_preview_pixmap: QPixmap | None = None
         self.full_skeleton_item: QGraphicsPixmapItem | None = None
         self.edge_skeleton_item: QGraphicsPixmapItem | None = None
         self.design_stroke_item: QGraphicsPixmapItem | None = None
@@ -362,32 +394,65 @@ class DesktopEditor(QMainWindow):
 
         self.scene = QGraphicsScene(self)
         self.view = EditorView(self, self.scene)
+        self.view.setMinimumSize(520, 420)
+        self.view.setBackgroundBrush(QBrush(QColor("#f7f9fb")))
+        self.reference_preview = QLabel(self.view.viewport())
+        self.reference_preview.setObjectName("referencePreview")
+        self.reference_preview.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.reference_preview.setScaledContents(False)
+        self.reference_preview.hide()
+        self.reference_preview_opacity_effect = QGraphicsOpacityEffect(self.reference_preview)
+        self.reference_preview.setGraphicsEffect(self.reference_preview_opacity_effect)
+        self.empty_hint_items: list[QGraphicsItem] = []
         self.curve_list = QListWidget()
         self.curve_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.curve_list.currentItemChanged.connect(self._load_curve_from_item)
         self.branch_list = QListWidget()
         self.branch_list.currentRowChanged.connect(self._branch_selection_changed)
 
-        self.degree = QComboBox()
+        self.degree = NoWheelComboBox()
         self.degree.addItems(["auto", "3", "5", "7"])
+        self.precision_fit = QCheckBox("精度优先")
+        self.precision_fit.setToolTip(
+            "导出时忽略 CV 美学和 G2 关系，尽量贴合手动路由的目标线；适合 Logo、粗笔画、复杂装饰细节。"
+        )
 
-        self.extraction_mode = QComboBox()
+        self.raw_feature_preprocess = QCheckBox("原图预处理")
+        self.raw_feature_preprocess.setToolTip(
+            "勾选后先把未处理照片/渲染图转换成黑线白底特征线，再提取骨架；已是线稿/ControlNet 结果时不要勾选。"
+        )
+        self.thick_stroke_preprocess = QCheckBox("粗笔画轮廓")
+        self.thick_stroke_preprocess.setToolTip(
+            "用于 Logo、粗马克笔、粗黑实体图形：提取外轮廓和内孔轮廓，不提取粗笔画中心线。"
+        )
+        self.raw_feature_preprocess.toggled.connect(
+            lambda checked: self.thick_stroke_preprocess.setChecked(False) if checked else None
+        )
+        self.thick_stroke_preprocess.toggled.connect(
+            lambda checked: self.raw_feature_preprocess.setChecked(False) if checked else None
+        )
+
+        self.extraction_mode = NoWheelComboBox()
         self.extraction_mode.addItem("自动识别", "auto")
         self.extraction_mode.addItem("铅笔弱线增强", "pencil_weak_line_art")
         self.extraction_mode.addItem("黑底白线草图", "white_on_black_sketch")
         self.extraction_mode.addItem("白底黑线线稿", "black_on_white_line_art")
         self.extraction_mode.addItem("照片/渲染边缘", "canny_edges")
 
-        self.weak_line_threshold = QSpinBox()
+        self.weak_line_threshold = NoWheelSpinBox()
         self.weak_line_threshold.setRange(5, 95)
         self.weak_line_threshold.setValue(32)
         self.weak_line_threshold.setSuffix(" 阈值")
         self.weak_line_threshold.setToolTip("铅笔弱线增强阈值：数值越低越容易保留淡线，数值越高越抑制噪点。")
 
-        self.parallel_collapse = QComboBox()
-        self.parallel_collapse.addItems(["off", "soft", "medium", "strong"])
+        self.parallel_collapse = NoWheelComboBox()
+        self.parallel_collapse.addItem("关闭", "off")
+        self.parallel_collapse.addItem("轻度并线", "soft")
+        self.parallel_collapse.addItem("中度并线", "medium")
+        self.parallel_collapse.addItem("强并线", "strong")
+        self.parallel_collapse.setToolTip("用于把光影造成的平行多条线合成一条设计笔画。强度越高，越容易合并近距离平行线。")
 
-        self.auto_segment_mode = QComboBox()
+        self.auto_segment_mode = NoWheelComboBox()
         self.auto_segment_mode.addItem("主线模式", "main")
         self.auto_segment_mode.addItem("连续覆盖模式", "coverage")
         self.auto_segment_mode.addItem("局部细节模式", "detail")
@@ -396,10 +461,11 @@ class DesktopEditor(QMainWindow):
             "主线模式更保守；连续覆盖会跨小断口追长线；局部细节会提取更多短线；全量骨架会尽量把所有可追踪骨架都变成候选曲线。"
         )
 
-        self.snap_radius = QSpinBox()
+        self.snap_radius = NoWheelSpinBox()
         self.snap_radius.setRange(1, 9999)
         self.snap_radius.setValue(36)
         self.snap_radius.setSuffix(" px")
+        self.snap_radius.setToolTip("鼠标点、拖动分段点时吸附到骨架或已保存端点的搜索半径。")
 
         self.show_image = QCheckBox("原图")
         self.show_image.setChecked(True)
@@ -416,32 +482,133 @@ class DesktopEditor(QMainWindow):
         self.show_saved = QCheckBox("已保存蓝线")
         self.show_saved.setChecked(True)
         self.show_saved.toggled.connect(self._update_visibility)
+        self.show_reference_preview = QCheckBox("右上角原图参考")
+        self.show_reference_preview.setChecked(True)
+        self.show_reference_preview.toggled.connect(self._update_visibility)
+        self.reference_preview_opacity = NoWheelSpinBox()
+        self.reference_preview_opacity.setRange(20, 100)
+        self.reference_preview_opacity.setValue(78)
+        self.reference_preview_opacity.setSuffix(" %")
+        self.reference_preview_opacity.valueChanged.connect(self._update_reference_preview)
 
         self.skeleton_edit_mode = QCheckBox("骨架修补")
-        self.skeleton_edit_tool = QComboBox()
+        self.skeleton_edit_tool = NoWheelComboBox()
         self.skeleton_edit_tool.addItems(["add", "delete"])
-        self.skeleton_edit_radius = QSpinBox()
+        self.skeleton_edit_radius = NoWheelSpinBox()
         self.skeleton_edit_radius.setRange(4, 240)
         self.skeleton_edit_radius.setValue(24)
         self.skeleton_edit_radius.setSuffix(" px")
 
         self.last_export_label = QLabel("最近导出：无")
+        self.last_export_label.setWordWrap(True)
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
         self._build_ui()
         self._install_shortcuts()
+        self._set_initial_window_geometry()
         self._set_status("打开一张图片开始。左键添加分段点，拖动点后松手自动吸附骨架。")
 
     def _current_extraction_mode(self) -> str:
         return str(self.extraction_mode.currentData() or self.extraction_mode.currentText())
+
+    def _current_input_preprocess(self) -> str:
+        if self.thick_stroke_preprocess.isChecked():
+            return "thick_stroke_contours"
+        return "raw_feature_lines" if self.raw_feature_preprocess.isChecked() else "none"
+
+    def _current_parallel_collapse(self) -> str:
+        return str(self.parallel_collapse.currentData() or self.parallel_collapse.currentText())
+
+    def _set_combo_data(self, combo: QComboBox, value: str) -> None:
+        for index in range(combo.count()):
+            if str(combo.itemData(index)) == value:
+                combo.setCurrentIndex(index)
+                return
+        combo.setCurrentIndex(0)
+
+    def _make_group(self, title: str) -> tuple[QFrame, QVBoxLayout]:
+        card = QFrame()
+        card.setObjectName("sectionCard")
+        card.setFrameShape(QFrame.Shape.NoFrame)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(14, 12, 14, 14)
+        layout.setSpacing(9)
+        header = QLabel(title)
+        header.setProperty("sectionTitle", True)
+        header.setWordWrap(True)
+        layout.addWidget(header)
+        return card, layout
+
+    def _add_field(self, layout: QVBoxLayout, label: str, widget: QWidget) -> None:
+        text = QLabel(label)
+        text.setProperty("fieldLabel", True)
+        text.setWordWrap(True)
+        layout.addWidget(text)
+        layout.addWidget(widget)
+
+    def _make_primary_button(self, text: str) -> QPushButton:
+        button = QPushButton(text)
+        button.setProperty("primary", True)
+        button.setMinimumHeight(38)
+        return button
+
+    def _set_initial_window_geometry(self) -> None:
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            self.resize(1280, 820)
+            return
+        available = screen.availableGeometry()
+        width = min(1320, max(1120, int(available.width() * 0.82)))
+        height = min(860, max(720, int(available.height() * 0.82)))
+        width = min(width, max(900, available.width() - 80))
+        height = min(height, max(640, available.height() - 80))
+        x = available.x() + max(0, (available.width() - width) // 2)
+        y = available.y() + max(0, (available.height() - height) // 2)
+        self.setGeometry(x, y, width, height)
+
+    def reset_default_settings(self) -> None:
+        self.degree.setCurrentText("auto")
+        self.precision_fit.setChecked(False)
+        self.raw_feature_preprocess.setChecked(False)
+        self.thick_stroke_preprocess.setChecked(False)
+        self._set_combo_data(self.extraction_mode, "auto")
+        self.weak_line_threshold.setValue(32)
+        self._set_combo_data(self.parallel_collapse, "off")
+        self._set_combo_data(self.auto_segment_mode, "main")
+        self.snap_radius.setValue(36)
+        self.show_image.setChecked(True)
+        self.show_full_skeleton.setChecked(True)
+        self.show_edge_skeleton.setChecked(True)
+        self.show_design_strokes.setChecked(True)
+        self.show_saved.setChecked(True)
+        self.show_reference_preview.setChecked(True)
+        self.reference_preview_opacity.setValue(78)
+        self.skeleton_edit_mode.setChecked(False)
+        self.skeleton_edit_tool.setCurrentIndex(0)
+        self.skeleton_edit_radius.setValue(24)
+        self._update_visibility()
+        self._set_status("已恢复默认设置。已保存曲线和当前工程不会被清空。")
+
+    def open_user_guide(self) -> None:
+        guide = Path(__file__).resolve().parents[3] / "docs" / "AutoAlias_Desktop_Editor_User_Guide.pdf"
+        if not guide.exists():
+            QMessageBox.information(
+                self,
+                "AutoAlias",
+                f"没有找到使用教程 PDF：\n{guide}\n\n"
+                "请先运行：\n"
+                r"F:\ComfyUI\.venv\Scripts\python.exe F:\430AutoAlias\scripts\generate_gui_user_guide_pdf.py",
+            )
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(guide)))
 
     def _build_ui(self) -> None:
         toolbar = QToolBar("AutoAlias")
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
 
-        open_action = QAction("打开图片", self)
+        open_action = QAction("上传图片", self)
         open_action.triggered.connect(self.open_image_dialog)
         toolbar.addAction(open_action)
         open_project_action = QAction("打开工程", self)
@@ -453,35 +620,237 @@ class DesktopEditor(QMainWindow):
         save_project_as_action = QAction("工程另存为", self)
         save_project_as_action.triggered.connect(self.save_project_as)
         toolbar.addAction(save_project_as_action)
-        toolbar.addSeparator()
-        toolbar.addWidget(QLabel("提取 "))
-        toolbar.addWidget(self.extraction_mode)
-        toolbar.addWidget(QLabel(" 弱线 "))
-        toolbar.addWidget(self.weak_line_threshold)
-        toolbar.addWidget(QLabel(" 并线 "))
-        toolbar.addWidget(self.parallel_collapse)
-        toolbar.addSeparator()
-        toolbar.addWidget(QLabel("吸附 "))
-        toolbar.addWidget(self.snap_radius)
+        toolbar.setVisible(False)
+
+        asset_dir = Path(__file__).with_name("assets")
+        chevron_down = (asset_dir / "chevron_down.svg").as_posix()
+        chevron_up = (asset_dir / "chevron_up.svg").as_posix()
+        style = (
+            """
+            QMainWindow {
+                background: #f3f6f8;
+                color: #17202a;
+                font-family: "Times New Roman", "SimSun", "宋体";
+                font-size: 13px;
+            }
+            QToolBar { background: #f7f9fb; border: 0; border-bottom: 1px solid #cfd7df; spacing: 8px; }
+            QWidget#sidePanel { background: #e7edf2; }
+            QFrame#sectionCard {
+                background: #fbfcfd;
+                border: 1px solid #cfd8e2;
+                border-radius: 7px;
+            }
+            QLabel[sectionTitle="true"] {
+                color: #17202a;
+                font-size: 15px;
+                font-weight: 700;
+                padding-bottom: 2px;
+                border: 0;
+            }
+            QLabel[fieldLabel="true"] { color: #5e6b78; font-size: 13px; font-weight: 500; }
+            QLabel { color: #17202a; font-size: 13px; }
+            QCheckBox { spacing: 7px; color: #24313d; font-size: 13px; }
+            QCheckBox::indicator { width: 15px; height: 15px; }
+            QCheckBox::indicator:unchecked {
+                border: 1px solid #8c99a6;
+                background: #ffffff;
+                border-radius: 2px;
+            }
+            QCheckBox::indicator:checked {
+                border: 1px solid #1668dc;
+                background: #1668dc;
+                border-radius: 2px;
+            }
+            QPushButton {
+                min-height: 33px;
+                padding: 4px 10px;
+                border: 1px solid #b9c4cf;
+                border-radius: 5px;
+                background: #f5f7fa;
+                color: #17202a;
+                font-size: 13px;
+            }
+            QPushButton:hover { background: #edf4ff; border-color: #8bb7f0; }
+            QPushButton:pressed { background: #dcecff; }
+            QPushButton[primary="true"] {
+                background: #1668dc;
+                color: #ffffff;
+                border: 1px solid #1668dc;
+                border-radius: 5px;
+                font-weight: 600;
+            }
+            QPushButton[primary="true"]:hover { background: #0f5fc8; border-color: #0f5fc8; }
+            QPushButton[primary="true"]:disabled { background: #9ebff0; border-color: #9ebff0; }
+            QListWidget {
+                background: #ffffff;
+                color: #17202a;
+                border: 1px solid #cfd8e2;
+                border-radius: 5px;
+                font-size: 13px;
+            }
+            QListWidget::item:selected { background: #1668dc; color: #ffffff; }
+            QLabel#referencePreview {
+                background: rgba(255, 255, 255, 232);
+                border: 1px solid #93a4b5;
+                border-radius: 6px;
+                padding: 5px;
+            }
+            QComboBox, QSpinBox {
+                min-height: 33px;
+                border: 1px solid #b9c4cf;
+                border-radius: 5px;
+                background: #ffffff;
+                color: #17202a;
+                padding-left: 8px;
+                padding-right: 4px;
+                font-size: 13px;
+            }
+            QComboBox:hover, QSpinBox:hover { border-color: #7aa8dc; }
+            QComboBox::drop-down {
+                width: 28px;
+                border: 0;
+                border-left: 1px solid #d2dbe5;
+                border-top-right-radius: 5px;
+                border-bottom-right-radius: 5px;
+                background: #dce5ee;
+            }
+            QComboBox::down-arrow {
+                image: url(__CHEVRON_DOWN__);
+                width: 12px;
+                height: 12px;
+                margin-right: 8px;
+            }
+            QSpinBox::up-button, QSpinBox::down-button {
+                width: 22px;
+                border-left: 1px solid #d2dbe5;
+                background: #dce5ee;
+            }
+            QSpinBox::up-arrow {
+                image: url(__CHEVRON_UP__);
+                width: 10px;
+                height: 10px;
+            }
+            QSpinBox::down-arrow {
+                image: url(__CHEVRON_DOWN__);
+                width: 10px;
+                height: 10px;
+            }
+            QScrollArea { background: #e7edf2; border: 0; }
+            QScrollBar:vertical {
+                background: #dde5ec;
+                width: 12px;
+                margin: 0;
+            }
+            QScrollBar::handle:vertical {
+                background: #9aa8b5;
+                min-height: 36px;
+                border-radius: 5px;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+            QSplitter::handle { background: #c2ccd6; }
+            QStatusBar {
+                background: #eef3f7;
+                color: #17202a;
+                border-top: 1px solid #cfd7df;
+            }
+            """
+        )
+        self.setStyleSheet(
+            style.replace("__CHEVRON_DOWN__", chevron_down).replace("__CHEVRON_UP__", chevron_up)
+        )
 
         side = QWidget()
+        side.setObjectName("sidePanel")
+        side.setMinimumWidth(390)
+        side.setMaximumWidth(470)
         side_layout = QVBoxLayout(side)
-        side_layout.addWidget(QLabel("导出 Degree"))
-        side_layout.addWidget(self.degree)
-        side_layout.addWidget(self.show_image)
-        side_layout.addWidget(self.show_full_skeleton)
-        side_layout.addWidget(self.show_edge_skeleton)
-        side_layout.addWidget(self.show_design_strokes)
-        side_layout.addWidget(self.show_saved)
+        side_layout.setContentsMargins(12, 12, 12, 14)
+        side_layout.setSpacing(12)
 
+        welcome_group, welcome_layout = self._make_group("开始")
+        title = QLabel("请先上传图片")
+        title.setStyleSheet(
+            'font-family: "Times New Roman", "SimSun", "宋体"; '
+            "font-size: 22px; font-weight: 700; color: #17202a;"
+        )
+        title.setWordWrap(True)
+        welcome_layout.addWidget(title)
+        intro = QLabel("上传后会自动提取骨架。再根据骨架手动分段、检查路径候选，最后导出 IGES / WIRE。")
+        intro.setWordWrap(True)
+        intro.setStyleSheet(
+            'font-family: "Times New Roman", "SimSun", "宋体"; '
+            "font-size: 13px; color: #5e6b78; line-height: 140%;"
+        )
+        welcome_layout.addWidget(intro)
+        upload_btn = self._make_primary_button("上传图片并提取骨架")
+        upload_btn.clicked.connect(self.open_image_dialog)
+        welcome_layout.addWidget(upload_btn)
+        project_row = QHBoxLayout()
+        open_project_btn = QPushButton("打开工程")
+        open_project_btn.clicked.connect(self.open_project_dialog)
+        save_project_btn = QPushButton("保存工程")
+        save_project_btn.clicked.connect(self.save_project)
+        project_row.addWidget(open_project_btn)
+        project_row.addWidget(save_project_btn)
+        welcome_layout.addLayout(project_row)
+        reset_btn = QPushButton("恢复默认设置")
+        reset_btn.clicked.connect(self.reset_default_settings)
+        welcome_layout.addWidget(reset_btn)
+        guide_btn = QPushButton("打开使用教程")
+        guide_btn.clicked.connect(self.open_user_guide)
+        welcome_layout.addWidget(guide_btn)
+        side_layout.addWidget(welcome_group)
+
+        extract_group, extract_layout = self._make_group("1 图片与骨架提取")
+        self.image_state_label = QLabel("当前图片：未上传")
+        self.image_state_label.setWordWrap(True)
+        self.image_state_label.setStyleSheet("color: #5e6b78;")
+        extract_layout.addWidget(self.image_state_label)
+        preprocess_row = QHBoxLayout()
+        preprocess_row.addWidget(self.raw_feature_preprocess)
+        preprocess_row.addWidget(self.thick_stroke_preprocess)
+        extract_layout.addLayout(preprocess_row)
+        self._add_field(extract_layout, "提取模式", self.extraction_mode)
+        self._add_field(extract_layout, "铅笔弱线阈值", self.weak_line_threshold)
+        self._add_field(extract_layout, "并线强度", self.parallel_collapse)
+        reload_btn = QPushButton("按当前选项重新提取")
+        reload_btn.clicked.connect(self.reload_current_image)
+        extract_layout.addWidget(reload_btn)
+        side_layout.addWidget(extract_group)
+
+        view_group, view_layout = self._make_group("2 视图与吸附")
+        self._add_field(view_layout, "分段点吸附半径", self.snap_radius)
+        view_row1 = QHBoxLayout()
+        view_row1.addWidget(self.show_image)
+        view_row1.addWidget(self.show_saved)
+        view_layout.addLayout(view_row1)
+        view_row2 = QHBoxLayout()
+        view_row2.addWidget(self.show_full_skeleton)
+        view_row2.addWidget(self.show_design_strokes)
+        view_layout.addLayout(view_row2)
+        view_row3 = QHBoxLayout()
+        view_row3.addWidget(self.show_edge_skeleton)
+        view_row3.addStretch(1)
+        view_layout.addLayout(view_row3)
+        view_row4 = QHBoxLayout()
+        view_row4.addWidget(self.show_reference_preview)
+        view_row4.addStretch(1)
+        view_layout.addLayout(view_row4)
+        self._add_field(view_layout, "右上角参考图透明度", self.reference_preview_opacity)
+        side_layout.addWidget(view_group)
+
+        manual_group, manual_layout = self._make_group("3 手动分段")
         skeleton_row = QHBoxLayout()
+        skeleton_row.setSpacing(8)
+        self.skeleton_edit_tool.setMinimumWidth(96)
+        self.skeleton_edit_radius.setMinimumWidth(86)
         skeleton_row.addWidget(self.skeleton_edit_mode)
         skeleton_row.addWidget(self.skeleton_edit_tool)
         skeleton_row.addWidget(self.skeleton_edit_radius)
-        side_layout.addLayout(skeleton_row)
+        manual_layout.addLayout(skeleton_row)
         skeleton_break_btn = QPushButton("断开连续加点")
         skeleton_break_btn.clicked.connect(self.break_skeleton_add_chain)
-        side_layout.addWidget(skeleton_break_btn)
+        manual_layout.addWidget(skeleton_break_btn)
 
         row1 = QHBoxLayout()
         save_btn = QPushButton("保存当前")
@@ -490,7 +859,7 @@ class DesktopEditor(QMainWindow):
         save_next_btn.clicked.connect(lambda: self.save_current(start_next=True))
         row1.addWidget(save_btn)
         row1.addWidget(save_next_btn)
-        side_layout.addLayout(row1)
+        manual_layout.addLayout(row1)
 
         row2 = QHBoxLayout()
         undo_btn = QPushButton("撤回点")
@@ -499,7 +868,7 @@ class DesktopEditor(QMainWindow):
         delete_btn.clicked.connect(self.delete_selected_point)
         row2.addWidget(undo_btn)
         row2.addWidget(delete_btn)
-        side_layout.addLayout(row2)
+        manual_layout.addLayout(row2)
 
         row3 = QHBoxLayout()
         close_btn = QPushButton("闭合开关")
@@ -508,16 +877,17 @@ class DesktopEditor(QMainWindow):
         clear_btn.clicked.connect(self.clear_current)
         row3.addWidget(close_btn)
         row3.addWidget(clear_btn)
-        side_layout.addLayout(row3)
+        manual_layout.addLayout(row3)
+        side_layout.addWidget(manual_group)
 
-        side_layout.addWidget(QLabel("几何自动分段模式"))
-        side_layout.addWidget(self.auto_segment_mode)
+        auto_group, auto_layout = self._make_group("4 自动分段与路径候选")
+        self._add_field(auto_layout, "几何自动分段模式", self.auto_segment_mode)
         auto_btn = QPushButton("几何自动分段")
         auto_btn.clicked.connect(self.run_geometry_auto_segment)
-        side_layout.addWidget(auto_btn)
+        auto_layout.addWidget(auto_btn)
 
-        side_layout.addWidget(QLabel("分支/多路径候选"))
-        side_layout.addWidget(self.branch_list)
+        self._add_field(auto_layout, "分支 / 多路径候选", self.branch_list)
+        self.branch_list.setMinimumHeight(88)
         branch_row = QHBoxLayout()
         prev_branch_btn = QPushButton("上一候选")
         prev_branch_btn.clicked.connect(lambda: self.shift_branch_choice(-1))
@@ -525,17 +895,22 @@ class DesktopEditor(QMainWindow):
         next_branch_btn.clicked.connect(lambda: self.shift_branch_choice(1))
         branch_row.addWidget(prev_branch_btn)
         branch_row.addWidget(next_branch_btn)
-        side_layout.addLayout(branch_row)
+        auto_layout.addLayout(branch_row)
+        side_layout.addWidget(auto_group)
 
-        self.export_btn = QPushButton("导出 IGES")
+        export_group, export_layout = self._make_group("5 导出 Alias")
+        self._add_field(export_layout, "导出 Degree", self.degree)
+        export_layout.addWidget(self.precision_fit)
+        self.export_btn = self._make_primary_button("导出 IGES / WIRE")
         self.export_btn.clicked.connect(self.export_iges)
-        side_layout.addWidget(self.export_btn)
+        export_layout.addWidget(self.export_btn)
         open_export_btn = QPushButton("打开最近导出文件夹")
         open_export_btn.clicked.connect(self.open_last_export_dir)
-        side_layout.addWidget(open_export_btn)
-        side_layout.addWidget(self.last_export_label)
+        export_layout.addWidget(open_export_btn)
+        export_layout.addWidget(self.last_export_label)
+        side_layout.addWidget(export_group)
 
-        side_layout.addWidget(QLabel("曲线列表"))
+        list_group, list_layout = self._make_group("曲线列表")
         curve_action_row = QHBoxLayout()
         select_all_btn = QPushButton("全选曲线")
         select_all_btn.clicked.connect(self.select_all_curves)
@@ -543,15 +918,28 @@ class DesktopEditor(QMainWindow):
         delete_curve_btn.clicked.connect(self.delete_selected_curve)
         curve_action_row.addWidget(select_all_btn)
         curve_action_row.addWidget(delete_curve_btn)
-        side_layout.addLayout(curve_action_row)
-        side_layout.addWidget(self.curve_list, stretch=1)
+        list_layout.addLayout(curve_action_row)
+        self.curve_list.setMinimumHeight(150)
+        list_layout.addWidget(self.curve_list)
+        side_layout.addWidget(list_group)
+        side_layout.addStretch(1)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(side)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setMinimumWidth(416)
+        scroll.setMaximumWidth(500)
 
         splitter = QSplitter()
+        splitter.addWidget(scroll)
         splitter.addWidget(self.view)
-        splitter.addWidget(side)
-        splitter.setStretchFactor(0, 5)
+        splitter.setChildrenCollapsible(False)
+        splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
+        splitter.setSizes([450, 1050])
         self.setCentralWidget(splitter)
+        self._show_empty_scene()
 
     def _install_shortcuts(self) -> None:
         undo = QAction(self)
@@ -562,6 +950,56 @@ class DesktopEditor(QMainWindow):
         delete.setShortcut(QKeySequence.StandardKey.Delete)
         delete.triggered.connect(self.delete_selected_point)
         self.addAction(delete)
+
+    def _show_empty_scene(self) -> None:
+        self.scene.clear()
+        self.empty_hint_items.clear()
+        self.scene.setSceneRect(0, 0, 1100, 700)
+        card = self.scene.addRect(0, 0, 520, 220, QPen(QColor("#d7e0e7"), 1.2), QBrush(QColor("#ffffff")))
+        card.setZValue(1)
+        title = self.scene.addSimpleText("请上传图片")
+        title.setBrush(QBrush(QColor("#17202a")))
+        title.setScale(1.8)
+        title.setZValue(2)
+        body = self.scene.addSimpleText("左侧选择预处理、提取模式和阈值，然后上传图片生成骨架。")
+        body.setBrush(QBrush(QColor("#5c6873")))
+        body.setScale(1.05)
+        body.setZValue(2)
+        self.empty_hint_items.extend([card, title, body])
+        self.update_empty_scene_layout()
+        self.view.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+
+    def update_empty_scene_layout(self) -> None:
+        empty_hint_items = getattr(self, "empty_hint_items", [])
+        if len(empty_hint_items) < 3 or self.session is not None:
+            return
+        viewport = self.view.viewport().size()
+        if viewport.width() > 100 and viewport.height() > 100:
+            scene_width = max(900.0, float(viewport.width()))
+            scene_height = max(560.0, float(viewport.height()))
+            self.scene.setSceneRect(0, 0, scene_width, scene_height)
+        scene_rect = self.scene.sceneRect()
+        card = empty_hint_items[0]
+        title = empty_hint_items[1]
+        body = empty_hint_items[2]
+        card_width = min(560.0, max(460.0, scene_rect.width() * 0.46))
+        card_height = 220.0
+        card_x = scene_rect.center().x() - card_width / 2.0
+        card_y = scene_rect.center().y() - card_height / 2.0
+        if hasattr(card, "setRect"):
+            card.setRect(card_x, card_y, card_width, card_height)
+        title_rect = title.boundingRect()
+        body_rect = body.boundingRect()
+        title_scale = float(title.scale())
+        body_scale = float(body.scale())
+        title.setPos(
+            scene_rect.center().x() - title_rect.width() * title_scale / 2.0,
+            card_y + 52.0,
+        )
+        body.setPos(
+            scene_rect.center().x() - body_rect.width() * body_scale / 2.0,
+            card_y + 132.0,
+        )
 
     def open_image_dialog(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -594,7 +1032,8 @@ class DesktopEditor(QMainWindow):
                 project_path.parent,
                 ReviewGraphOptions(
                     extraction_mode=self._current_extraction_mode(),
-                    parallel_collapse=self.parallel_collapse.currentText(),
+                    input_preprocess="none",
+                    parallel_collapse=self._current_parallel_collapse(),
                     weak_line_threshold=float(self.weak_line_threshold.value()),
                     max_points_per_edge=480,
                 ),
@@ -605,9 +1044,9 @@ class DesktopEditor(QMainWindow):
             skeleton_edits = data.get("skeleton_edits", [])
             skeleton_edits = list(skeleton_edits) if isinstance(skeleton_edits, list) else []
             _replay_skeleton_edits(session, skeleton_edits)
-            image = QImage(str(image_path))
+            image = QImage(str(session.image_path))
             if image.isNull():
-                raise FileNotFoundError(f"cannot load image: {image_path}")
+                raise FileNotFoundError(f"cannot load image: {session.image_path}")
             self._session_loaded(
                 LoadedSession(session=session, image=image, skeleton_edits=skeleton_edits)
             )
@@ -644,12 +1083,15 @@ class DesktopEditor(QMainWindow):
         if self._worker_thread is not None:
             QMessageBox.information(self, "AutoAlias", "正在提取上一张图片，请稍等。")
             return
+        if hasattr(self, "image_state_label"):
+            self.image_state_label.setText(f"正在提取：{image_path.name}")
         self._set_status("正在提取骨架，GUI 不会阻塞。")
         worker = SessionWorker(
             image_path=image_path,
             output_dir=self.output_dir,
             extraction_mode=self._current_extraction_mode(),
-            parallel_collapse=self.parallel_collapse.currentText(),
+            input_preprocess=self._current_input_preprocess(),
+            parallel_collapse=self._current_parallel_collapse(),
             weak_line_threshold=float(self.weak_line_threshold.value()),
         )
         thread = QThread(self)
@@ -667,13 +1109,47 @@ class DesktopEditor(QMainWindow):
         self._worker_thread = thread
         thread.start()
 
+    def reload_current_image(self) -> None:
+        if self.session is None:
+            QMessageBox.information(self, "AutoAlias", "请先上传图片。")
+            return
+        self.load_image(self.session.image_path)
+
     def _clear_worker(self) -> None:
         self._worker = None
         self._worker_thread = None
 
+    def _friendly_session_error(self, message: str) -> str:
+        if (
+            "raw feature-line preprocessing found no usable line pixels" in message
+            or "原图预处理没有找到可用线条像素" in message
+        ):
+            return (
+                "原图预处理没有找到可用线条像素。\n\n"
+                "原因：\n"
+                "当前勾选了“原图预处理”。这个功能主要用于未处理过的照片或渲染图，"
+                "它会先估计背景和主体区域，再用 Canny 提取主体里的结构边缘。"
+                "如果输入本身已经是线稿、ControlNet 线稿、黑底白线图，"
+                "或者线条太淡、对比度太低，就可能在主体遮罩和噪声过滤阶段被过滤掉，"
+                "最终没有留下可追踪的线条像素。\n\n"
+                "建议：\n"
+                "1. 取消勾选“原图预处理”；\n"
+                "2. 如果是黑底白线图，提取模式改成“黑底白线草图”；\n"
+                "3. 如果是淡铅笔线，选择“铅笔弱线增强”，并把阈值调低到 20-28；\n"
+                "4. 然后再点击“按当前选项重新提取”。\n\n"
+                "当前已加载的骨架不会被清空。"
+            )
+        return message
+
     def _session_failed(self, message: str) -> None:
-        QMessageBox.critical(self, "AutoAlias", message)
-        self._set_status("图片加载失败。")
+        friendly = self._friendly_session_error(message)
+        QMessageBox.critical(self, "AutoAlias", friendly)
+        if hasattr(self, "image_state_label"):
+            if self.session is None:
+                self.image_state_label.setText("当前图片：加载失败")
+            else:
+                self.image_state_label.setText("重新提取失败：已保留当前骨架")
+        self._set_status("图片重新提取失败，已保留当前骨架。")
 
     def _session_loaded(self, loaded: LoadedSession) -> None:
         self.session = loaded.session
@@ -688,11 +1164,13 @@ class DesktopEditor(QMainWindow):
         self.selected_cut_index = None
 
         self.scene.clear()
+        self.empty_hint_items.clear()
         self.point_items.clear()
         self.alt_route_items.clear()
         self.saved_route_items.clear()
         self.connection_items.clear()
         self.current_route_item = None
+        self.reference_preview_pixmap = self._make_reference_preview_pixmap(loaded.image)
         self.image_item = self.scene.addPixmap(QPixmap.fromImage(loaded.image))
         self.image_item.setZValue(0)
         self.full_skeleton_item = self.scene.addPixmap(
@@ -712,6 +1190,19 @@ class DesktopEditor(QMainWindow):
         self._rebuild_saved_routes()
         self._refresh_curve_list()
         self._update_visibility()
+        self.update_reference_preview_position()
+        if hasattr(self, "image_state_label"):
+            mode = self.extraction_mode.currentText()
+            preprocess = "无"
+            if self.raw_feature_preprocess.isChecked():
+                preprocess = "原图预处理"
+            elif self.thick_stroke_preprocess.isChecked():
+                preprocess = "粗笔画轮廓"
+            self.image_state_label.setText(
+                f"当前图片：{loaded.session.image_path.name}\n"
+                f"提取模式：{mode} / 预处理：{preprocess}\n"
+                f"骨架点：{len(loaded.session.router.coords)}"
+            )
         self._set_status(
             f"已加载：{loaded.session.image_path.name}，骨架点 {len(loaded.session.router.coords)}。"
         )
@@ -724,6 +1215,44 @@ class DesktopEditor(QMainWindow):
         )
         image.fill(Qt.GlobalColor.transparent)
         return image
+
+    def _make_reference_preview_pixmap(self, image_source: QImage) -> QPixmap:
+        max_width = 260
+        max_height = 190
+        pixmap = QPixmap.fromImage(image_source)
+        if pixmap.isNull():
+            return pixmap
+        return pixmap.scaled(
+            max_width,
+            max_height,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+
+    def _update_reference_preview(self) -> None:
+        if self.reference_preview_pixmap is None or self.reference_preview_pixmap.isNull():
+            self.reference_preview.hide()
+            return
+        if not self.show_reference_preview.isChecked():
+            self.reference_preview.hide()
+            return
+        self.reference_preview.setPixmap(self.reference_preview_pixmap)
+        self.reference_preview.adjustSize()
+        self.reference_preview_opacity_effect.setOpacity(
+            max(0.2, min(1.0, float(self.reference_preview_opacity.value()) / 100.0))
+        )
+        self.reference_preview.show()
+        self.reference_preview.raise_()
+        self.update_reference_preview_position()
+
+    def update_reference_preview_position(self) -> None:
+        if not self.reference_preview.isVisible():
+            return
+        margin = 16
+        viewport_size = self.view.viewport().size()
+        x = max(margin, viewport_size.width() - self.reference_preview.width() - margin)
+        y = margin
+        self.reference_preview.move(x, y)
 
     def _make_full_skeleton_pixmap(self, image_source: QImage, session: ReviewSession) -> QPixmap:
         image = self._transparent_image_like(image_source)
@@ -1474,7 +2003,8 @@ class DesktopEditor(QMainWindow):
         out = self.output_dir / "alias_exports" / (
             self.session.image_path.stem + "_desktop_" + time.strftime("%Y%m%d_%H%M%S")
         )
-        worker = ExportWorker(self.session.corrections_path, out, degree)
+        fit_mode = "precision" if self.precision_fit.isChecked() else "manual_class_a_g2"
+        worker = ExportWorker(self.session.corrections_path, out, degree, fit_mode)
         thread = QThread(self)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -1538,6 +2068,7 @@ class DesktopEditor(QMainWindow):
             self.design_stroke_item.setVisible(self.show_design_strokes.isChecked())
         for item in self.saved_route_items:
             item.setVisible(self.show_saved.isChecked())
+        self._update_reference_preview()
 
     def _set_status(self, message: str) -> None:
         self.status.showMessage(message)
@@ -1553,6 +2084,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     app = QApplication(sys.argv[:1])
+    app_font = QFont("SimSun", 11)
+    try:
+        app_font.setFamilies(["Times New Roman", "SimSun", "宋体"])
+    except AttributeError:
+        pass
+    app.setFont(app_font)
     window = DesktopEditor(args.out)
     window.show()
     if args.image:

@@ -90,9 +90,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_fit_reviewed.add_argument("--max-fit-points", type=int, default=None)
     p_fit_reviewed.add_argument(
         "--fit-mode",
-        choices=("manual_class_a_g2", "standard"),
+        choices=("manual_class_a_g2", "standard", "precision"),
         default="manual_class_a_g2",
-        help="manual_class_a_g2 enables the new hand-split Alias Class-A continuity fitter",
+        help="manual_class_a_g2 keeps Class-A/G2; precision ignores CV aesthetics and fits routed points as closely as possible",
     )
     p_fit_reviewed.add_argument(
         "--wire",

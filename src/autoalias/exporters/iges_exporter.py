@@ -126,7 +126,6 @@ def _global_records() -> list[str]:
         _h("AutoAlias Curves"),
         _h("AutoAlias single-span NURBS export"),
         _h("1"),
-        _h("1"),
         "32",
         "38",
         "6",
