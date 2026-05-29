@@ -1,3 +1,9 @@
 /out_cmd/
 out*
 /lan_reviews
+/lan_reviews_next
+/webapp/node_modules
+/webapp/dist
+/webapp/*.tsbuildinfo
+/webapp/vite.config.js
+/webapp/vite.config.d.ts

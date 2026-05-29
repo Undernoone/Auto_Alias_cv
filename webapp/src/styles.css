@@ -1,0 +1,381 @@
+:root {
+  color-scheme: light;
+  font-family: Inter, "Segoe UI", "Microsoft YaHei", Arial, sans-serif;
+  --bg: #eef3f8;
+  --panel: rgba(255, 255, 255, 0.9);
+  --card: #ffffff;
+  --ink: #172033;
+  --muted: #637085;
+  --line: #dbe5ef;
+  --blue: #2563eb;
+  --cyan: #0ea5e9;
+  --orange: #f28c28;
+  --shadow: 0 24px 70px rgba(19, 34, 58, 0.13);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at 12% 8%, rgba(37, 99, 235, 0.1), transparent 30%),
+    linear-gradient(135deg, #f9fbff 0%, var(--bg) 100%);
+  color: var(--ink);
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+button,
+select,
+input[type="file"] {
+  width: 100%;
+  min-height: 38px;
+  border: 1px solid #c6d3e1;
+  border-radius: 12px;
+  background: #fff;
+  color: var(--ink);
+  outline: none;
+  transition: border-color 0.18s ease, box-shadow 0.18s ease, transform 0.18s ease;
+}
+
+button {
+  cursor: pointer;
+  font-weight: 700;
+}
+
+button:hover,
+select:hover,
+input[type="file"]:hover {
+  transform: translateY(-1px);
+  border-color: #9fb2cb;
+  box-shadow: 0 10px 26px rgba(20, 34, 56, 0.08);
+}
+
+button:disabled {
+  cursor: default;
+  opacity: 0.46;
+  transform: none;
+  box-shadow: none;
+}
+
+select {
+  padding: 0 34px 0 12px;
+}
+
+input[type="file"] {
+  padding: 7px;
+}
+
+input[type="file"]::file-selector-button {
+  margin-right: 10px;
+  border: 0;
+  border-radius: 10px;
+  background: #eaf2ff;
+  color: var(--blue);
+  padding: 7px 11px;
+  font-weight: 800;
+}
+
+.appShell {
+  display: grid;
+  grid-template-columns: clamp(360px, 28vw, 440px) minmax(0, 1fr);
+  gap: 16px;
+  height: 100dvh;
+  padding: 16px;
+  overflow: hidden;
+}
+
+.sidePanel,
+.workArea {
+  border: 1px solid rgba(198, 211, 225, 0.95);
+  border-radius: 24px;
+  background: var(--panel);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(18px);
+}
+
+.sidePanel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  overflow: auto;
+  padding: 16px;
+}
+
+.sidePanel::-webkit-scrollbar {
+  width: 10px;
+}
+
+.sidePanel::-webkit-scrollbar-thumb {
+  border: 3px solid rgba(255, 255, 255, 0.9);
+  border-radius: 999px;
+  background: #c7d3e0;
+}
+
+.brand,
+.toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.brand span {
+  color: #8a97aa;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.brand h1 {
+  margin: 2px 0 0;
+  font-size: 24px;
+  line-height: 1.2;
+}
+
+.brandGlyph {
+  width: 38px;
+  height: 38px;
+  flex: 0 0 auto;
+  border-radius: 14px;
+  background: linear-gradient(135deg, var(--blue), var(--cyan));
+  box-shadow: 0 12px 26px rgba(37, 99, 235, 0.26);
+}
+
+.card {
+  display: grid;
+  gap: 11px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: linear-gradient(180deg, #fff, #f9fbff);
+}
+
+.compactCard {
+  gap: 9px;
+}
+
+.hiddenFile {
+  display: none;
+}
+
+.card h2 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.miniMeta {
+  display: grid;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.growCard {
+  min-height: 180px;
+}
+
+.twoCols,
+.buttonGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.primary {
+  border-color: transparent;
+  background: linear-gradient(135deg, var(--blue), var(--cyan));
+  color: #fff;
+}
+
+.warning {
+  border-color: rgba(242, 140, 40, 0.35);
+  background: #fff5e9;
+  color: #9a5209;
+}
+
+.toggleRow {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.toggleRow label,
+.checkPill {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 38px;
+  padding: 0 11px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  color: var(--muted);
+  background: #fff;
+}
+
+.curveList {
+  display: grid;
+  gap: 8px;
+  overflow: auto;
+}
+
+.curveItem {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: #fff;
+}
+
+.curveItem.active {
+  border-color: rgba(37, 99, 235, 0.38);
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
+}
+
+.curveItem > button:not(.iconButton) {
+  min-height: auto;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  padding: 0;
+  text-align: left;
+  transform: none;
+}
+
+.curveItem span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.iconButton {
+  width: 34px;
+  min-height: 30px;
+  padding: 0;
+  border-color: rgba(220, 59, 59, 0.24);
+  color: #a42121;
+}
+
+.branchList {
+  display: grid;
+  gap: 8px;
+  min-height: 52px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: #fff;
+}
+
+.branchItem {
+  display: grid;
+  gap: 8px;
+}
+
+.branchItem > div {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.muted {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.jobBox {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: #fff;
+}
+
+.jobBox div:first-child {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.jobBox progress {
+  width: 100%;
+  height: 10px;
+  accent-color: var(--blue);
+}
+
+.links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.links a {
+  color: var(--blue);
+  font-weight: 800;
+  text-decoration: none;
+}
+
+.workArea {
+  position: relative;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
+}
+
+.toolbar {
+  min-height: 58px;
+  padding: 0 18px;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.canvasHost {
+  min-width: 0;
+  min-height: 0;
+  background: #ffffff;
+}
+
+@media (max-width: 1060px) {
+  .appShell {
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(52dvh, 1fr) minmax(320px, 44dvh);
+  }
+
+  .sidePanel {
+    order: 2;
+  }
+}
+
+@media (max-width: 620px) {
+  .appShell {
+    padding: 10px;
+    gap: 10px;
+  }
+
+  .sidePanel,
+  .workArea {
+    border-radius: 18px;
+  }
+
+  .twoCols,
+  .buttonGrid,
+  .toggleRow {
+    grid-template-columns: 1fr;
+  }
+}
