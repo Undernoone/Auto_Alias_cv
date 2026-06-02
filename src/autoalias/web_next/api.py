@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import json
+import mimetypes
 import os
 import threading
 import time
@@ -8,7 +11,7 @@ from typing import Any
 
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from autoalias.review.fit_reviewed import fit_reviewed_annotations
@@ -62,6 +65,7 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 (OUTPUT_DIR / "alias_exports").mkdir(parents=True, exist_ok=True)
 
 sessions: dict[str, ReviewSession] = {}
+session_meta: dict[str, dict[str, Any]] = {}
 exports: dict[str, dict[str, Path]] = {}
 jobs: dict[str, dict[str, Any]] = {}
 lock = threading.Lock()
@@ -93,15 +97,16 @@ async def upload_image(
     target = _unique_path(OUTPUT_DIR / "uploads" / _safe_filename(file.filename or "uploaded.png"))
     target.write_bytes(raw)
     try:
+        options = _graph_options(
+            extraction_mode=x_extraction_mode,
+            input_preprocess=x_input_preprocess,
+            parallel_collapse=x_parallel_collapse,
+            weak_line_threshold=x_weak_line_threshold,
+        )
         session = ReviewSession.create(
             target,
             OUTPUT_DIR,
-            ReviewGraphOptions(
-                extraction_mode=_clean_extraction_mode(x_extraction_mode),
-                input_preprocess=_clean_input_preprocess(x_input_preprocess),
-                parallel_collapse=_clean_parallel_collapse(x_parallel_collapse),
-                weak_line_threshold=float(x_weak_line_threshold or 32),
-            ),
+            options,
         )
     except Exception as exc:
         try:
@@ -112,6 +117,12 @@ async def upload_image(
 
     sid = _make_session_id(target)
     sessions[sid] = session
+    session_meta[sid] = {
+        "source_image": str(target),
+        "graph_options": _graph_options_payload(options),
+        "skeleton_edits": [],
+        "last_skeleton_edit_index": None,
+    }
     payload = _session_payload(sid, session)
     payload["ok"] = True
     return payload
@@ -126,6 +137,37 @@ def session_state(sid: str) -> dict[str, Any]:
 def session_image(sid: str) -> FileResponse:
     session = _require_session(sid)
     return FileResponse(session.image_path)
+
+
+@app.post("/api/sessions/{sid}/reextract")
+async def reextract_image(sid: str, payload: dict[str, Any]) -> dict[str, Any]:
+    old_session = _require_session(sid)
+    meta = session_meta.setdefault(sid, _default_session_meta(old_session))
+    source = Path(str(meta.get("source_image") or old_session.image_path)).resolve()
+    if not source.exists():
+        raise HTTPException(status_code=404, detail=f"原始图片不存在：{source}")
+    options = _graph_options(
+        extraction_mode=payload.get("extraction_mode", "auto"),
+        input_preprocess=payload.get("input_preprocess", "none"),
+        parallel_collapse=payload.get("parallel_collapse", "off"),
+        weak_line_threshold=payload.get("weak_line_threshold", 32),
+    )
+    try:
+        new_session = ReviewSession.create(source, OUTPUT_DIR, options)
+        new_session.corrections_path = old_session.corrections_path
+        new_session.corrections = list(old_session.corrections)
+        new_session.design_curves = list(old_session.design_curves)
+        _replay_skeleton_edits(new_session, list(meta.get("skeleton_edits") or []))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=_friendly_session_error(str(exc))) from exc
+    sessions[sid] = new_session
+    meta["graph_options"] = _graph_options_payload(options)
+    meta["last_skeleton_edit_index"] = None
+    _save_session(sid, new_session)
+    result = _session_payload(sid, new_session)
+    result["ok"] = True
+    result["message"] = "已按当前选项重新提取，原有曲线和骨架修补记录已保留"
+    return result
 
 
 @app.post("/api/sessions/{sid}/route")
@@ -177,7 +219,31 @@ async def snap_point(sid: str, payload: dict[str, Any]) -> dict[str, Any]:
 
 @app.post("/api/sessions/{sid}/skeleton-edit")
 async def skeleton_edit(sid: str, payload: dict[str, Any]) -> dict[str, Any]:
-    return _edit_session_skeleton(_require_session(sid), payload)
+    session = _require_session(sid)
+    meta = session_meta.setdefault(sid, _default_session_meta(session))
+    clean = dict(payload)
+    action = str(clean.get("action") or "").strip().lower()
+    if action == "add" and clean.get("link_index") in (None, ""):
+        clean["link_index"] = meta.get("last_skeleton_edit_index")
+    result = _edit_session_skeleton(session, clean)
+    if result.get("ok"):
+        edits = meta.setdefault("skeleton_edits", [])
+        edits.append(clean)
+        meta["last_skeleton_edit_index"] = (
+            int(result.get("index", -1)) if action == "add" else None
+        )
+        _save_session(sid, session)
+    result["last_skeleton_edit_index"] = meta.get("last_skeleton_edit_index")
+    result["skeleton_edit_count"] = len(meta.get("skeleton_edits") or [])
+    return result
+
+
+@app.post("/api/sessions/{sid}/skeleton-edit/break")
+async def break_skeleton_edit_chain(sid: str) -> dict[str, Any]:
+    session = _require_session(sid)
+    meta = session_meta.setdefault(sid, _default_session_meta(session))
+    meta["last_skeleton_edit_index"] = None
+    return {"ok": True, "message": "已断开连续骨架加点"}
 
 
 @app.post("/api/sessions/{sid}/auto-segment")
@@ -192,12 +258,79 @@ async def save_corrections(sid: str, payload: dict[str, Any]) -> dict[str, Any]:
     design_curves = payload.get("design_curves", [])
     if not isinstance(corrections, list) or not isinstance(design_curves, list):
         raise HTTPException(status_code=400, detail="corrections and design_curves must be lists")
-    session.save(corrections, design_curves)
+    session.corrections = corrections
+    session.design_curves = design_curves
+    _save_session(sid, session)
     return {
         "ok": True,
         "corrections_path": str(session.corrections_path),
         "design_curve_count": len(session.design_curves),
     }
+
+
+@app.post("/api/sessions/{sid}/project")
+async def download_project(sid: str, payload: dict[str, Any] | None = None) -> Response:
+    session = _require_session(sid)
+    body = payload or {}
+    corrections = body.get("corrections", session.corrections)
+    design_curves = body.get("design_curves", session.design_curves)
+    if not isinstance(corrections, list) or not isinstance(design_curves, list):
+        raise HTTPException(status_code=400, detail="corrections and design_curves must be lists")
+    session.corrections = corrections
+    session.design_curves = design_curves
+    _save_session(sid, session)
+    project = _project_payload(sid, session, editor_state=body.get("editor_state", {}))
+    filename = f"{Path(str(project['source_image']['filename'])).stem}.autoalias_project.json"
+    return Response(
+        content=json.dumps(project, ensure_ascii=False, indent=2),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/api/projects/open")
+async def open_project(project: UploadFile = File(...)) -> dict[str, Any]:
+    try:
+        data = json.loads((await project.read()).decode("utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="工程 JSON 无法读取") from exc
+    source = data.get("source_image") or {}
+    encoded = str(source.get("data_base64") or "")
+    if not encoded:
+        raise HTTPException(status_code=400, detail="工程 JSON 中没有内嵌原图")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="工程 JSON 中的原图数据损坏") from exc
+    filename = _safe_filename(str(source.get("filename") or "project_image.png"))
+    target = _unique_path(OUTPUT_DIR / "uploads" / filename)
+    target.write_bytes(raw)
+    options = _graph_options_from_payload(data.get("graph_options") or {})
+    try:
+        session = ReviewSession.create(target, OUTPUT_DIR, options)
+        session.corrections = list(data.get("corrections") or [])
+        session.design_curves = list(data.get("design_curves") or [])
+        edits = list(data.get("skeleton_edits") or [])
+        _replay_skeleton_edits(session, edits)
+    except Exception as exc:
+        try:
+            target.unlink()
+        except OSError:
+            pass
+        raise HTTPException(status_code=400, detail=_friendly_session_error(str(exc))) from exc
+    sid = _make_session_id(target)
+    sessions[sid] = session
+    session_meta[sid] = {
+        "source_image": str(target),
+        "graph_options": _graph_options_payload(options),
+        "skeleton_edits": edits,
+        "last_skeleton_edit_index": None,
+    }
+    _save_session(sid, session)
+    result = _session_payload(sid, session)
+    result["ok"] = True
+    result["editor_state"] = data.get("editor_state") or {}
+    return result
 
 
 @app.post("/api/sessions/{sid}/export")
@@ -235,10 +368,9 @@ def download_export(sid: str, kind: str) -> FileResponse:
 def _run_export_job(job_id: str, sid: str, session: ReviewSession, payload: dict[str, Any]) -> None:
     try:
         _set_job(job_id, status="running", progress=8, message="保存分段数据")
-        session.save(
-            payload.get("corrections", session.corrections),
-            payload.get("design_curves", session.design_curves),
-        )
+        session.corrections = payload.get("corrections", session.corrections)
+        session.design_curves = payload.get("design_curves", session.design_curves)
+        _save_session(sid, session)
         _set_job(job_id, status="running", progress=35, message="拟合 Class-A 曲线并生成 Alias 文件")
         export_dir = OUTPUT_DIR / "alias_exports" / f"{session.image_path.stem}_next"
         result = fit_reviewed_annotations(
@@ -290,6 +422,8 @@ def _session_payload(sid: str, session: ReviewSession) -> dict[str, Any]:
     payload = _client_state(session)
     payload["sid"] = sid
     payload["exports"] = _next_export_payload(exports.get(sid, {}), sid)
+    meta = session_meta.setdefault(sid, _default_session_meta(session))
+    payload["skeleton_edit_count"] = len(meta.get("skeleton_edits") or [])
     return payload
 
 
@@ -319,6 +453,111 @@ def _next_export_payload(paths: dict[str, Path], sid: str) -> dict[str, Any]:
                 "url": f"/api/sessions/{sid}/download/{kind}",
             }
     return payload
+
+
+def _graph_options(
+    *,
+    extraction_mode: Any,
+    input_preprocess: Any,
+    parallel_collapse: Any,
+    weak_line_threshold: Any,
+) -> ReviewGraphOptions:
+    return ReviewGraphOptions(
+        extraction_mode=_clean_extraction_mode(str(extraction_mode or "auto")),
+        input_preprocess=_clean_input_preprocess(str(input_preprocess or "none")),
+        parallel_collapse=_clean_parallel_collapse(str(parallel_collapse or "off")),
+        weak_line_threshold=float(weak_line_threshold or 32),
+        max_points_per_edge=480,
+    )
+
+
+def _graph_options_payload(options: ReviewGraphOptions) -> dict[str, Any]:
+    return {
+        "extraction_mode": options.extraction_mode,
+        "input_preprocess": options.input_preprocess,
+        "parallel_collapse": options.parallel_collapse,
+        "weak_line_threshold": options.weak_line_threshold,
+        "max_points_per_edge": options.max_points_per_edge,
+    }
+
+
+def _graph_options_from_payload(payload: dict[str, Any]) -> ReviewGraphOptions:
+    return _graph_options(
+        extraction_mode=payload.get("extraction_mode", "auto"),
+        input_preprocess=payload.get("input_preprocess", "none"),
+        parallel_collapse=payload.get("parallel_collapse", "off"),
+        weak_line_threshold=payload.get("weak_line_threshold", 32),
+    )
+
+
+def _default_session_meta(session: ReviewSession) -> dict[str, Any]:
+    return {
+        "source_image": str(session.graph.get("source_image") or session.image_path),
+        "graph_options": {
+            "extraction_mode": session.graph.get("extraction_mode", "auto"),
+            "input_preprocess": session.graph.get("input_preprocess", "none"),
+            "parallel_collapse": session.graph.get("parallel_collapse", "off"),
+            "weak_line_threshold": session.graph.get("weak_line_threshold", 32),
+            "max_points_per_edge": 480,
+        },
+        "skeleton_edits": [],
+        "last_skeleton_edit_index": None,
+    }
+
+
+def _save_session(sid: str, session: ReviewSession) -> None:
+    session.save(session.corrections, session.design_curves)
+    meta = session_meta.setdefault(sid, _default_session_meta(session))
+    try:
+        data = json.loads(session.corrections_path.read_text(encoding="utf-8"))
+        data["skeleton_edits"] = list(meta.get("skeleton_edits") or [])
+        data["graph_options"] = dict(meta.get("graph_options") or {})
+        session.corrections_path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def _replay_skeleton_edits(session: ReviewSession, edits: list[dict[str, Any]]) -> None:
+    for edit in edits:
+        try:
+            _edit_session_skeleton(session, edit)
+        except Exception:
+            continue
+
+
+def _project_payload(sid: str, session: ReviewSession, *, editor_state: Any) -> dict[str, Any]:
+    meta = session_meta.setdefault(sid, _default_session_meta(session))
+    source = Path(str(meta.get("source_image") or session.image_path)).resolve()
+    if not source.exists():
+        raise HTTPException(status_code=404, detail=f"原始图片不存在：{source}")
+    mime = mimetypes.guess_type(source.name)[0] or "application/octet-stream"
+    return {
+        "version": 2,
+        "task": "autoalias_web_project",
+        "created_or_updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "source_image": {
+            "filename": source.name,
+            "media_type": mime,
+            "data_base64": base64.b64encode(source.read_bytes()).decode("ascii"),
+        },
+        "graph_options": dict(meta.get("graph_options") or {}),
+        "skeleton_edits": list(meta.get("skeleton_edits") or []),
+        "corrections": list(session.corrections),
+        "design_curves": list(session.design_curves),
+        "editor_state": editor_state if isinstance(editor_state, dict) else {},
+    }
+
+
+def _friendly_session_error(message: str) -> str:
+    if "raw feature-line preprocessing found no usable line pixels" in message:
+        return (
+            "原图预处理没有找到可用线条像素。输入可能已经是线稿，或线条较淡。"
+            "请取消原图预处理；黑底白线图请选择黑底白线；淡铅笔线请选择铅笔弱线并降低阈值。"
+        )
+    return message
 
 
 @app.get("/", response_class=HTMLResponse)

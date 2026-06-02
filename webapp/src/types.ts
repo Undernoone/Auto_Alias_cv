@@ -1,4 +1,12 @@
-export type Point = { x: number; y: number; snap_source?: string; order?: number };
+export type Point = {
+  x: number;
+  y: number;
+  snap_source?: string;
+  order?: number;
+  anchor_curve_id?: string;
+  anchor_point_order?: number;
+  anchor_semantic?: string;
+};
 
 export type RouteSegment = {
   ok?: boolean;
@@ -42,26 +50,11 @@ export type SessionState = {
   graph: ReviewGraph;
   corrections: unknown[];
   design_curves: DesignCurve[];
+  editor_state?: Record<string, unknown>;
+  skeleton_edit_count?: number;
+  message?: string;
   corrections_path?: string;
   exports?: Record<string, { path: string; url: string }>;
-};
-
-export type FitPreviewSegment = {
-  ok: boolean;
-  segment_index: number;
-  degree?: number;
-  span?: number;
-  samples?: number[][];
-  cvs?: number[][];
-  color?: string;
-  warnings?: string[];
-};
-
-export type FitPreview = {
-  ok: boolean;
-  segments: FitPreviewSegment[];
-  segment_count: number;
-  passed_count: number;
 };
 
 export type JobState = {
