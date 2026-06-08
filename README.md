@@ -1,149 +1,213 @@
-# AutoAlias Curves
+# AutoAlias Curves 教学向二开版
 
-AutoAlias Curves reconstructs automotive design-intent curves from images or ordered point data and exports Alias-friendly single-span NURBS/Bezier curves.
+> 这是一个面向学习和教学的仓库。项目基于 didilili 的原仓库进行二次开发，在原有思路基础上补充了更多基础知识、工程化示例、交互式工具和适合新手理解的流程说明。
 
-This repository is built as an engineering base, not a visual toy:
+AutoAlias Curves 的目标是：从图片、线稿或人工分段点中提取设计曲线，并导出可导入 Autodesk Alias 的曲线文件，例如 IGES、JSON、SVG 预览等。
 
-- single-span degree 3/5/7 curve generation;
-- CV count is locked to `degree + 1`;
-- open clamped knot vectors only;
-- fairing losses for curvature, bending, jerk and CV polygon quality;
-- S-curve inflection validation;
-- L-corner/blend validation;
-- JSON, SVG preview, DXF SPLINE and IGES export;
-- optional hooks for SAM2, DINOv2 and CAD-grade OpenCascade export.
+本仓库更偏向“带着小白一步一步理解图像到曲线的完整过程”，而不是只给出一个黑盒脚本。你可以把它当作：
 
-## Install
+- 图像处理入门项目；
+- 曲线拟合和 NURBS 学习项目；
+- Alias 曲线导出流程示例；
+- 汽车造型线稿自动/半自动分段实验平台；
+- 基于原项目继续二开的教学版本。
+
+## 与 didilili 原仓库的关系
+
+本项目是基于 didilili 的仓库进行的二次开发版本。
+
+二开重点包括：
+
+- 增加更适合初学者阅读的说明文档；
+- 增加 GUI 和新版网页交互工具；
+- 增加人工分段、骨架吸附、骨架修补、工程保存等功能；
+- 增加 Alias 导出、SVG 预览和质量检查流程；
+- 增加更多图像预处理入口，例如弱线增强、粗笔画轮廓、照片边缘提取；
+- 增加自动分段、手动分段、候选路径切换等工程实验功能；
+- 保留命令行方式，方便学习底层流程。
+
+说明：本仓库不是 didilili 原仓库的官方发布版本。如需了解原始项目，请以 didilili 原仓库内容为准。版权、协议和引用关系应同时尊重原作者与本仓库后续二开内容。
+
+## 快速运行
+
+完整启动说明见：[AutoAlias 运行文档](docs/RUNNING.md)。
+
+最常用的三个入口：
 
 ```powershell
-conda env create -f environment.yml
-conda activate autoalias
+# GUI，推荐本机人工分段使用
+F:\430AutoAlias\scripts\autoalias_gui.cmd
+
+# 旧网页，历史工作台
+F:\430AutoAlias\scripts\autoalias.cmd skeleton-review --out F:\430AutoAlias\lan_reviews --host 0.0.0.0 --port 8780
+
+# 新网页，推荐局域网多人使用
+F:\430AutoAlias\scripts\autoalias_next_api.cmd
+```
+
+新网页默认访问：
+
+```text
+http://127.0.0.1:8790/
+```
+
+## 项目适合谁
+
+适合：
+
+- 想学习“图片如何变成曲线”的初学者；
+- 想理解 OpenCV、骨架提取、路径搜索、曲线拟合的人；
+- 想把线稿整理成 Alias 可用曲线的人；
+- 想研究 NURBS、Bezier、CV 点、degree、span 的同学；
+- 想在原项目基础上继续做二开的开发者。
+
+不适合：
+
+- 只想一键得到完美 Class-A 曲线、完全不人工检查的人；
+- 完全不关心图像预处理、分段逻辑、CV 点质量的人；
+- 希望把它当作商业级自动 CAD 系统直接生产的人。
+
+当前更推荐的工作方式是：自动提取骨架，人工或半自动分段，最后导出 Alias 曲线。
+
+## 当前主要功能
+
+- 图片上传与骨架提取；
+- 原图预处理、弱线增强、粗笔画轮廓提取；
+- 完整骨架点显示；
+- 切段骨架线显示；
+- 设计笔画路线显示；
+- 手动分段点吸附到骨架；
+- 分段点拖拽、撤回、删除；
+- 已保存曲线端点吸附；
+- 骨架点添加和删除；
+- 自动几何分段实验；
+- 分支候选路径切换；
+- 工程 JSON 保存和打开；
+- IGES 导出；
+- SVG 预览；
+- JSON 曲线数据导出；
+- GUI 桌面工具；
+- React + FastAPI 新网页工具；
+- 旧网页工具保留作为历史版本。
+
+## 目录结构
+
+```text
+F:\430AutoAlias
+├─ src\autoalias              Python 核心代码
+│  ├─ geometry                曲线拟合、Bezier/NURBS 基础
+│  ├─ vision                  图像处理和骨架提取
+│  ├─ review                  旧网页和人工纠错逻辑
+│  ├─ web_next                新版 FastAPI 后端
+│  ├─ gui                     PySide6 桌面 GUI
+│  └─ exporters               JSON/SVG/DXF/IGES 导出
+├─ webapp                     新版 React + TypeScript 前端
+├─ scripts                    常用启动脚本
+├─ docs                       教程文档
+├─ examples                   示例数据
+├─ tests                      测试
+└─ lan_reviews                GUI/网页默认输出目录
+```
+
+## 安装环境
+
+如果你已经有 Python 环境，可以在项目根目录运行：
+
+```powershell
 pip install -e .
 ```
 
-If you already have Python 3.10+:
+如果要使用 GUI：
 
 ```powershell
-pip install -e .
+pip install -e ".[gui]"
 ```
 
-For OpenCascade IGES export:
+如果要使用新版网页：
+
+```powershell
+pip install -e ".[web]"
+cd F:\430AutoAlias\webapp
+npm install
+npm run build
+```
+
+如果要使用 OpenCascade 更完整地导出 CAD 文件：
 
 ```powershell
 conda install -c conda-forge pythonocc-core
 ```
 
-## Run From An Image
+本项目也提供了 Windows 脚本。你的本地脚本会优先使用 `F:\ComfyUI\.venv\Scripts\python.exe`，方便和已有 ComfyUI 环境共用。
 
-```powershell
-autoalias fit-image path\to\car.jpg --out out --max-curves 400 --degree auto
-```
+## 关键概念给新手
 
-Outputs:
+### 骨架
 
-- `curves.json`: exact NURBS/CV data;
-- `curves.igs`: IGES BSpline curves, OpenCascade when available, manual writer fallback;
-- `curves.dxf`: DXF SPLINE entities;
-- `preview.svg`: target points, fitted curve, CV polygon and curvature comb;
-- `quality.json`: Class-A and Alias-readiness metrics.
+骨架可以理解为线条的中心线。图片里一条黑线可能很粗，程序会尽量把它压缩成一条单像素中心路径。
 
-## Run From Ordered Points
+### 分段点
 
-Use this when another segmentation system already provides ordered curve points.
+分段点是你告诉程序“这里应该切开”的位置。比如车门外轮廓可能是一圈线，但在 Alias 建模中通常会根据转折和倒角分成几条更好编辑的曲线。
 
-```json
-{
-  "curves": [
-    {
-      "label": "beltline",
-      "points": [[0, 0], [20, 3], [60, 8], [100, 7]]
-    }
-  ]
-}
-```
+### CV 点
 
-```powershell
-autoalias fit-points points.json --out out --degree 7
-```
+CV 点是控制曲线形状的点。好的 CV 排布应该简洁、有节奏，不应该乱飞、交叉或在曲线两侧来回跳。
 
-Without installing the package, run it directly from this workspace:
+### Degree
 
-```powershell
-.\scripts\autoalias.cmd fit-points examples\points_s_curve.json --out out --degree 7 --torch-refine
-```
+degree 是曲线阶数。一般来说：
 
-The `.cmd` wrapper uses `F:\ComfyUI\.venv\Scripts\python.exe` automatically when it exists.
+- degree 3 适合简单平滑曲线；
+- degree 5 适合更柔和的汽车造型曲线；
+- degree 7 能表达更复杂的单段曲线；
+- 精度优先模式会更重视贴合，但也更容易产生不适合 Class-A 编辑的 CV。
 
-## Interactive Topology Correction
+### Span
 
-Use this before training the junction resolver. The tool opens a local browser page where you can
-select two stroke branches and mark the intended relationship: same design line, fair blend, break,
-or do-not-connect.
+span 可以理解为曲线段数。本项目默认追求 single-span，也就是一条曲线尽量一个 span，方便 Alias 后续编辑。
 
-The same page also supports manual design-curve annotation. In manual mode, AutoAlias does not ask
-you to use its automatic edge split: click the curve split/blend points directly on the image,
-choose a semantic label, and save the result as one `manual_design_curve` training sample.
-After two or more points are clicked, the page routes between them on the extracted stroke
-skeleton and saves the routed centerline as `routed_points`. Add an intermediate guide point if a
-junction chooses the wrong branch.
-Use `保存设计曲线` to update the current line, or `保存并下一条` to store the current manual
-line and immediately clear the point buffer for the next line. A mistaken point can be removed
-with `撤回上一点`, or by clicking that point and using `删除选中点` / `Delete`.
-For closed outlines such as a lamp loop, wheel detail, or closed styling island, click at least
-three points and enable `闭合曲线`; the saved sample records `closed: true` and routes the last
-point back to the first point on the stroke skeleton.
+## 建议学习路线
 
-```powershell
-.\scripts\autoalias.cmd review-image F:\430AutoAlias\test.png --out F:\430AutoAlias\corrections
-```
+如果你是新手，建议按这个顺序学习：
 
-Saved annotations are written as:
+1. 先用 GUI 上传一张简单线稿；
+2. 打开完整骨架点和设计笔画路线；
+3. 手动点选 2 到 5 个分段点；
+4. 保存曲线；
+5. 导出 IGES；
+6. 在 Alias 中查看曲线；
+7. 再回来看 JSON、SVG 和 CV 点；
+8. 最后再研究自动分段、G2、曲率梳和深度学习。
 
-```text
-F:\430AutoAlias\corrections\<image-name>.topology_corrections.json
-```
+不要一开始就追求全自动。这个项目最重要的学习价值是把“图片、骨架、路径、分段、拟合、导出”这些步骤拆开看清楚。
 
-These files are the first training dataset for the curve-topology model.
+## 常见问题
 
-Export Alias curves directly from manually reviewed segmentation:
+### 为什么自动分段不一定完美？
 
-```powershell
-.\scripts\autoalias.cmd fit-reviewed F:\430AutoAlias\corrections\*.topology_corrections.json --out F:\430AutoAlias\out_reviewed --degree auto
-```
+因为程序只能看到像素和骨架，不一定理解“这条线在汽车设计里是什么部位”。尤其是交叉线、弱线、光影线、粗线、断线，都会影响分段结果。
 
-This command reads only the saved manual `design_curves`, fits each one as a compact
-degree 3/5/7 single-span NURBS curve, and writes:
+### 为什么有时导出的曲线和蓝线不完全一样？
 
-- `reviewed_curves.igs`: Alias import file;
-- `reviewed_curves.json`: compact CV/degree/weight/knot data;
-- `reviewed_clean_preview.svg`: clean curve preview;
-- `reviewed_preview.svg`: debug preview with skeleton target, CV polygon and curvature comb.
+蓝线通常是骨架路径，导出时会再拟合成 NURBS/Bezier 曲线。拟合会在贴合度、CV 美观、degree、span、曲率平滑之间做取舍。
 
-When a saved manual design curve contains several boundary points, AutoAlias treats
-them as split boundaries, not as one long fitting guide. For example, points
-`1, 2, 3, 4` export as three independent single-span curves: `1->2`, `2->3`,
-and `3->4`. If the curve is closed, the final `N->1` segment is exported too.
+### 为什么还需要人工分段？
 
-Convert reviewed curves into supervised decoder data:
+因为 Alias 曲线不是简单描边。真正好用的曲线要考虑端点、倒角、曲率梳、CV 排布和后续建面方式。很多设计判断目前仍然需要人来给边界。
 
-```powershell
-.\scripts\autoalias.cmd build-training-set F:\430AutoAlias\corrections\test.topology_corrections.json --out F:\430AutoAlias\data\manual_curve_supervision.json --degree auto
-```
+## 后续可以继续二开的方向
 
-Train the neural decoder from one or more supervision JSON files:
+- 更强的自动分段；
+- 基于视觉大模型的分段点建议；
+- 更稳定的 G1/G2 约束；
+- 更好的 CV 美学优化；
+- 更完整的 WIRE 导出；
+- 批量图片处理；
+- 云端/局域网多人协作；
+- 数据集标注和训练流程。
 
-```powershell
-.\scripts\autoalias.cmd train-decoder F:\430AutoAlias\data\manual_curve_supervision.json --out F:\430AutoAlias\checkpoints\manual_curve_decoder.pt --epochs 50 --batch-size 16
-```
+## 致谢
 
-## Industrial Integration Points
+感谢 didilili 原仓库提供的基础思路和代码基础。本仓库是在其基础上进行的教学向二次开发，目标是让更多初学者能够理解、运行和继续改造这个方向。
 
-The production architecture is intentionally modular:
-
-- `autoalias.vision.extractor.OpenCVCurveExtractor`: local fallback extractor;
-- `autoalias.vision.foundation.FoundationBackends`: SAM2/DINOv2 adapter interface;
-- `autoalias.geometry.fitting.SingleSpanFitter`: deterministic fair single-span fitting;
-- `autoalias.quality.ClassAValidator`: Alias and Class-A metric gate;
-- `autoalias.exporters`: JSON/SVG/DXF/IGES exporters.
-
-In a deployed system, replace or augment the OpenCV extractor with SAM2/Grounded-SAM/DINOv2 candidates while keeping the same curve fitting, validation and export path.

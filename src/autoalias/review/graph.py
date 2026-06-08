@@ -369,6 +369,17 @@ def build_review_graph_bundle(
     }, router
 
 
+def _snapshot_points(item: dict[str, Any], max_points: int) -> list[list[float]]:
+    try:
+        points = np.asarray(item.get("points") or [], dtype=float)
+    except Exception:
+        return []
+    if points.ndim != 2 or points.shape[0] < 2 or points.shape[1] < 2:
+        return []
+    points = points[:, :2]
+    return _round_points(_downsample_points(points, max_points))
+
+
 def graph_snapshot_for_training(graph: dict[str, Any]) -> dict[str, Any]:
     return {
         "version": graph.get("version", 1),
@@ -394,6 +405,7 @@ def graph_snapshot_for_training(graph: dict[str, Any]) -> dict[str, Any]:
                 "end_node": edge.get("end_node"),
                 "length": edge.get("length", 0.0),
                 "bbox": edge.get("bbox", {}),
+                "points": _snapshot_points(edge, 360),
             }
             for edge in graph.get("edges", [])
         ],
@@ -406,6 +418,7 @@ def graph_snapshot_for_training(graph: dict[str, Any]) -> dict[str, Any]:
                 "length": stroke.get("length", 0.0),
                 "bbox": stroke.get("bbox", {}),
                 "source_edge_count": stroke.get("source_edge_count", 0),
+                "points": _snapshot_points(stroke, 900),
             }
             for stroke in graph.get("design_strokes", [])
         ],

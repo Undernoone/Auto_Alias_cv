@@ -390,6 +390,331 @@ def _fit_chain_lowest_degree(
     return best_curve
 
 
+def _target_segment_is_straight_line(points: np.ndarray) -> bool:
+    pts = remove_duplicate_points(np.asarray(points, dtype=float), eps=0.35)
+    if len(pts) < 2:
+        return False
+    if len(pts) == 2:
+        return float(np.linalg.norm(pts[-1, :2] - pts[0, :2])) > 1e-6
+    length = _polyline_length(pts)
+    chord = float(np.linalg.norm(pts[-1, :2] - pts[0, :2]))
+    if chord < 4.0 or length < 4.0:
+        return False
+    direction = pts[-1, :2] - pts[0, :2]
+    deviations = np.abs(
+        direction[0] * (pts[:, 1] - pts[0, 1]) - direction[1] * (pts[:, 0] - pts[0, 0])
+    ) / max(chord, 1e-9)
+    max_dev = float(np.max(deviations))
+    rms_dev = float(np.sqrt(np.mean(deviations**2)))
+    sinuosity = length / max(chord, 1e-9)
+    max_allowed = max(1.25, min(4.0, length * 0.006))
+    rms_allowed = max(0.65, min(2.4, length * 0.003))
+    return bool(sinuosity <= 1.006 and max_dev <= max_allowed and rms_dev <= rms_allowed)
+
+
+def _fit_exact_straight_curve(candidate: CurveCandidate, points: np.ndarray, degree: int | str) -> NURBSCurve:
+    pts = remove_duplicate_points(np.asarray(points, dtype=float), eps=0.35)
+    if len(pts) < 2:
+        raise ValueError("not enough points for exact straight fit")
+    line_degree = 3
+    start = pts[0, :3].astype(float)
+    end = pts[-1, :3].astype(float)
+    cvs = np.vstack(
+        [start * (1.0 - t) + end * t for t in np.linspace(0.0, 1.0, line_degree + 1)]
+    )
+    curve = NURBSCurve.single_span(
+        label=candidate.label,
+        degree=line_degree,
+        cvs=cvs,
+        confidence=1.0,
+        source="manual_exact_straight_line_fit",
+        metadata={
+            "exact_straight_line": True,
+            "straight_line_degree": line_degree,
+            "straight_line_cv_policy": "collinear_even_spacing",
+        },
+    )
+    return curve
+
+
+def _is_exact_straight_curve(curve: NURBSCurve) -> bool:
+    return bool(curve.metadata.get("exact_straight_line"))
+
+
+def _segment_tangent(points: np.ndarray, *, at_end: bool) -> np.ndarray:
+    pts = remove_duplicate_points(np.asarray(points, dtype=float), eps=0.5)
+    if len(pts) < 2:
+        return np.zeros(2, dtype=float)
+    length = _polyline_length(pts)
+    sample_distance = min(max(8.0, length * 0.08), 42.0)
+    if at_end:
+        return (pts[-1, :2] - _point_before_end(pts, sample_distance)[:2]).astype(float)
+    return (_point_after_start(pts, sample_distance)[:2] - pts[0, :2]).astype(float)
+
+
+def _chain_has_hard_g2_break(segments: list[dict[str, Any]], *, closed: bool) -> bool:
+    if not segments:
+        return False
+    prepared = [
+        remove_duplicate_points(np.asarray(segment.get("points"), dtype=float), eps=0.5)
+        for segment in segments
+    ]
+    if any(_target_segment_is_straight_line(points) for points in prepared):
+        return True
+    join_count = len(prepared) if closed and len(prepared) > 2 else len(prepared) - 1
+    for join_index in range(join_count):
+        left = prepared[join_index]
+        right = prepared[(join_index + 1) % len(prepared)]
+        left_tangent = _segment_tangent(left, at_end=True)
+        right_tangent = _segment_tangent(right, at_end=False)
+        if np.linalg.norm(left_tangent) < 1e-6 or np.linalg.norm(right_tangent) < 1e-6:
+            continue
+        if _angle_between(left_tangent, right_tangent) > 22.0:
+            return True
+    return False
+
+
+def _manual_class_a_g2_requested(fit_mode: str) -> bool:
+    return str(fit_mode or "").lower() in {"manual_class_a_g2", "class_a_g2"}
+
+
+def _manual_source_allows_g2(design_curve: dict[str, Any]) -> bool:
+    source = str(design_curve.get("source") or "").lower()
+    return not source.startswith("geometry_auto_segment")
+
+
+def _join_allows_curve_g2(left: np.ndarray, right: np.ndarray) -> bool:
+    left = remove_duplicate_points(np.asarray(left, dtype=float), eps=0.5)
+    right = remove_duplicate_points(np.asarray(right, dtype=float), eps=0.5)
+    if len(left) < 4 or len(right) < 4:
+        return False
+    if _target_segment_is_straight_line(left) or _target_segment_is_straight_line(right):
+        return False
+    gap = float(np.linalg.norm(left[-1, :2] - right[0, :2]))
+    local_len = max(min(_polyline_length(left), _polyline_length(right)), 1.0)
+    if gap > max(3.0, min(12.0, local_len * 0.055)):
+        return False
+    left_tangent = _segment_tangent(left, at_end=True)
+    right_tangent = _segment_tangent(right, at_end=False)
+    if np.linalg.norm(left_tangent) < 1e-6 or np.linalg.norm(right_tangent) < 1e-6:
+        return False
+    return bool(_angle_between(left_tangent, right_tangent) <= 16.0)
+
+
+def _selective_g2_groups(segments: list[dict[str, Any]], *, closed: bool) -> list[list[int]]:
+    if len(segments) <= 1:
+        return []
+    prepared = [
+        remove_duplicate_points(np.asarray(segment.get("points"), dtype=float), eps=0.5)
+        for segment in segments
+    ]
+    curve_like = [
+        len(points) >= 4
+        and not _target_segment_is_straight_line(points)
+        and _polyline_length(points) >= 12.0
+        for points in prepared
+    ]
+    # Closed mixed chains are common in logo/trim work; when there is any hard
+    # break, keep the selective pass open-ended so a straight span cannot force
+    # the opposite side of the loop into C2.
+    join_ok = [
+        curve_like[index]
+        and curve_like[index + 1]
+        and _join_allows_curve_g2(prepared[index], prepared[index + 1])
+        for index in range(len(prepared) - 1)
+    ]
+    groups: list[list[int]] = []
+    index = 0
+    while index < len(prepared):
+        if not curve_like[index]:
+            index += 1
+            continue
+        group = [index]
+        while index < len(join_ok) and join_ok[index]:
+            index += 1
+            group.append(index)
+        if len(group) >= 2:
+            groups.append(group)
+        index += 1
+    return groups
+
+
+def _fit_individual_review_segment(
+    design_curve: dict[str, Any],
+    annotation_path: Path,
+    design_index: int,
+    segment: dict[str, Any],
+    points: np.ndarray,
+    degree: int | str,
+    validator: ClassAValidator,
+    *,
+    segment_index: int,
+    segment_count: int,
+    closed: bool,
+    fit_policy: str,
+) -> tuple[NURBSCurve, CurveCandidate, QualityReport]:
+    label = _curve_label(
+        design_curve,
+        annotation_path,
+        design_index,
+        segment_index,
+        segment_count,
+    )
+    candidate = _make_candidate(label, points, annotation_path, design_curve)
+    exact_line = _target_segment_is_straight_line(points)
+    curve = (
+        _fit_exact_straight_curve(candidate, points, degree)
+        if exact_line
+        else _fit_chain_lowest_degree(
+            candidate,
+            points,
+            degree,
+            validator,
+            segment_index=segment_index,
+            segment_count=segment_count,
+            closed=closed,
+        )
+    )
+    curve.source = "manual_review_fit"
+    curve.metadata = _curve_metadata(
+        design_curve,
+        annotation_path,
+        segment,
+        points,
+        segment_index,
+        fit_policy=(
+            "exact_straight_line_single_span_collinear_cvs"
+            if exact_line
+            else fit_policy
+        ),
+    )
+    if exact_line:
+        curve.metadata["exact_straight_line"] = True
+        curve.metadata["straight_line_cv_policy"] = "collinear_even_spacing"
+        curve.metadata["g2_policy"] = "not_g2_straight_line_protected"
+    else:
+        curve.metadata["g2_policy"] = "not_g2_hard_break_or_isolated_curve"
+    curve.metadata.update(_fit_metadata_notes(curve))
+    _stamp_cv_side_diagnostics(curve, points)
+    _stamp_cv_target_corridor_diagnostics(curve, points)
+    _stamp_curvature_sign_diagnostics(curve, points)
+    _stamp_blend_fairness_diagnostics(curve, points)
+    return curve, candidate, validator.validate(curve, points)
+
+
+def _fit_design_curve_chain_selective_g2(
+    design_curve: dict[str, Any],
+    annotation_path: Path,
+    design_index: int,
+    segments: list[dict[str, Any]],
+    degree: int | str,
+    validator: ClassAValidator,
+) -> list[tuple[NURBSCurve, CurveCandidate, QualityReport]] | None:
+    closed = bool(design_curve.get("closed", False))
+    groups = _selective_g2_groups(segments, closed=closed)
+    if not groups:
+        out: list[tuple[NURBSCurve, CurveCandidate, QualityReport]] = []
+        segment_count = len(segments)
+        for index, segment in enumerate(segments, start=1):
+            points = np.asarray(segment["points"], dtype=float)
+            out.append(
+                _fit_individual_review_segment(
+                    design_curve,
+                    annotation_path,
+                    design_index,
+                    segment,
+                    points,
+                    degree,
+                    validator,
+                    segment_index=index,
+                    segment_count=segment_count,
+                    closed=False,
+                    fit_policy="selective_g2_no_curve_join_independent_segment",
+                )
+            )
+        return out
+    grouped = {index for group in groups for index in group}
+    group_by_start = {group[0]: group for group in groups}
+    out: list[tuple[NURBSCurve, CurveCandidate, QualityReport]] = []
+    index = 0
+    segment_count = len(segments)
+    while index < segment_count:
+        group = group_by_start.get(index)
+        if group is not None:
+            sub_curve = dict(design_curve)
+            sub_curve["closed"] = False
+            sub_segments = [segments[item] for item in group]
+            try:
+                fitted = _fit_design_curve_chain_class_a_g2(
+                    sub_curve,
+                    annotation_path,
+                    design_index,
+                    sub_segments,
+                    degree,
+                    validator,
+                )
+                if len(fitted) != len(group):
+                    raise ValueError("selective G2 group returned the wrong segment count")
+            except Exception:
+                fitted = []
+                for local_index, item in enumerate(group, start=1):
+                    points = np.asarray(segments[item]["points"], dtype=float)
+                    fitted.append(
+                        _fit_individual_review_segment(
+                            design_curve,
+                            annotation_path,
+                            design_index,
+                            segments[item],
+                            points,
+                            degree,
+                            validator,
+                            segment_index=item + 1,
+                            segment_count=segment_count,
+                            closed=False,
+                            fit_policy="selective_g2_group_fallback_individual_curve",
+                        )
+                    )
+
+            for local_index, item in enumerate(group, start=1):
+                curve, candidate, _report = fitted[local_index - 1]
+                label = _curve_label(design_curve, annotation_path, design_index, item + 1, segment_count)
+                curve.label = label
+                candidate.label = label
+                curve.metadata["selective_g2"] = True
+                curve.metadata["selective_g2_group_start"] = group[0] + 1
+                curve.metadata["selective_g2_group_end"] = group[-1] + 1
+                curve.metadata["global_segment_index"] = item + 1
+                curve.metadata["g2_policy"] = "g2_curve_to_curve_join"
+                curve.metadata["g2_start_constrained"] = bool(local_index > 1)
+                curve.metadata["g2_end_constrained"] = bool(local_index < len(group))
+                points = np.asarray(segments[item]["points"], dtype=float)
+                out.append((curve, candidate, validator.validate(curve, points)))
+            index = group[-1] + 1
+            continue
+        points = np.asarray(segments[index]["points"], dtype=float)
+        out.append(
+            _fit_individual_review_segment(
+                design_curve,
+                annotation_path,
+                design_index,
+                segments[index],
+                points,
+                degree,
+                validator,
+                segment_index=index + 1,
+                segment_count=segment_count,
+                closed=False,
+                fit_policy=(
+                    "selective_g2_straight_or_hard_break_single_span"
+                    if index not in grouped
+                    else "selective_g2_individual_single_span"
+                ),
+            )
+        )
+        index += 1
+    return out
+
+
 def _fit_design_curve_chain(
     design_curve: dict[str, Any],
     annotation_path: Path,
@@ -426,6 +751,22 @@ def _fit_design_curve_chain(
             degree,
             validator,
         )
+    if (
+        _manual_class_a_g2_requested(fit_mode)
+        and _manual_source_allows_g2(design_curve)
+        and len(segments) > 1
+        and _chain_has_hard_g2_break(segments, closed=bool(design_curve.get("closed", False)))
+    ):
+        selective = _fit_design_curve_chain_selective_g2(
+            design_curve,
+            annotation_path,
+            design_index,
+            segments,
+            degree,
+            validator,
+        )
+        if selective is not None:
+            return selective
     if _should_use_manual_class_a_g2(design_curve, segments, fit_mode):
         return _fit_design_curve_chain_class_a_g2(
             design_curve,
@@ -447,7 +788,12 @@ def _fit_design_curve_chain(
                 segment["segment_count"],
             )
             candidate = _make_candidate(label, points, annotation_path, design_curve)
-            curve = _fit_lowest_degree(candidate, points, degree, validator)
+            exact_line = _target_segment_is_straight_line(points)
+            curve = (
+                _fit_exact_straight_curve(candidate, points, degree)
+                if exact_line
+                else _fit_lowest_degree(candidate, points, degree, validator)
+            )
             fit_notes = _fit_metadata_notes(curve)
             curve.source = "manual_review_fit"
             curve.metadata = _curve_metadata(
@@ -456,8 +802,15 @@ def _fit_design_curve_chain(
                 segment,
                 points,
                 segment_index,
-                fit_policy="split_boundaries_then_single_span_degree_3_to_7",
+                fit_policy=(
+                    "exact_straight_line_single_span_collinear_cvs"
+                    if exact_line
+                    else "split_boundaries_then_single_span_degree_3_to_7"
+                ),
             )
+            if exact_line:
+                curve.metadata["exact_straight_line"] = True
+                curve.metadata["straight_line_cv_policy"] = "collinear_even_spacing"
             curve.metadata.update(fit_notes)
             _stamp_cv_side_diagnostics(curve, points)
             _stamp_cv_target_corridor_diagnostics(curve, points)
@@ -498,14 +851,19 @@ def _fit_design_curve_chain(
             segment["segment_count"],
         )
         candidate = _make_candidate(label, points, annotation_path, design_curve)
-        curve = _fit_chain_lowest_degree(
-            candidate,
-            points,
-            degree,
-            validator,
-            segment_index=segment_index,
-            segment_count=segment["segment_count"],
-            closed=closed,
+        exact_line = _target_segment_is_straight_line(points)
+        curve = (
+            _fit_exact_straight_curve(candidate, points, degree)
+            if exact_line
+            else _fit_chain_lowest_degree(
+                candidate,
+                points,
+                degree,
+                validator,
+                segment_index=segment_index,
+                segment_count=segment["segment_count"],
+                closed=closed,
+            )
         )
         fit_notes = _fit_metadata_notes(curve)
         curve.source = "manual_review_g2_fit" if ENABLE_G2_CONSTRAINTS else "manual_review_fit"
@@ -516,11 +874,18 @@ def _fit_design_curve_chain(
             points,
             segment_index,
             fit_policy=(
-                "manual_split_boundaries_with_lowest_degree_g2_fairing"
-                if ENABLE_G2_CONSTRAINTS
-                else "manual_split_boundaries_with_lowest_degree_no_g2"
+                "exact_straight_line_single_span_collinear_cvs"
+                if exact_line
+                else (
+                    "manual_split_boundaries_with_lowest_degree_g2_fairing"
+                    if ENABLE_G2_CONSTRAINTS
+                    else "manual_split_boundaries_with_lowest_degree_no_g2"
+                )
             ),
         )
+        if exact_line:
+            curve.metadata["exact_straight_line"] = True
+            curve.metadata["straight_line_cv_policy"] = "collinear_even_spacing"
         curve.metadata["g2_chain"] = bool(ENABLE_G2_CONSTRAINTS)
         curve.metadata["g2_method"] = (
             "limited_split_adjustment_plus_local_fairness_search"
@@ -607,6 +972,8 @@ def _should_use_manual_class_a_g2(
         return False
     source = str(design_curve.get("source") or "").lower()
     if source.startswith("geometry_auto_segment"):
+        return False
+    if _chain_has_hard_g2_break(segments, closed=bool(design_curve.get("closed", False))):
         return False
     return True
 
@@ -2171,6 +2538,8 @@ def _promote_failed_chain_degrees(
 ) -> None:
     changed = False
     for index, (curve, candidate, points, segment, segment_index) in enumerate(list(fitted_curves)):
+        if _is_exact_straight_curve(curve):
+            continue
         report = validator.validate(curve, points)
         if report.passed or curve.degree >= 7:
             continue
@@ -2342,6 +2711,8 @@ def _repair_cv_side_flips(
     closed: bool,
 ) -> None:
     for index, (curve, candidate, points, segment, segment_index) in enumerate(list(fitted_curves)):
+        if _is_exact_straight_curve(curve):
+            continue
         current_side = _cv_side_consistency_penalty(curve, points)
         current_corridor = _cv_target_corridor_penalty(curve, points)
         current_forbidden = _has_forbidden_cv_side_switch(curve, points)
@@ -2425,6 +2796,8 @@ def _promote_bad_layout_degrees(
         return
     target_segments = [item[2] for item in fitted_curves]
     for index, (curve, candidate, points, segment, segment_index) in enumerate(list(fitted_curves)):
+        if _is_exact_straight_curve(curve):
+            continue
         side = _cv_side_consistency_penalty(curve, points)
         corridor = _cv_target_corridor_penalty(curve, points)
         forbidden_side = _has_forbidden_cv_side_switch(curve, points)
@@ -2710,8 +3083,10 @@ def _smooth_endpoint_bridges_for_curves(
             ),
             1.0,
         )
-        _smooth_endpoint_bridge_cv(curves[join_index], side="end", local_len=local_len)
-        _smooth_endpoint_bridge_cv(curves[(join_index + 1) % len(curves)], side="start", local_len=local_len)
+        if not _is_exact_straight_curve(curves[join_index]):
+            _smooth_endpoint_bridge_cv(curves[join_index], side="end", local_len=local_len)
+        if not _is_exact_straight_curve(curves[(join_index + 1) % len(curves)]):
+            _smooth_endpoint_bridge_cv(curves[(join_index + 1) % len(curves)], side="start", local_len=local_len)
 
 
 def _fair_free_interior_cvs_for_curves(
@@ -2723,6 +3098,8 @@ def _fair_free_interior_cvs_for_curves(
     if not curves:
         return
     for index, curve in enumerate(curves):
+        if _is_exact_straight_curve(curve):
+            continue
         start_constrained = closed or index > 0
         end_constrained = closed or index < len(curves) - 1
         if start_constrained and end_constrained:

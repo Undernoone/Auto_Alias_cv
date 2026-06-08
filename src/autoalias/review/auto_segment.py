@@ -161,6 +161,8 @@ def _suggest_intersection_only_segments(
     sorted_edges = sorted(edges.values(), key=lambda item: item.length, reverse=True)
     accepted_paths: list[np.ndarray] = []
     suggestion_seed = int(time.time() * 1000)
+    scan_limit = max(max_curves * 4, max_curves + 80)
+    scan_limit = min(max(scan_limit, max_curves), 2048)
     for edge in sorted_edges:
         if edge.length < min_length_value:
             continue
@@ -189,6 +191,7 @@ def _suggest_intersection_only_segments(
             if len(manual_points) < 2:
                 continue
             single_segment = {**segment, "segment_index": 0, "segment_count": 1}
+            is_closed = bool(segment.get("closed"))
             accepted_paths.append(points)
             suggestions.append(
                 {
@@ -198,7 +201,7 @@ def _suggest_intersection_only_segments(
                     "edge_ids": [edge.id],
                     "manual_points": manual_points,
                     "cut_points": manual_points,
-                    "closed": False,
+                    "closed": is_closed,
                     "routed_points": _round_points(points),
                     "route_segments": [single_segment],
                     "branch_choices": [0],
@@ -214,11 +217,12 @@ def _suggest_intersection_only_segments(
                     "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 }
             )
-            if len(suggestions) >= max_curves:
+            if len(suggestions) >= scan_limit:
                 break
-        if len(suggestions) >= max_curves:
+        if len(suggestions) >= scan_limit:
             break
-    return suggestions
+    ordered = _order_suggestions_for_review(suggestions, diag)
+    return _limit_ordered_suggestions(ordered, max_curves)
 
 
 def _intersection_cuts_by_edge(
@@ -1160,7 +1164,10 @@ def _route_segments_from_cuts(
         points[-1, :2] = end.point[:2]
         length = _curve_length(points)
         chord = float(np.linalg.norm(points[-1, :2] - points[0, :2]))
-        if length < max(1.0, min_span_length * 0.5) or chord < min_span_chord:
+        closed_span = chord <= max(2.0, min_span_chord * 0.75) and length >= max(12.0, min_span_length * 3.0)
+        if length < max(1.0, min_span_length * 0.5):
+            continue
+        if chord < min_span_chord and not closed_span:
             continue
         segments.append(
             {
@@ -1178,6 +1185,7 @@ def _route_segments_from_cuts(
                 "start_s": round(float(start.s), 3),
                 "end_s": round(float(end.s), 3),
                 "segment_count": segment_count,
+                "closed": bool(closed_span),
             }
         )
     return segments
@@ -1323,6 +1331,220 @@ def _manual_points_from_segment(edge: _GraphEdge, segment: dict[str, Any]) -> li
     return out
 
 
+def _order_suggestions_for_review(suggestions: list[dict[str, Any]], diag: float) -> list[dict[str, Any]]:
+    """Make auto-generated curve lists feel spatially readable.
+
+    The segmentation core emits candidates by source edge length, which is good for
+    filtering but confusing in the editor list. This pass keeps every curve intact and
+    only reorders the list: connected pieces stay near each other, and disconnected
+    groups are arranged roughly top-to-bottom, left-to-right.
+    """
+    if len(suggestions) <= 1:
+        return suggestions
+
+    infos: list[dict[str, Any]] = []
+    for index, curve in enumerate(suggestions):
+        points = _curve_points_for_order(curve)
+        if len(points) < 2:
+            continue
+        bbox_min = np.min(points[:, :2], axis=0)
+        bbox_max = np.max(points[:, :2], axis=0)
+        infos.append(
+            {
+                "index": index,
+                "curve": curve,
+                "points": points,
+                "start": points[0, :2].copy(),
+                "end": points[-1, :2].copy(),
+                "center": np.mean(points[:, :2], axis=0),
+                "bbox_min": bbox_min,
+                "bbox_max": bbox_max,
+                "length": _curve_length(points),
+            }
+        )
+
+    if not infos:
+        return suggestions
+
+    endpoint_radius = max(6.0, float(diag) * 0.006)
+    adjacency = _curve_adjacency_for_order(infos, endpoint_radius)
+    components = _curve_components_for_order(adjacency)
+
+    def component_key(component: list[int]) -> tuple[float, float, float, float]:
+        mins = np.vstack([infos[i]["bbox_min"] for i in component])
+        maxs = np.vstack([infos[i]["bbox_max"] for i in component])
+        centers = np.vstack([infos[i]["center"] for i in component])
+        bbox_min = np.min(mins, axis=0)
+        bbox_max = np.max(maxs, axis=0)
+        center = np.mean(centers, axis=0)
+        # Primary reading order is top-to-bottom. The center terms keep very tall
+        # components, such as a door loop, from being sorted only by one stray endpoint.
+        return (
+            round(float(bbox_min[1]) / max(endpoint_radius, 1.0)),
+            round(float(bbox_min[0]) / max(endpoint_radius, 1.0)),
+            float(center[1]),
+            float(center[0]),
+        )
+
+    ordered: list[dict[str, Any]] = []
+    component_order = 0
+    for component in sorted(components, key=component_key):
+        local_sequence = _order_component_curves(infos, adjacency, component, endpoint_radius)
+        for local_order, info_index in enumerate(local_sequence):
+            curve = infos[info_index]["curve"]
+            curve["auto_order"] = len(ordered) + 1
+            curve["auto_component"] = component_order + 1
+            curve["auto_component_order"] = local_order + 1
+            ordered.append(curve)
+        component_order += 1
+
+    # Preserve any malformed items at the end instead of dropping them.
+    ordered_ids = {id(curve) for curve in ordered}
+    for curve in suggestions:
+        if id(curve) not in ordered_ids:
+            ordered.append(curve)
+    return ordered
+
+
+def _limit_ordered_suggestions(suggestions: list[dict[str, Any]], max_curves: int) -> list[dict[str, Any]]:
+    """Trim after spatial ordering so short but important strokes are not starved.
+
+    The old flow stopped while scanning curves from longest to shortest. That made the
+    saved blue curves over-represent outer silhouettes, wheels, and long rocker lines,
+    while dropping shorter window/frame/detail strokes that were already present in the
+    design-stroke layer. We now trim only after the review order has been built.
+    """
+    limit = max(1, min(int(max_curves), len(suggestions)))
+    kept = suggestions[:limit]
+    for index, curve in enumerate(kept):
+        curve["auto_order"] = index + 1
+    return kept
+
+
+def _curve_points_for_order(curve: dict[str, Any]) -> np.ndarray:
+    candidates = [curve.get("routed_points")]
+    for segment in curve.get("route_segments") or []:
+        candidates.append(segment.get("points"))
+    for value in candidates:
+        try:
+            points = np.asarray(value or [], dtype=float)
+        except Exception:
+            continue
+        if points.ndim == 2 and points.shape[0] >= 2 and points.shape[1] >= 2:
+            return points[:, :2].astype(float, copy=False)
+    manual = curve.get("manual_points") or curve.get("cut_points") or []
+    parsed: list[list[float]] = []
+    for item in manual:
+        point = _optional_point(item)
+        if point is not None:
+            parsed.append([float(point[0]), float(point[1])])
+    if len(parsed) >= 2:
+        return np.asarray(parsed, dtype=float)
+    return np.zeros((0, 2), dtype=float)
+
+
+def _curve_adjacency_for_order(
+    infos: list[dict[str, Any]],
+    endpoint_radius: float,
+) -> dict[int, list[int]]:
+    adjacency: dict[int, set[int]] = {index: set() for index in range(len(infos))}
+    for left in range(len(infos)):
+        left_endpoints = (infos[left]["start"], infos[left]["end"])
+        for right in range(left + 1, len(infos)):
+            right_endpoints = (infos[right]["start"], infos[right]["end"])
+            connected = any(
+                float(np.linalg.norm(np.asarray(a) - np.asarray(b))) <= endpoint_radius
+                for a in left_endpoints
+                for b in right_endpoints
+            )
+            if connected:
+                adjacency[left].add(right)
+                adjacency[right].add(left)
+    return {key: sorted(value) for key, value in adjacency.items()}
+
+
+def _curve_components_for_order(adjacency: dict[int, list[int]]) -> list[list[int]]:
+    seen: set[int] = set()
+    components: list[list[int]] = []
+    for start in sorted(adjacency):
+        if start in seen:
+            continue
+        stack = [start]
+        seen.add(start)
+        component: list[int] = []
+        while stack:
+            current = stack.pop()
+            component.append(current)
+            for neighbor in adjacency.get(current, []):
+                if neighbor in seen:
+                    continue
+                seen.add(neighbor)
+                stack.append(neighbor)
+        components.append(sorted(component))
+    return components
+
+
+def _order_component_curves(
+    infos: list[dict[str, Any]],
+    adjacency: dict[int, list[int]],
+    component: list[int],
+    endpoint_radius: float,
+) -> list[int]:
+    if len(component) <= 1:
+        return component
+    remaining = set(component)
+    ordered: list[int] = []
+
+    def info_key(index: int) -> tuple[float, float, float]:
+        info = infos[index]
+        center = info["center"]
+        bbox_min = info["bbox_min"]
+        return (float(bbox_min[1]), float(bbox_min[0]), -float(info["length"]))
+
+    degree_one = [index for index in component if len([n for n in adjacency.get(index, []) if n in remaining]) <= 1]
+    current = min(degree_one or component, key=info_key)
+
+    while remaining:
+        if current not in remaining:
+            current = min(remaining, key=info_key)
+        ordered.append(current)
+        remaining.remove(current)
+        if not remaining:
+            break
+
+        connected_candidates = [n for n in adjacency.get(current, []) if n in remaining]
+        if connected_candidates:
+            current = min(
+                connected_candidates,
+                key=lambda idx: (
+                    _curve_endpoint_distance(infos[current], infos[idx]),
+                    _curve_center_distance(infos[current], infos[idx]),
+                    info_key(idx),
+                ),
+            )
+            continue
+
+        current = min(
+            remaining,
+            key=lambda idx: (
+                0 if _curve_endpoint_distance(infos[ordered[-1]], infos[idx]) <= endpoint_radius * 1.65 else 1,
+                _curve_center_distance(infos[ordered[-1]], infos[idx]),
+                info_key(idx),
+            ),
+        )
+    return ordered
+
+
+def _curve_endpoint_distance(left: dict[str, Any], right: dict[str, Any]) -> float:
+    left_points = (left["start"], left["end"])
+    right_points = (right["start"], right["end"])
+    return min(float(np.linalg.norm(np.asarray(a) - np.asarray(b))) for a in left_points for b in right_points)
+
+
+def _curve_center_distance(left: dict[str, Any], right: dict[str, Any]) -> float:
+    return float(np.linalg.norm(np.asarray(left["center"]) - np.asarray(right["center"])))
+
+
 def _segment_points_array(segment: dict[str, Any]) -> np.ndarray:
     try:
         points = np.asarray(segment.get("points") or [], dtype=float)
@@ -1357,11 +1579,13 @@ def _route_segment_duplicates_existing(
         if one_way > distance:
             continue
         length_ratio = max(length, other_length) / max(min(length, other_length), 1e-6)
+        strict_distance = max(0.8, distance * 0.45)
+        subset_distance = max(0.7, distance * 0.35)
         if length_ratio <= 1.18:
             reverse_one_way = _mean_nearest_distance(other_sample, sample)
-            if reverse_one_way <= distance * 1.25:
+            if one_way <= strict_distance and reverse_one_way <= strict_distance:
                 return True
-        elif length <= other_length:
+        elif length <= other_length and one_way <= subset_distance:
             return True
     return False
 

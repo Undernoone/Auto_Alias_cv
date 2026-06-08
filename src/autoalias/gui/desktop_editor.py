@@ -137,6 +137,8 @@ def _safe_choice(choices: list[int], index: int, candidate_count: int) -> int:
 class LoadedSession:
     session: ReviewSession
     image: QImage
+    reference_image: QImage
+    source_image_path: Path
     skeleton_edits: list[dict[str, Any]]
 
 
@@ -195,8 +197,18 @@ class SessionWorker(QObject):
             image = QImage(str(session.image_path))
             if image.isNull():
                 raise FileNotFoundError(f"cannot load image: {session.image_path}")
+            reference_path = Path(str(session.graph.get("source_image") or self.image_path)).resolve()
+            reference_image = QImage(str(reference_path))
+            if reference_image.isNull():
+                reference_image = image
             self.finished.emit(
-                LoadedSession(session=session, image=image, skeleton_edits=skeleton_edits)
+                LoadedSession(
+                    session=session,
+                    image=image,
+                    reference_image=reference_image,
+                    source_image_path=reference_path,
+                    skeleton_edits=skeleton_edits,
+                )
             )
         except Exception as exc:  # pragma: no cover - GUI worker path.
             self.failed.emit(str(exc))
@@ -239,14 +251,14 @@ class ExportWorker(QObject):
 
 class CutPointItem(QGraphicsEllipseItem):
     def __init__(self, window: "DesktopEditor", index: int, point: QPointF) -> None:
-        radius = 6.0
+        radius = 4.2
         super().__init__(-radius, -radius, radius * 2, radius * 2)
         self.window = window
         self.index = index
         self.setPos(point)
         self.setZValue(50)
         self.setBrush(QBrush(QColor(116, 87, 255)))
-        self.setPen(QPen(QColor("white"), 1.6))
+        self.setPen(QPen(QColor("white"), 1.2))
         self.setFlags(
             QGraphicsItem.GraphicsItemFlag.ItemIsMovable
             | QGraphicsItem.GraphicsItemFlag.ItemIsSelectable
@@ -254,7 +266,7 @@ class CutPointItem(QGraphicsEllipseItem):
         )
         self.label = QGraphicsSimpleTextItem(str(index + 1), self)
         self.label.setBrush(QBrush(QColor(30, 36, 35)))
-        self.label.setPos(8, -18)
+        self.label.setPos(6, -16)
 
     def mousePressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         self.window.select_cut_point(self.index)
@@ -331,6 +343,7 @@ class EditorView(QGraphicsView):
             self.window.update_reference_preview_position()
             event.accept()
             return
+        self.window.update_link_hover(self.mapToScene(event.position().toPoint()))
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[no-untyped-def]
@@ -340,6 +353,10 @@ class EditorView(QGraphicsView):
             event.accept()
             return
         super().mouseReleaseEvent(event)
+
+    def leaveEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        self.window.clear_link_hover()
+        super().leaveEvent(event)
 
 
 class NoWheelComboBox(QComboBox):
@@ -367,6 +384,7 @@ class DesktopEditor(QMainWindow):
 
         self.session: ReviewSession | None = None
         self.current_image: QImage | None = None
+        self.source_image_path: Path | None = None
         self.image_item: QGraphicsPixmapItem | None = None
         self.reference_preview_pixmap: QPixmap | None = None
         self.full_skeleton_item: QGraphicsPixmapItem | None = None
@@ -376,6 +394,8 @@ class DesktopEditor(QMainWindow):
         self.alt_route_items: list[QGraphicsPathItem] = []
         self.saved_route_items: list[QGraphicsPathItem] = []
         self.connection_items: list[QGraphicsItem] = []
+        self.link_hover_items: list[QGraphicsItem] = []
+        self._last_link_hover_key: str | None = None
         self.point_items: list[CutPointItem] = []
         self.cut_points: list[dict[str, Any]] = []
         self.design_curves: list[dict[str, Any]] = []
@@ -457,6 +477,7 @@ class DesktopEditor(QMainWindow):
         self.auto_segment_mode.addItem("连续覆盖模式", "coverage")
         self.auto_segment_mode.addItem("局部细节模式", "detail")
         self.auto_segment_mode.addItem("全量骨架模式", "full")
+        self._set_combo_data(self.auto_segment_mode, "coverage")
         self.auto_segment_mode.setToolTip(
             "主线模式更保守；连续覆盖会跨小断口追长线；局部细节会提取更多短线；全量骨架会尽量把所有可追踪骨架都变成候选曲线。"
         )
@@ -575,7 +596,7 @@ class DesktopEditor(QMainWindow):
         self._set_combo_data(self.extraction_mode, "auto")
         self.weak_line_threshold.setValue(32)
         self._set_combo_data(self.parallel_collapse, "off")
-        self._set_combo_data(self.auto_segment_mode, "main")
+        self._set_combo_data(self.auto_segment_mode, "coverage")
         self.snap_radius.setValue(36)
         self.show_image.setChecked(True)
         self.show_full_skeleton.setChecked(True)
@@ -919,7 +940,7 @@ class DesktopEditor(QMainWindow):
         curve_action_row.addWidget(select_all_btn)
         curve_action_row.addWidget(delete_curve_btn)
         list_layout.addLayout(curve_action_row)
-        self.curve_list.setMinimumHeight(150)
+        self.curve_list.setMinimumHeight(450)
         list_layout.addWidget(self.curve_list)
         side_layout.addWidget(list_group)
         side_layout.addStretch(1)
@@ -1024,9 +1045,13 @@ class DesktopEditor(QMainWindow):
     def open_project(self, project_path: Path) -> None:
         try:
             data = json.loads(project_path.read_text(encoding="utf-8"))
-            image_path = Path(str(data.get("graph", {}).get("image") or ""))
+            graph = data.get("graph", {}) if isinstance(data.get("graph"), dict) else {}
+            image_path = Path(str(graph.get("image") or ""))
             if not image_path.exists():
                 raise FileNotFoundError(f"工程里的图片路径不存在：{image_path}")
+            source_image_path = Path(str(graph.get("source_image") or image_path))
+            if not source_image_path.exists():
+                source_image_path = image_path
             session = ReviewSession.create(
                 image_path,
                 project_path.parent,
@@ -1047,8 +1072,17 @@ class DesktopEditor(QMainWindow):
             image = QImage(str(session.image_path))
             if image.isNull():
                 raise FileNotFoundError(f"cannot load image: {session.image_path}")
+            reference_image = QImage(str(source_image_path))
+            if reference_image.isNull():
+                reference_image = image
             self._session_loaded(
-                LoadedSession(session=session, image=image, skeleton_edits=skeleton_edits)
+                LoadedSession(
+                    session=session,
+                    image=image,
+                    reference_image=reference_image,
+                    source_image_path=source_image_path.resolve(),
+                    skeleton_edits=skeleton_edits,
+                )
             )
             self._set_status(f"已打开工程：{project_path}")
         except Exception as exc:
@@ -1113,7 +1147,7 @@ class DesktopEditor(QMainWindow):
         if self.session is None:
             QMessageBox.information(self, "AutoAlias", "请先上传图片。")
             return
-        self.load_image(self.session.image_path)
+        self.load_image(self.source_image_path or self.session.image_path)
 
     def _clear_worker(self) -> None:
         self._worker = None
@@ -1154,6 +1188,7 @@ class DesktopEditor(QMainWindow):
     def _session_loaded(self, loaded: LoadedSession) -> None:
         self.session = loaded.session
         self.current_image = loaded.image
+        self.source_image_path = loaded.source_image_path
         self.skeleton_edits = list(loaded.skeleton_edits)
         self.design_curves = list(loaded.session.design_curves)
         self.cut_points = []
@@ -1170,7 +1205,7 @@ class DesktopEditor(QMainWindow):
         self.saved_route_items.clear()
         self.connection_items.clear()
         self.current_route_item = None
-        self.reference_preview_pixmap = self._make_reference_preview_pixmap(loaded.image)
+        self.reference_preview_pixmap = self._make_reference_preview_pixmap(loaded.reference_image)
         self.image_item = self.scene.addPixmap(QPixmap.fromImage(loaded.image))
         self.image_item.setZValue(0)
         self.full_skeleton_item = self.scene.addPixmap(
@@ -1385,6 +1420,7 @@ class DesktopEditor(QMainWindow):
         self._normalize_branch_choices()
         self._rebuild_connection_markers()
         self._update_point_styles()
+        self.update_link_hover(scene_pos)
 
     def finish_cut_point_drag(self, index: int, scene_pos: QPointF) -> None:
         if index < 0 or index >= len(self.cut_points):
@@ -1402,6 +1438,7 @@ class DesktopEditor(QMainWindow):
         self._maybe_merge_dragged_point(index)
         self._normalize_branch_choices()
         self._rebuild_connection_markers()
+        self.clear_link_hover()
         self._update_route_preview()
 
     def _snap_point(
@@ -1442,9 +1479,7 @@ class DesktopEditor(QMainWindow):
     def _saved_anchor_radius(self) -> float:
         return max(4.0, float(self.snap_radius.value()))
 
-    def _snap_to_saved_anchor(self, point: QPointF) -> dict[str, Any] | None:
-        radius = self._saved_anchor_radius()
-        best: dict[str, Any] | None = None
+    def _iter_saved_anchor_points(self):
         for curve in self.design_curves:
             curve_id = str(curve.get("id") or "")
             if self.active_curve_id and curve_id == self.active_curve_id:
@@ -1456,18 +1491,30 @@ class DesktopEditor(QMainWindow):
                     y = float(saved_point.get("y"))
                 except Exception:
                     continue
-                distance = ((point.x() - x) ** 2 + (point.y() - y) ** 2) ** 0.5
-                if distance > radius:
-                    continue
-                if best is None or distance < float(best["distance"]):
-                    best = {
-                        "point": QPointF(x, y),
-                        "distance": float(distance),
-                        "source": "saved_curve_anchor",
-                        "anchor_curve_id": curve_id,
-                        "anchor_point_order": int(saved_point.get("order", order) or order),
-                        "anchor_semantic": str(curve.get("semantic") or DEFAULT_GUI_SEMANTIC),
-                    }
+                yield {
+                    "point": QPointF(x, y),
+                    "curve_id": curve_id,
+                    "order": int(saved_point.get("order", order) or order),
+                    "semantic": str(curve.get("semantic") or DEFAULT_GUI_SEMANTIC),
+                }
+
+    def _snap_to_saved_anchor(self, point: QPointF, radius: float | None = None) -> dict[str, Any] | None:
+        radius = self._saved_anchor_radius() if radius is None else max(0.0, float(radius))
+        best: dict[str, Any] | None = None
+        for anchor in self._iter_saved_anchor_points():
+            anchor_point = anchor["point"]
+            distance = ((point.x() - anchor_point.x()) ** 2 + (point.y() - anchor_point.y()) ** 2) ** 0.5
+            if distance > radius:
+                continue
+            if best is None or distance < float(best["distance"]):
+                best = {
+                    "point": QPointF(float(anchor_point.x()), float(anchor_point.y())),
+                    "distance": float(distance),
+                    "source": "saved_curve_anchor",
+                    "anchor_curve_id": anchor["curve_id"],
+                    "anchor_point_order": anchor["order"],
+                    "anchor_semantic": anchor["semantic"],
+                }
         return best
 
     def _maybe_merge_dragged_point(self, index: int) -> None:
@@ -1509,6 +1556,21 @@ class DesktopEditor(QMainWindow):
         for item in self.connection_items:
             self.scene.removeItem(item)
         self.connection_items.clear()
+        if self.show_saved.isChecked():
+            for anchor in self._iter_saved_anchor_points():
+                point = anchor["point"]
+                x = float(point.x())
+                y = float(point.y())
+                hint = QGraphicsEllipseItem(x - 4.5, y - 4.5, 9.0, 9.0)
+                hint.setPen(QPen(QColor(0, 160, 175, 135), 1.2))
+                hint.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+                hint.setZValue(43)
+                hint.setToolTip(
+                    f"可连接到已有曲线 {anchor.get('curve_id', '')} "
+                    f"点 {int(anchor.get('order', 0)) + 1}"
+                )
+                self.scene.addItem(hint)
+                self.connection_items.append(hint)
         for point in self.cut_points:
             if point.get("snap_source") != "saved_curve_anchor":
                 continue
@@ -1530,6 +1592,81 @@ class DesktopEditor(QMainWindow):
             label.setZValue(49)
             self.scene.addItem(label)
             self.connection_items.append(label)
+
+    def clear_link_hover(self) -> None:
+        for item in self.link_hover_items:
+            self.scene.removeItem(item)
+        self.link_hover_items.clear()
+        self._last_link_hover_key = None
+
+    def update_link_hover(self, scene_pos: QPointF) -> None:
+        if self.session is None or not self.design_curves or self.skeleton_edit_mode.isChecked():
+            self.clear_link_hover()
+            return
+        snap_radius = self._saved_anchor_radius()
+        anchor = self._snap_to_saved_anchor(scene_pos, radius=snap_radius)
+        active = anchor is not None
+        if anchor is None:
+            anchor = self._snap_to_saved_anchor(scene_pos, radius=snap_radius * 2.2)
+        if anchor is None:
+            self.clear_link_hover()
+            return
+        self._show_link_hover(scene_pos, anchor, active=active)
+        key = (
+            f"{'active' if active else 'near'}:"
+            f"{anchor.get('anchor_curve_id', '')}:"
+            f"{anchor.get('anchor_point_order', '')}"
+        )
+        if key != self._last_link_hover_key:
+            self._last_link_hover_key = key
+            order = int(anchor.get("anchor_point_order", 0)) + 1
+            distance = float(anchor.get("distance", 0.0))
+            if active:
+                self._set_status(f"可连接：松开/点击后会吸附到已有曲线点 {order}（距离 {distance:.1f}px）。")
+            else:
+                self._set_status(f"靠近已有曲线点 {order}，继续靠近会出现连接吸附。")
+
+    def _show_link_hover(self, scene_pos: QPointF, anchor: dict[str, Any], *, active: bool) -> None:
+        for item in self.link_hover_items:
+            self.scene.removeItem(item)
+        self.link_hover_items.clear()
+        point = anchor["point"]
+        x = float(point.x())
+        y = float(point.y())
+        color = QColor(0, 190, 210) if active else QColor(255, 178, 48)
+        fill = QColor(color)
+        fill.setAlpha(38 if active else 28)
+        outer_radius = 20.0 if active else 15.0
+        halo = QGraphicsEllipseItem(x - outer_radius, y - outer_radius, outer_radius * 2.0, outer_radius * 2.0)
+        halo.setPen(QPen(color, 1.5, Qt.PenStyle.DashLine if not active else Qt.PenStyle.SolidLine))
+        halo.setBrush(QBrush(fill))
+        halo.setZValue(72)
+        self.scene.addItem(halo)
+        self.link_hover_items.append(halo)
+
+        ring_radius = 8.0 if active else 6.0
+        ring = QGraphicsEllipseItem(x - ring_radius, y - ring_radius, ring_radius * 2.0, ring_radius * 2.0)
+        ring.setPen(QPen(color, 2.4 if active else 1.7))
+        ring.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        ring.setZValue(73)
+        self.scene.addItem(ring)
+        self.link_hover_items.append(ring)
+
+        if ((scene_pos.x() - x) ** 2 + (scene_pos.y() - y) ** 2) ** 0.5 > 1.5:
+            path = QPainterPath(scene_pos)
+            path.lineTo(point)
+            guide = QGraphicsPathItem(path)
+            guide.setPen(QPen(color, 1.4, Qt.PenStyle.DashLine))
+            guide.setZValue(71)
+            self.scene.addItem(guide)
+            self.link_hover_items.append(guide)
+
+        label = QGraphicsSimpleTextItem("可连接" if active else "靠近端点")
+        label.setBrush(QBrush(color))
+        label.setPos(x + 12.0, y - 24.0)
+        label.setZValue(74)
+        self.scene.addItem(label)
+        self.link_hover_items.append(label)
 
     def _rebuild_point_items(self) -> None:
         for item in self.point_items:
@@ -1861,6 +1998,7 @@ class DesktopEditor(QMainWindow):
             item.setVisible(self.show_saved.isChecked())
             self.scene.addItem(item)
             self.saved_route_items.append(item)
+        self._rebuild_connection_markers()
 
     def _refresh_curve_list(self) -> None:
         self.curve_list.blockSignals(True)
@@ -2068,6 +2206,10 @@ class DesktopEditor(QMainWindow):
             self.design_stroke_item.setVisible(self.show_design_strokes.isChecked())
         for item in self.saved_route_items:
             item.setVisible(self.show_saved.isChecked())
+        for item in self.connection_items:
+            item.setVisible(self.show_saved.isChecked())
+        if not self.show_saved.isChecked():
+            self.clear_link_hover()
         self._update_reference_preview()
 
     def _set_status(self, message: str) -> None:
