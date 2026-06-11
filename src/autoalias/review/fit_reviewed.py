@@ -412,6 +412,68 @@ def _target_segment_is_straight_line(points: np.ndarray) -> bool:
     return bool(sinuosity <= 1.006 and max_dev <= max_allowed and rms_dev <= rms_allowed)
 
 
+def _segment_rule(segment: dict[str, Any]) -> str:
+    value = str(
+        segment.get("segment_rule")
+        or segment.get("segment_type")
+        or segment.get("continuity_segment_rule")
+        or "auto"
+    ).strip().lower()
+    aliases = {
+        "straight": "line",
+        "linear": "line",
+        "line_protected": "line",
+        "curve_g2": "curve",
+        "smooth": "curve",
+        "default": "auto",
+        "": "auto",
+    }
+    return aliases.get(value, value)
+
+
+def _segment_forces_straight(segment: dict[str, Any]) -> bool:
+    return _segment_rule(segment) == "line"
+
+
+def _join_continuity_rule(segment: dict[str, Any]) -> str:
+    value = str(
+        segment.get("end_join_continuity")
+        or segment.get("join_continuity")
+        or segment.get("continuity")
+        or "auto"
+    ).strip().lower()
+    aliases = {
+        "break": "hard",
+        "corner": "hard",
+        "g0": "hard",
+        "none": "hard",
+        "no_g2": "hard",
+        "smooth": "g2",
+        "curvature": "g2",
+        "class_a": "g2",
+        "default": "auto",
+        "": "auto",
+    }
+    return aliases.get(value, value)
+
+
+def _join_forces_hard(segment: dict[str, Any]) -> bool:
+    return _join_continuity_rule(segment) in {"hard", "line_hard"}
+
+
+def _join_forces_g2(segment: dict[str, Any]) -> bool:
+    return _join_continuity_rule(segment) == "g2"
+
+
+def _chain_has_manual_continuity_overrides(segments: list[dict[str, Any]]) -> bool:
+    for segment in segments:
+        if _segment_rule(segment) != "auto":
+            return True
+        if _join_continuity_rule(segment) != "auto":
+            return True
+    return False
+
+
 def _fit_exact_straight_curve(candidate: CurveCandidate, points: np.ndarray, degree: int | str) -> NURBSCurve:
     pts = remove_duplicate_points(np.asarray(points, dtype=float), eps=0.35)
     if len(pts) < 2:
@@ -455,6 +517,8 @@ def _segment_tangent(points: np.ndarray, *, at_end: bool) -> np.ndarray:
 def _chain_has_hard_g2_break(segments: list[dict[str, Any]], *, closed: bool) -> bool:
     if not segments:
         return False
+    if any(_segment_forces_straight(segment) for segment in segments):
+        return True
     prepared = [
         remove_duplicate_points(np.asarray(segment.get("points"), dtype=float), eps=0.5)
         for segment in segments
@@ -463,6 +527,11 @@ def _chain_has_hard_g2_break(segments: list[dict[str, Any]], *, closed: bool) ->
         return True
     join_count = len(prepared) if closed and len(prepared) > 2 else len(prepared) - 1
     for join_index in range(join_count):
+        policy_segment = segments[join_index]
+        if _join_forces_hard(policy_segment):
+            return True
+        if _join_forces_g2(policy_segment):
+            continue
         left = prepared[join_index]
         right = prepared[(join_index + 1) % len(prepared)]
         left_tangent = _segment_tangent(left, at_end=True)
@@ -483,7 +552,7 @@ def _manual_source_allows_g2(design_curve: dict[str, Any]) -> bool:
     return not source.startswith("geometry_auto_segment")
 
 
-def _join_allows_curve_g2(left: np.ndarray, right: np.ndarray) -> bool:
+def _join_allows_curve_g2(left: np.ndarray, right: np.ndarray, *, force: bool = False) -> bool:
     left = remove_duplicate_points(np.asarray(left, dtype=float), eps=0.5)
     right = remove_duplicate_points(np.asarray(right, dtype=float), eps=0.5)
     if len(left) < 4 or len(right) < 4:
@@ -498,6 +567,8 @@ def _join_allows_curve_g2(left: np.ndarray, right: np.ndarray) -> bool:
     right_tangent = _segment_tangent(right, at_end=False)
     if np.linalg.norm(left_tangent) < 1e-6 or np.linalg.norm(right_tangent) < 1e-6:
         return False
+    if force:
+        return True
     return bool(_angle_between(left_tangent, right_tangent) <= 16.0)
 
 
@@ -510,19 +581,24 @@ def _selective_g2_groups(segments: list[dict[str, Any]], *, closed: bool) -> lis
     ]
     curve_like = [
         len(points) >= 4
+        and not _segment_forces_straight(segments[index])
         and not _target_segment_is_straight_line(points)
         and _polyline_length(points) >= 12.0
-        for points in prepared
+        for index, points in enumerate(prepared)
     ]
     # Closed mixed chains are common in logo/trim work; when there is any hard
     # break, keep the selective pass open-ended so a straight span cannot force
     # the opposite side of the loop into C2.
-    join_ok = [
-        curve_like[index]
-        and curve_like[index + 1]
-        and _join_allows_curve_g2(prepared[index], prepared[index + 1])
-        for index in range(len(prepared) - 1)
-    ]
+    join_ok: list[bool] = []
+    for index in range(len(prepared) - 1):
+        if not (curve_like[index] and curve_like[index + 1]):
+            join_ok.append(False)
+            continue
+        if _join_forces_hard(segments[index]):
+            join_ok.append(False)
+            continue
+        force = _join_forces_g2(segments[index])
+        join_ok.append(_join_allows_curve_g2(prepared[index], prepared[index + 1], force=force))
     groups: list[list[int]] = []
     index = 0
     while index < len(prepared):
@@ -561,7 +637,7 @@ def _fit_individual_review_segment(
         segment_count,
     )
     candidate = _make_candidate(label, points, annotation_path, design_curve)
-    exact_line = _target_segment_is_straight_line(points)
+    exact_line = _segment_forces_straight(segment) or _target_segment_is_straight_line(points)
     curve = (
         _fit_exact_straight_curve(candidate, points, degree)
         if exact_line
@@ -591,8 +667,10 @@ def _fit_individual_review_segment(
     if exact_line:
         curve.metadata["exact_straight_line"] = True
         curve.metadata["straight_line_cv_policy"] = "collinear_even_spacing"
+        curve.metadata["manual_segment_rule"] = _segment_rule(segment)
         curve.metadata["g2_policy"] = "not_g2_straight_line_protected"
     else:
+        curve.metadata["manual_segment_rule"] = _segment_rule(segment)
         curve.metadata["g2_policy"] = "not_g2_hard_break_or_isolated_curve"
     curve.metadata.update(_fit_metadata_notes(curve))
     _stamp_cv_side_diagnostics(curve, points)
@@ -755,7 +833,10 @@ def _fit_design_curve_chain(
         _manual_class_a_g2_requested(fit_mode)
         and _manual_source_allows_g2(design_curve)
         and len(segments) > 1
-        and _chain_has_hard_g2_break(segments, closed=bool(design_curve.get("closed", False)))
+        and (
+            _chain_has_manual_continuity_overrides(segments)
+            or _chain_has_hard_g2_break(segments, closed=bool(design_curve.get("closed", False)))
+        )
     ):
         selective = _fit_design_curve_chain_selective_g2(
             design_curve,
@@ -788,7 +869,7 @@ def _fit_design_curve_chain(
                 segment["segment_count"],
             )
             candidate = _make_candidate(label, points, annotation_path, design_curve)
-            exact_line = _target_segment_is_straight_line(points)
+            exact_line = _segment_forces_straight(segment) or _target_segment_is_straight_line(points)
             curve = (
                 _fit_exact_straight_curve(candidate, points, degree)
                 if exact_line
@@ -851,7 +932,7 @@ def _fit_design_curve_chain(
             segment["segment_count"],
         )
         candidate = _make_candidate(label, points, annotation_path, design_curve)
-        exact_line = _target_segment_is_straight_line(points)
+        exact_line = _segment_forces_straight(segment) or _target_segment_is_straight_line(points)
         curve = (
             _fit_exact_straight_curve(candidate, points, degree)
             if exact_line
@@ -972,6 +1053,8 @@ def _should_use_manual_class_a_g2(
         return False
     source = str(design_curve.get("source") or "").lower()
     if source.startswith("geometry_auto_segment"):
+        return False
+    if _chain_has_manual_continuity_overrides(segments):
         return False
     if _chain_has_hard_g2_break(segments, closed=bool(design_curve.get("closed", False))):
         return False
@@ -6091,24 +6174,30 @@ def _curve_segments(curve: dict[str, Any]) -> list[dict[str, Any]]:
             points = _as_points3(segment.get("points") or [])
             if len(points) < 2:
                 points = _manual_pair_points(manual, index, bool(curve.get("closed")))
+            end_join = _curve_end_join_rule(curve, index, expected_count)
             out.append(
                 {
                     "points": points,
                     "start_order": index,
                     "end_order": 0 if bool(curve.get("closed")) and index == len(manual) - 1 else index + 1,
                     "segment_count": expected_count,
+                    "segment_rule": _curve_segment_rule(curve, index, segment),
+                    "end_join_continuity": end_join,
                 }
             )
         return out
 
     if expected_count > 0:
         for index in range(expected_count):
+            end_join = _curve_end_join_rule(curve, index, expected_count)
             out.append(
                 {
                     "points": _manual_pair_points(manual, index, bool(curve.get("closed"))),
                     "start_order": index,
                     "end_order": 0 if bool(curve.get("closed")) and index == len(manual) - 1 else index + 1,
                     "segment_count": expected_count,
+                    "segment_rule": _curve_segment_rule(curve, index, {}),
+                    "end_join_continuity": end_join,
                 }
             )
         return out
@@ -6117,6 +6206,28 @@ def _curve_segments(curve: dict[str, Any]) -> list[dict[str, Any]]:
     if len(points) >= 2:
         return [{"points": points, "start_order": 0, "end_order": 1, "segment_count": 1}]
     return []
+
+
+def _curve_segment_rule(curve: dict[str, Any], index: int, segment: dict[str, Any]) -> str:
+    direct = segment.get("segment_rule") or segment.get("segment_type")
+    if direct:
+        return str(direct)
+    rules = curve.get("segment_rules") or curve.get("segment_types") or []
+    if isinstance(rules, list) and 0 <= index < len(rules):
+        return str(rules[index] or "auto")
+    return "auto"
+
+
+def _curve_end_join_rule(curve: dict[str, Any], index: int, segment_count: int) -> str:
+    if segment_count <= 1:
+        return "auto"
+    closed = bool(curve.get("closed"))
+    if not closed and index >= segment_count - 1:
+        return "auto"
+    rules = curve.get("join_continuities") or curve.get("join_rules") or []
+    if isinstance(rules, list) and 0 <= index < len(rules):
+        return str(rules[index] or "auto")
+    return "auto"
 
 
 def _compact_auto_export_segments(

@@ -120,6 +120,8 @@ def _clean_route_segment(segment: dict[str, Any], index: int) -> dict[str, Any]:
         "selected_candidate": int(segment.get("selected_candidate", 0)),
         "length": float(segment.get("length", 0.0) or 0.0),
         "alternatives": segment.get("alternatives", []),
+        "segment_rule": str(segment.get("segment_rule") or "auto"),
+        "end_join_continuity": str(segment.get("end_join_continuity") or "auto"),
     }
 
 
@@ -284,8 +286,16 @@ class CutPointItem(QGraphicsEllipseItem):
         self.index = index
         self.label.setText(str(index + 1))
 
-    def set_selected_style(self, selected: bool) -> None:
-        self.setBrush(QBrush(QColor(255, 230, 106) if selected else QColor(116, 87, 255)))
+    def set_selected_style(self, selected: bool, join_rule: str = "auto") -> None:
+        if selected:
+            color = QColor(255, 230, 106)
+        elif join_rule == "g2":
+            color = QColor(0, 190, 210)
+        elif join_rule == "hard":
+            color = QColor(235, 86, 86)
+        else:
+            color = QColor(116, 87, 255)
+        self.setBrush(QBrush(color))
 
 
 class EditorView(QGraphicsView):
@@ -401,6 +411,8 @@ class DesktopEditor(QMainWindow):
         self.design_curves: list[dict[str, Any]] = []
         self.route_preview: dict[str, Any] | None = None
         self.branch_choices: list[int] = []
+        self.segment_rules: list[str] = []
+        self.join_continuities: list[str] = []
         self.closed_curve = False
         self.active_curve_id: str | None = None
         self.selected_cut_index: int | None = None
@@ -429,6 +441,18 @@ class DesktopEditor(QMainWindow):
         self.curve_list.currentItemChanged.connect(self._load_curve_from_item)
         self.branch_list = QListWidget()
         self.branch_list.currentRowChanged.connect(self._branch_selection_changed)
+
+        self.segment_rule_combo = NoWheelComboBox()
+        self.segment_rule_combo.addItem("当前段：自动判断", "auto")
+        self.segment_rule_combo.addItem("当前段：曲线，可参与 G2", "curve")
+        self.segment_rule_combo.addItem("当前段：直线保护", "line")
+        self.segment_rule_combo.setToolTip("给分支列表中选中的那一段设置规则；直线保护会导出精确共线 CV，两端不做 G2。")
+
+        self.join_rule_combo = NoWheelComboBox()
+        self.join_rule_combo.addItem("连接点：自动判断", "auto")
+        self.join_rule_combo.addItem("连接点：硬连接/G0，不做 G2", "hard")
+        self.join_rule_combo.addItem("连接点：曲率连续/G2", "g2")
+        self.join_rule_combo.setToolTip("给当前选中的紫色分段点设置连接规则；首尾开放端点没有连接关系。")
 
         self.degree = NoWheelComboBox()
         self.degree.addItems(["auto", "3", "5", "7"])
@@ -899,6 +923,22 @@ class DesktopEditor(QMainWindow):
         row3.addWidget(close_btn)
         row3.addWidget(clear_btn)
         manual_layout.addLayout(row3)
+
+        continuity_row1 = QHBoxLayout()
+        apply_segment_rule_btn = QPushButton("应用段规则")
+        apply_segment_rule_btn.setToolTip("先在下面的分支/路径候选列表中选择一段，再应用段规则。")
+        apply_segment_rule_btn.clicked.connect(self.apply_selected_segment_rule)
+        continuity_row1.addWidget(self.segment_rule_combo)
+        continuity_row1.addWidget(apply_segment_rule_btn)
+        manual_layout.addLayout(continuity_row1)
+
+        continuity_row2 = QHBoxLayout()
+        apply_join_rule_btn = QPushButton("应用连接规则")
+        apply_join_rule_btn.setToolTip("先点击一个手动分段点，再设置该连接点是否 G2。")
+        apply_join_rule_btn.clicked.connect(self.apply_selected_join_rule)
+        continuity_row2.addWidget(self.join_rule_combo)
+        continuity_row2.addWidget(apply_join_rule_btn)
+        manual_layout.addLayout(continuity_row2)
         side_layout.addWidget(manual_group)
 
         auto_group, auto_layout = self._make_group("4 自动分段与路径候选")
@@ -1547,10 +1587,21 @@ class DesktopEditor(QMainWindow):
     def select_cut_point(self, index: int) -> None:
         self.selected_cut_index = index
         self._update_point_styles()
+        self._sync_rule_controls()
 
     def _update_point_styles(self) -> None:
         for i, item in enumerate(self.point_items):
-            item.set_selected_style(i == self.selected_cut_index)
+            item.set_selected_style(i == self.selected_cut_index, self._join_rule_for_point(i))
+
+    def _join_rule_for_point(self, point_index: int) -> str:
+        if not self.join_continuities:
+            return "auto"
+        if self.closed_curve and len(self.cut_points) >= 3:
+            return self.join_continuities[(point_index - 1) % len(self.join_continuities)]
+        join_index = point_index - 1
+        if 0 <= join_index < len(self.join_continuities):
+            return self.join_continuities[join_index]
+        return "auto"
 
     def _rebuild_connection_markers(self) -> None:
         for item in self.connection_items:
@@ -1696,6 +1747,99 @@ class DesktopEditor(QMainWindow):
             self.branch_choices.append(0)
         if len(self.branch_choices) > expected:
             self.branch_choices = self.branch_choices[:expected]
+        self._normalize_continuity_rules()
+
+    def _normalize_continuity_rules(self) -> None:
+        expected_segments = self._expected_segment_count()
+        while len(self.segment_rules) < expected_segments:
+            self.segment_rules.append("auto")
+        if len(self.segment_rules) > expected_segments:
+            self.segment_rules = self.segment_rules[:expected_segments]
+
+        expected_joins = expected_segments if self.closed_curve and expected_segments > 1 else max(0, expected_segments - 1)
+        while len(self.join_continuities) < expected_joins:
+            self.join_continuities.append("auto")
+        if len(self.join_continuities) > expected_joins:
+            self.join_continuities = self.join_continuities[:expected_joins]
+
+    def _selected_segment_index(self) -> int | None:
+        self._normalize_continuity_rules()
+        row = self.branch_list.currentRow()
+        if 0 <= row < len(self.segment_rules):
+            return row
+        if self.selected_cut_index is not None:
+            index = min(max(int(self.selected_cut_index), 0), max(0, len(self.segment_rules) - 1))
+            if 0 <= index < len(self.segment_rules):
+                return index
+        return 0 if self.segment_rules else None
+
+    def _selected_join_index(self) -> int | None:
+        self._normalize_continuity_rules()
+        if not self.join_continuities or self.selected_cut_index is None:
+            return None
+        point_index = int(self.selected_cut_index)
+        if self.closed_curve and len(self.cut_points) >= 3:
+            return (point_index - 1) % len(self.join_continuities)
+        join_index = point_index - 1
+        if 0 <= join_index < len(self.join_continuities):
+            return join_index
+        return None
+
+    def apply_selected_segment_rule(self) -> None:
+        index = self._selected_segment_index()
+        if index is None:
+            self._set_status("请先添加至少两个分段点，再设置段规则。")
+            return
+        rule = str(self.segment_rule_combo.currentData() or "auto")
+        self.segment_rules[index] = rule
+        if rule == "line":
+            previous_join = index - 1
+            if self.closed_curve and self.join_continuities:
+                previous_join %= len(self.join_continuities)
+            if 0 <= previous_join < len(self.join_continuities):
+                self.join_continuities[previous_join] = "hard"
+            if index < len(self.join_continuities):
+                self.join_continuities[index] = "hard"
+        self._update_point_styles()
+        self._update_route_preview()
+        self._set_status(f"已设置第 {index + 1} 段规则：{self._segment_rule_label(rule)}。")
+
+    def apply_selected_join_rule(self) -> None:
+        index = self._selected_join_index()
+        if index is None:
+            self._set_status("请先选中中间连接点；开放曲线首尾端点没有连接规则。")
+            return
+        rule = str(self.join_rule_combo.currentData() or "auto")
+        self.join_continuities[index] = rule
+        self._update_point_styles()
+        self._update_route_preview()
+        self._set_status(f"已设置连接点 {index + 1}：{self._join_rule_label(rule)}。")
+
+    def _segment_rule_label(self, rule: str) -> str:
+        return {"auto": "自动", "curve": "曲线", "line": "直线保护"}.get(str(rule), str(rule))
+
+    def _join_rule_label(self, rule: str) -> str:
+        return {"auto": "自动", "hard": "硬连接/G0", "g2": "G2"}.get(str(rule), str(rule))
+
+    def _set_combo_by_data(self, combo: QComboBox, value: str) -> None:
+        idx = combo.findData(value)
+        if idx < 0:
+            idx = 0
+        combo.blockSignals(True)
+        combo.setCurrentIndex(idx)
+        combo.blockSignals(False)
+
+    def _sync_rule_controls(self) -> None:
+        segment_index = self._selected_segment_index()
+        if segment_index is not None and segment_index < len(self.segment_rules):
+            self._set_combo_by_data(self.segment_rule_combo, self.segment_rules[segment_index])
+        else:
+            self._set_combo_by_data(self.segment_rule_combo, "auto")
+        join_index = self._selected_join_index()
+        if join_index is not None and join_index < len(self.join_continuities):
+            self._set_combo_by_data(self.join_rule_combo, self.join_continuities[join_index])
+        else:
+            self._set_combo_by_data(self.join_rule_combo, "auto")
 
     def _route_points_with_choices(self) -> dict[str, Any]:
         if self.session is None:
@@ -1704,6 +1848,7 @@ class DesktopEditor(QMainWindow):
         if len(clean) < 2:
             return {"ok": False, "reason": "need at least two points", "segments": [], "points": []}
         self._normalize_branch_choices()
+        self._normalize_continuity_rules()
         pairs = list(zip(clean, clean[1:]))
         is_closed = bool(self.closed_curve and len(clean) >= 3)
         if is_closed:
@@ -1730,6 +1875,8 @@ class DesktopEditor(QMainWindow):
                     "segment_index": index,
                     "selected_candidate": choice,
                     "alternatives": candidates,
+                    "segment_rule": self.segment_rules[index] if index < len(self.segment_rules) else "auto",
+                    "end_join_continuity": self.join_continuities[index] if index < len(self.join_continuities) else "auto",
                 }
             )
         return {
@@ -1763,6 +1910,7 @@ class DesktopEditor(QMainWindow):
             self.current_route_item = item
         self._draw_branch_alternatives()
         self._refresh_branch_list()
+        self._sync_rule_controls()
         ok = bool(self.route_preview.get("ok"))
         self._set_status(
             f"蓝线路径：{len(points)} 点，{'连通' if ok else '未完全连通'}。"
@@ -1802,8 +1950,12 @@ class DesktopEditor(QMainWindow):
             selected = int(segment.get("selected_candidate", 0)) + 1
             count = len(alternatives) if alternatives else 1
             length = float(segment.get("length", 0.0) or 0.0)
-            status = "OK" if segment.get("ok") else "断"
-            item = QListWidgetItem(f"段 {index + 1}: 候选 {selected}/{count} / {length:.0f}px / {status}")
+            status = "OK" if segment.get("ok") else "BROKEN"
+            segment_rule = self._segment_rule_label(str(segment.get("segment_rule") or "auto"))
+            join_rule = self._join_rule_label(str(segment.get("end_join_continuity") or "auto"))
+            item = QListWidgetItem(
+                f"Seg {index + 1}: cand {selected}/{count} / {length:.0f}px / {status} / segment:{segment_rule} / join:{join_rule}"
+            )
             item.setData(Qt.ItemDataRole.UserRole, index)
             self.branch_list.addItem(item)
         if self.branch_list.count():
@@ -1814,6 +1966,7 @@ class DesktopEditor(QMainWindow):
     def _branch_selection_changed(self, _row: int) -> None:
         if self.route_preview is None:
             return
+        self._sync_rule_controls()
         for item in self.alt_route_items:
             self.scene.removeItem(item)
         self.alt_route_items.clear()
@@ -1844,6 +1997,7 @@ class DesktopEditor(QMainWindow):
             _clean_route_segment(segment, i)
             for i, segment in enumerate(route.get("segments") or [])
         ]
+        self._normalize_continuity_rules()
         item = {
             "id": self.active_curve_id or _curve_id(),
             "type": "manual_design_curve",
@@ -1855,6 +2009,8 @@ class DesktopEditor(QMainWindow):
             "routed_points": route.get("points") or [],
             "route_segments": route_segments,
             "branch_choices": self.branch_choices[:],
+            "segment_rules": self.segment_rules[:],
+            "join_continuities": self.join_continuities[:],
             "route_ok": bool(route.get("ok")),
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "source": "autoalias_desktop_gui",
@@ -2024,11 +2180,18 @@ class DesktopEditor(QMainWindow):
         self.cut_points = [dict(point) for point in (curve.get("manual_points") or curve.get("cut_points") or [])]
         self.closed_curve = bool(curve.get("closed"))
         self.branch_choices = [int(value) for value in (curve.get("branch_choices") or [])]
+        route_segments = curve.get("route_segments") or []
+        self.segment_rules = [str(value or "auto") for value in (curve.get("segment_rules") or [])]
+        if not self.segment_rules and route_segments:
+            self.segment_rules = [str(segment.get("segment_rule") or "auto") for segment in route_segments]
+        self.join_continuities = [str(value or "auto") for value in (curve.get("join_continuities") or [])]
+        if not self.join_continuities and route_segments:
+            self.join_continuities = [str(segment.get("end_join_continuity") or "auto") for segment in route_segments]
         self._normalize_branch_choices()
         self.route_preview = {
             "ok": bool(curve.get("route_ok")),
             "points": curve.get("routed_points") or [],
-            "segments": curve.get("route_segments") or [],
+            "segments": route_segments,
         }
         self._rebuild_point_items()
         self._update_route_preview()
@@ -2066,6 +2229,8 @@ class DesktopEditor(QMainWindow):
             self.cut_points = []
             self.route_preview = None
             self.branch_choices = []
+            self.segment_rules = []
+            self.join_continuities = []
             self.closed_curve = False
             self.active_curve_id = None
             self.selected_cut_index = None
@@ -2077,6 +2242,7 @@ class DesktopEditor(QMainWindow):
             self.alt_route_items.clear()
             self._rebuild_point_items()
             self._refresh_branch_list()
+            self._sync_rule_controls()
         self._save_all()
         self._rebuild_saved_routes()
         self._refresh_curve_list()
@@ -2089,6 +2255,7 @@ class DesktopEditor(QMainWindow):
         self._normalize_branch_choices()
         self._rebuild_point_items()
         self._update_route_preview()
+        self._sync_rule_controls()
 
     def delete_selected_point(self) -> None:
         if self.selected_cut_index is None:
@@ -2098,10 +2265,14 @@ class DesktopEditor(QMainWindow):
         self._normalize_branch_choices()
         self._rebuild_point_items()
         self._update_route_preview()
+        self._sync_rule_controls()
 
     def clear_current(self) -> None:
         self.cut_points = []
         self.route_preview = None
+        self.branch_choices = []
+        self.segment_rules = []
+        self.join_continuities = []
         self.closed_curve = False
         self.active_curve_id = None
         self.selected_cut_index = None
@@ -2117,12 +2288,14 @@ class DesktopEditor(QMainWindow):
         self._rebuild_point_items()
         self._refresh_branch_list()
         self._refresh_curve_list()
+        self._sync_rule_controls()
         self._set_status("当前曲线已清空。")
 
     def toggle_closed(self) -> None:
         self.closed_curve = not self.closed_curve
         self._normalize_branch_choices()
         self._update_route_preview()
+        self._sync_rule_controls()
         self._set_status("闭合已开启。" if self.closed_curve else "闭合已关闭。")
 
     def export_iges(self) -> None:
