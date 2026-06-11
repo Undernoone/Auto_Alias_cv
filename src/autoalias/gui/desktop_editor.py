@@ -290,7 +290,7 @@ class CutPointItem(QGraphicsEllipseItem):
         if selected:
             color = QColor(255, 230, 106)
         elif join_rule == "g2":
-            color = QColor(0, 190, 210)
+            color = QColor(220, 38, 38)
         elif join_rule == "hard":
             color = QColor(235, 86, 86)
         else:
@@ -508,7 +508,7 @@ class DesktopEditor(QMainWindow):
 
         self.snap_radius = NoWheelSpinBox()
         self.snap_radius.setRange(1, 9999)
-        self.snap_radius.setValue(36)
+        self.snap_radius.setValue(10)
         self.snap_radius.setSuffix(" px")
         self.snap_radius.setToolTip("鼠标点、拖动分段点时吸附到骨架或已保存端点的搜索半径。")
 
@@ -621,7 +621,7 @@ class DesktopEditor(QMainWindow):
         self.weak_line_threshold.setValue(32)
         self._set_combo_data(self.parallel_collapse, "off")
         self._set_combo_data(self.auto_segment_mode, "coverage")
-        self.snap_radius.setValue(36)
+        self.snap_radius.setValue(10)
         self.show_image.setChecked(True)
         self.show_full_skeleton.setChecked(True)
         self.show_edge_skeleton.setChecked(True)
@@ -1011,6 +1011,10 @@ class DesktopEditor(QMainWindow):
         delete.setShortcut(QKeySequence.StandardKey.Delete)
         delete.triggered.connect(self.delete_selected_point)
         self.addAction(delete)
+        force_g2 = QAction(self)
+        force_g2.setShortcut(QKeySequence("Ctrl+G"))
+        force_g2.triggered.connect(self.force_current_curve_g2)
+        self.addAction(force_g2)
 
     def _show_empty_scene(self) -> None:
         self.scene.clear()
@@ -1613,7 +1617,7 @@ class DesktopEditor(QMainWindow):
                 x = float(point.x())
                 y = float(point.y())
                 hint = QGraphicsEllipseItem(x - 4.5, y - 4.5, 9.0, 9.0)
-                hint.setPen(QPen(QColor(0, 160, 175, 135), 1.2))
+                hint.setPen(QPen(QColor(220, 38, 38, 150), 1.2))
                 hint.setBrush(QBrush(Qt.BrushStyle.NoBrush))
                 hint.setZValue(43)
                 hint.setToolTip(
@@ -1628,7 +1632,7 @@ class DesktopEditor(QMainWindow):
             x = float(point.get("x", 0.0))
             y = float(point.get("y", 0.0))
             ring = QGraphicsEllipseItem(x - 11.0, y - 11.0, 22.0, 22.0)
-            ring.setPen(QPen(QColor(0, 190, 210), 2.2))
+            ring.setPen(QPen(QColor(220, 38, 38), 2.2))
             ring.setBrush(QBrush(Qt.BrushStyle.NoBrush))
             ring.setZValue(48)
             ring.setToolTip(
@@ -1638,7 +1642,7 @@ class DesktopEditor(QMainWindow):
             self.scene.addItem(ring)
             self.connection_items.append(ring)
             label = QGraphicsSimpleTextItem("link")
-            label.setBrush(QBrush(QColor(0, 118, 130)))
+            label.setBrush(QBrush(QColor(185, 28, 28)))
             label.setPos(x + 12.0, y + 8.0)
             label.setZValue(49)
             self.scene.addItem(label)
@@ -1658,7 +1662,7 @@ class DesktopEditor(QMainWindow):
         anchor = self._snap_to_saved_anchor(scene_pos, radius=snap_radius)
         active = anchor is not None
         if anchor is None:
-            anchor = self._snap_to_saved_anchor(scene_pos, radius=snap_radius * 2.2)
+            anchor = self._snap_to_saved_anchor(scene_pos, radius=snap_radius * 2.0)
         if anchor is None:
             self.clear_link_hover()
             return
@@ -1684,7 +1688,7 @@ class DesktopEditor(QMainWindow):
         point = anchor["point"]
         x = float(point.x())
         y = float(point.y())
-        color = QColor(0, 190, 210) if active else QColor(255, 178, 48)
+        color = QColor(220, 38, 38) if active else QColor(255, 178, 48)
         fill = QColor(color)
         fill.setAlpha(38 if active else 28)
         outer_radius = 20.0 if active else 15.0
@@ -1814,6 +1818,19 @@ class DesktopEditor(QMainWindow):
         self._update_point_styles()
         self._update_route_preview()
         self._set_status(f"已设置连接点 {index + 1}：{self._join_rule_label(rule)}。")
+
+    def force_current_curve_g2(self) -> None:
+        self._normalize_continuity_rules()
+        if len(self.cut_points) < 3 or not self.join_continuities:
+            self._set_status("当前曲线没有可设置 G2 的连接点。")
+            return
+        self.segment_rules = ["curve" for _ in self.segment_rules]
+        self.join_continuities = ["g2" for _ in self.join_continuities]
+        self._update_point_styles()
+        self._update_route_preview()
+        self._sync_rule_controls()
+        self.save_current(start_next=False)
+        self._set_status("已将当前曲线所有段设为曲线，所有连接点设为 G2（Ctrl+G）。")
 
     def _segment_rule_label(self, rule: str) -> str:
         return {"auto": "自动", "curve": "曲线", "line": "直线保护"}.get(str(rule), str(rule))
